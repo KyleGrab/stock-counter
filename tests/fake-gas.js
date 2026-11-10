@@ -2,6 +2,7 @@
 // can run in Node exactly as written. Used by the backend tests and the local test server.
 const fs = require("fs");
 const vm = require("vm");
+const crypto = require("crypto");
 const path = require("path");
 
 function makeGas() {
@@ -41,8 +42,12 @@ function makeGas() {
   const ctx = {
     SpreadsheetApp: { getActiveSpreadsheet: () => ss, flush() {} },
     PropertiesService: { getScriptProperties: () => ({ getProperty: k => props[k] || null, setProperty: (k, v) => (props[k] = v) }) },
-    CacheService: { getScriptCache: () => ({ get: k => cache[k] || null, put: (k, v) => (cache[k] = v) }) },
-    Utilities: { getUuid: () => "abcd-1234-efgh-5678-ijkl-9999" },
+    CacheService: { getScriptCache: () => ({ get: k => cache[k] || null, put: (k, v) => (cache[k] = v), remove: k => delete cache[k] }) },
+    Utilities: {
+      getUuid: () => crypto.randomUUID(),
+      DigestAlgorithm: { SHA_256: "sha256" }, Charset: { UTF_8: "utf8" },
+      computeDigest: (alg, text) => Array.from(crypto.createHash(alg).update(String(text), "utf8").digest()).map(b => (b > 127 ? b - 256 : b))
+    },
     LockService: { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
     Logger: { log() {} },
     ContentService: { MimeType: { JSON: "json" }, createTextOutput: s => ({ setMimeType: () => ({ body: s }) }) },
@@ -50,8 +55,8 @@ function makeGas() {
   };
   vm.createContext(ctx);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "Code.gs"), "utf8"), ctx);
-  const key = ctx.setup();
+  const adminPin = ctx.setup();
   const post = body => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(body) } }).body);
-  return { ctx, sheets, key, post, get: () => JSON.parse(ctx.doGet({ parameter: {} }).body) };
+  return { ctx, sheets, cache, adminPin, post, get: () => JSON.parse(ctx.doGet({ parameter: {} }).body) };
 }
 module.exports = { makeGas };

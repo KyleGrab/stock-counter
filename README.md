@@ -25,7 +25,7 @@ A free stock app for the phone. Every metre of cable that leaves the store is ti
 2. Go to **github.com** and create a free account. Your username becomes part of the app link, so pick something sensible (e.g. the business name).
 3. Click **+** (top right) → **New repository**.
    - Name: `stock-counter`
-   - Choose **Public**. Free hosting needs this. Only the app's code is public; your stock data lives in the Google Sheet, and the secret key is never in these files.
+   - Choose **Public**. Free hosting needs this. Only the app's code is public; your stock data lives in the Google Sheet, and no PINs or passwords are ever in these files.
    - Click **Create repository**.
 4. Click **uploading an existing file**. Open the `stock-app` folder and drag in **these 6 files**: `index.html`, `app.js`, `core.js`, `sw.js`, `manifest.json`, `icon.svg`. Click **Commit changes**.
    - ⚠️ Drag the **files**, not the folder. If the files end up inside a `stock-app/` folder on GitHub, the link won't work.
@@ -55,8 +55,8 @@ A free stock app for the phone. Every metre of cable that leaves the store is ti
    - Google asks for permission: **Review permissions** → choose the business account.
    - You'll see *"Google hasn't verified this app"*. That's normal for a script you wrote yourself. Click **Advanced** → **Go to Stock Counter (unsafe)** → **Allow**.
    - It only reads and writes this one Sheet.
-5. The **Execution log** at the bottom shows: `Your secret key is: ...`. **Copy the key** and keep it private (e.g. in WhatsApp to yourself).
-   Lost it? Choose `showKey` in the dropdown and click **Run**.
+5. The **Execution log** at the bottom shows: `First login -> username: admin   PIN: ......`. **Write the PIN down.** It's a temporary PIN; you'll choose your own the first time you sign in.
+   Locked out later? Choose `resetAdmin` in the dropdown and click **Run** to get a new temporary admin PIN.
 6. Click **Deploy** (top right) → **New deployment**.
    - Click the gear ⚙ next to *Select type* → **Web app**.
    - *Description*: `Stock Counter`
@@ -64,29 +64,51 @@ A free stock app for the phone. Every metre of cable that leaves the store is ti
    - *Who has access*: **Anyone** (not "Anyone with Google account", and not "Only myself", or the phone can't connect)
    - Click **Deploy**. Copy the **Web app URL**. It starts with `https://script.google.com/macros/s/` and ends in `/exec`.
 
-> "Anyone" means anyone with the link **and** the secret key. Without the key, the Sheet refuses every request. Never post the key or the link anywhere public.
+> "Anyone" only means the link can be reached. The Sheet refuses every request that doesn't come from a signed-in user with the right role. Still, don't post the link anywhere public.
 
-Get the link and key to the phone: email or WhatsApp them to yourself, then copy-paste on the phone in Part C.
+Get the link to the phone: email or WhatsApp it to yourself, then copy-paste it in Part C.
+
+The Sheet has two hidden tabs, **Users** and **Sessions**. PINs are stored scrambled (hashed), so nobody, not even the owner, can read them. Don't edit these tabs by hand.
 
 Back in the Sheet you'll see new tabs: Items, Jobs, Lines, Moves, Labels, Vans, VanKit.
 
 ---
 
-## Part C: Connect the phone (2 min)
+## Part C: Connect and sign in (2 min)
 
-1. In the app: **More → Settings**.
-2. Enter your name, paste the **Web app link** and the **secret key**.
-3. Tap **Save and connect**. You should see *Connected to the Google Sheet*.
+1. Open the app → **Connect our Google Sheet**.
+2. Paste the **Web app link** (only needed once per device).
+3. Sign in: username `admin`, and the temporary PIN from Part B.
+4. Choose your own 6-digit PIN. Only you should know it.
 
-The app is now empty and ready for real stock. The demo data stays separate on the phone.
+The app is now empty and ready for real stock.
+
+---
+
+## Part C2: Create logins for the team (5 min)
+
+**Admin → Logins → Add a login** for each person:
+
+| Role | Give it to | They can |
+|---|---|---|
+| **Storeman** | Whoever runs the store | Jobs, kitting, scanning, receiving, returns, counts, stickers |
+| **Admin** | You / the owner | Everything, plus logins, items, costs, vans, corrections, reports |
+| **Viewer** | Owner, accountant | Look at jobs, stock and reports. Can't change anything |
+
+The app shows a **temporary PIN** once. Give it to the person face to face. They choose their own PIN the first time they sign in.
+
+- Someone leaves: **Logins → tap them → Status: Switched off → Save.** They're signed out on every device immediately.
+- Someone forgets their PIN: **Logins → tap them → Reset PIN.**
+- 5 wrong PINs locks that login for 15 minutes.
+- Every movement is stamped with the signed-in person automatically. Nobody can record under someone else's name.
 
 ---
 
 ## Part D: First day setup
 
-1. **Items** (More → Items): add each product. Cable = *Metres*. Panels, inverters, batteries = *Serial number*.
-2. **Vans** (More → Vans): add each van, then set the **van kit** (small parts only: connectors, lugs, fuses, ties).
-3. **Stickers** (More → Stickers): one sticker per **drum, roll, box or shelf bin**. Tap **Print sticker sheet**. Use A4 sticker paper, or plain paper and clear tape.
+1. **Items** (Admin → Items): add each product. Cable = *Metres*. Panels, inverters, batteries = *Serial number*.
+2. **Vans** (Admin → Vans and van kit): add each van, then set the **van kit** (small parts only: connectors, lugs, fuses, ties).
+3. **Stickers** (Admin → Stickers): one sticker per **drum, roll, box or shelf bin**. Tap **Print sticker sheet**. Use A4 sticker paper, or plain paper and clear tape.
 4. **Opening stock:** walk the store. For each sticker: **Scan → Receive**, enter the quantity on hand and the landed cost. For panels and inverters, scan each serial.
 
 ---
@@ -105,7 +127,8 @@ Quote accepted → New job → Kit the crate → Van collects → Crate back →
 | Short on site | **Scan** the drum sticker → **Extra to job**, with a reason. |
 | Crate comes back | **Scan** the crate label. For every line: what's **back in store**, **scrap**, and **used**. Anything left over is **missing** and needs a reason. **Close job**. |
 | Every week | **Counts →** each van kit, and the cable drums on the shelves. |
-| Every month | **Stock** tab: who and which van have missing stock, and which job types used more than quoted. |
+| Every month | **Admin → Missing stock report**: who and which van have missing stock, and which job types used more than quoted. |
+| Mistake recorded | Admin opens **Stock → tap the item → Reverse this**, with a reason. Shows in **Admin → Corrections log**. |
 
 **Shortcut:** stickers hold a web link. Pointing the normal phone camera at any sticker opens the app on that item or job.
 
@@ -127,7 +150,9 @@ Quote accepted → New job → Kit the crate → Van collects → Crate back →
 | "Camera blocked" (Android) | In Chrome, tap the icon left of the address → **Permissions → Camera → Allow**. |
 | "Camera blocked" (iPhone) | **Settings → Safari → Camera → Allow**, then reopen the app. |
 | Serial barcode won't scan (iPhone) | Hold steady, fill the screen with the barcode, or type it in the box. |
-| "Wrong secret key" | Check Settings. Run `showKey` in Apps Script to see it again. |
+| Forgot my PIN | Ask an admin: **Admin → Logins → Reset PIN**. |
+| Admin locked out | In Apps Script, run `resetAdmin` for a new temporary admin PIN. |
+| "Changes from another person waiting" | Someone saved work offline and signed out. They must sign in on that phone so the record shows who did it. |
 | "No connection" | No signal. Nothing was saved. Try again when there's signal. |
 | Changed `Code.gs` later | **Deploy → Manage deployments → ✏ Edit → Version: New version → Deploy.** The link stays the same. |
 | Wrong number saved | Movements can't be edited (that's the audit trail). Correct it with a count or a return. |
@@ -138,7 +163,7 @@ Quote accepted → New job → Kit the crate → Van collects → Crate back →
 
 Keep working. Receiving, kitting, van collection, returns, closing jobs and counts are **saved on the phone** and sent to the Sheet automatically when signal returns. The top of the screen shows how many changes are waiting.
 
-Three things need signal, because the Sheet hands out the number: **new jobs, new stickers, new vans.**
+These need signal: **signing in, new jobs, new stickers, new vans, managing logins.**
 
 If another device used the same stock while you were offline, the Sheet refuses the clashing change and the app tells you exactly which one, so nothing goes negative.
 

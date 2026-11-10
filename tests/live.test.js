@@ -26,8 +26,12 @@ const server = http.createServer((req, res) => {
   fs.readFile(p, (e, b) => { if (e) { res.writeHead(404); return res.end(); } res.writeHead(200, { "Content-Type": types[path.extname(p)] || "text/plain" }); res.end(b); });
 });
 
-const key = gas.key;
-const seed = gas.post({ key, ops: [
+// sign the admin in on the "office computer" and seed the Sheet
+const ADMIN_PIN = "482915";
+let lg = gas.post({ action: "login", username: "admin", pin: gas.adminPin });
+assert.ok(gas.post({ action: "changePin", token: lg.token, oldPin: gas.adminPin, newPin: ADMIN_PIN }).ok);
+const key = lg.token;
+const seed = gas.post({ token: key, ops: [
   { op: "upsert", sheet: "Items", rows: [
     { sku: "PV6-RED", name: "PV cable 6 mm² red", uom: "m", track: "qty", cost: 18.5, reorder: 100, allowancePct: 10 },
     { sku: "MC4", name: "MC4 connector pair", uom: "ea", track: "qty", cost: 28, reorder: 20, allowancePct: "" }] },
@@ -44,19 +48,25 @@ assert.ok(seed.ok, seed.error);
   const out = process.argv[2] || "/tmp";
   const browser = await chromium.launch({ executablePath: "/usr/bin/google-chrome", args: ["--no-sandbox"] });
   const context = await browser.newContext({ viewport: { width: 400, height: 860 }, deviceScaleFactor: 2 });
-  await context.addInitScript(k => {
-    if (!localStorage.getItem("sc_cfg")) localStorage.setItem("sc_cfg", JSON.stringify({ mode: "live", url: "http://localhost:8766/exec", key: k, name: "Kyle" }));
-  }, key);
+  await context.addInitScript(() => {
+    if (!localStorage.getItem("sc_cfg")) localStorage.setItem("sc_cfg", JSON.stringify({ mode: "live", url: "http://localhost:8766/exec" }));
+  });
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", e => errors.push(String(e)));
   const text = () => page.locator("#view").innerText();
   const sheetJob = no => gas.sheets.Jobs.rows.find(r => r[0] === no);
 
+  page.on("request", r => { if (r.url().includes("token") || r.url().includes(ADMIN_PIN)) errors.push("secret in URL: " + r.url()); });
+  // admin creates a storeman login from the office; the storeman signs in on the phone
+  assert.ok(gas.post({ action: "users", token: key, cmd: "save", isNew: true, user: { username: "sipho", name: "Sipho M", role: "storeman" }, pin: "5832" }).ok);
   await page.goto("http://localhost:8766/");
+  await page.fill("#lg_user", "sipho"); await page.fill("#lg_pin", "5832");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForSelector("text=Choose your PIN");
+  await page.fill("#cp_old", "5832"); await page.fill("#cp_new", "7140"); await page.fill("#cp_new2", "7140");
+  await page.getByRole("button", { name: "Save my PIN" }).click();
   await page.waitForSelector("text=+ New job");
-  // no key in any URL the app requests
-  page.on("request", r => { if (r.url().includes(key)) errors.push("key leaked in URL: " + r.url()); });
 
   // 1. New job: number comes from the Sheet
   await page.getByRole("button", { name: "+ New job" }).click();
@@ -104,7 +114,7 @@ assert.ok(seed.ok, seed.error);
   await page.waitForSelector("text=Van topped up");
 
   // Meanwhile ANOTHER device takes 5 MC4 from the store (only 10 there): phone's 8 no longer fits.
-  const other = gas.post({ key, ops: [{ op: "append", sheet: "Moves", rows: [{ id: "o1", ts: new Date().toISOString(), type: "topup", sku: "MC4", qty: 5, from: "WH", to: "VAN-1" }] }] });
+  const other = gas.post({ token: key, ops: [{ op: "append", sheet: "Moves", rows: [{ id: "o1", ts: new Date().toISOString(), type: "topup", sku: "MC4", qty: 5, from: "WH", to: "VAN-1" }] }] });
   assert.ok(other.ok, other.error);
 
   // 6. Signal returns: the job close syncs, the clashing top-up is refused and explained
@@ -119,7 +129,16 @@ assert.ok(seed.ok, seed.error);
   assert.strictEqual(sheetMoves.filter(r => r[2] === "topup" && r[3] === "MC4").length, 1, "only the other device's top-up exists");
   await page.screenshot({ path: out + "/live-refused.png" });
 
-  // 7. Correction: reverse the drum receipt partly? Reverse the 3 m return (job closed -> not allowed), reverse a receive instead.
+  // the movements carry the real login, not a typed name
+  assert.ok(gas.sheets.Moves.rows.filter(r => r[7] === "J-1001").every(r => r[15] === "sipho"));
+  // 7. Corrections are admin-only: switch to the admin login on the same phone
+  await page.locator("nav button[data-tab=more]").click();
+  await page.getByRole("button", { name: /My account/ }).click();
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.fill("#lg_user", "admin"); await page.fill("#lg_pin", ADMIN_PIN);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForSelector("text=+ New job");
+  // Correction: reverse the drum receipt partly? Reverse the 3 m return (job closed -> not allowed), reverse a receive instead.
   await page.locator("nav button[data-tab=stock]").click();
   await page.getByRole("button", { name: "MC4 connector pair" }).click();
   await page.waitForSelector("text=Movements");

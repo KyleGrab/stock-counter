@@ -21,7 +21,14 @@ const server = http.createServer((req, res) => {
 
   await page.goto("http://localhost:8765/");
   await page.getByText("Try it with example data").click();
+  // sign in as the demo admin
+  await page.fill("#lg_user", "admin"); await page.fill("#lg_pin", "000000");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForSelector("text=Wrong username or PIN");
+  await page.fill("#lg_user", "Admin"); await page.fill("#lg_pin", "246810");
+  await page.getByRole("button", { name: "Sign in" }).click();
   await page.waitForSelector("text=To kit");
+  assert.ok((await page.locator("#who").innerText()).includes("Admin"));
   assert.ok((await text()).includes("J-1005"));
   await page.screenshot({ path: out + "/1-jobs.png", fullPage: true });
 
@@ -94,10 +101,13 @@ const server = http.createServer((req, res) => {
 
   // Stock + counts + stickers render
   await page.locator("nav button[data-tab=stock]").click();
-  await page.waitForSelector("text=Where the missing stock sits");
-  const st = await text();
-  assert.ok(st.includes("Sipho") && st.includes("Jobs that used more than quoted"));
+  await page.waitForSelector("text=Stock on hand");
   await page.screenshot({ path: out + "/4-stock.png", fullPage: true });
+  await page.getByRole("button", { name: /Missing, last 30 days/ }).click();
+  await page.waitForSelector("text=Where it sits");
+  const st = await text();
+  assert.ok(st.includes("Sipho") && st.includes("Jobs that used more than quoted") && st.includes("Jobs closed with missing stock"));
+  await page.screenshot({ path: out + "/4b-report.png", fullPage: true });
   await page.locator("nav button[data-tab=counts]").click();
   await page.selectOption("#cnt_place", "VAN-1");
   await page.fill("#cnt_MC4", "5"); await page.fill("#cnt_TIES-100", "2"); await page.fill("#cnt_LUG-16", "10"); await page.fill("#cnt_FUSE-DC", "4");
@@ -112,6 +122,57 @@ const server = http.createServer((req, res) => {
   // Opening a sticker link straight from the phone camera
   await page.goto("http://localhost:8765/?c=GS-0001");
   await page.waitForSelector("text=PV cable 6 mm² red");
+
+  // --- roles in the demo ---
+  async function signInAs(u, pin) {
+    await page.locator("nav button[data-tab=more]").click();
+    await page.getByRole("button", { name: /My account/ }).click();
+    await page.getByRole("button", { name: "Sign out" }).click();
+    await page.fill("#lg_user", u); await page.fill("#lg_pin", pin);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await page.locator("nav.tabs").waitFor();
+  }
+  // admin adds a storeman login; the new person must choose their own PIN
+  await page.locator("nav button[data-tab=more]").click();
+  assert.strictEqual((await page.locator("nav button[data-tab=more]").innerText()).trim(), "Admin");
+  await page.getByRole("button", { name: /Logins/ }).click();
+  await page.fill("#us_name", "Thabo Nkosi"); await page.fill("#us_user", "thabo"); await page.fill("#us_pin", "5281");
+  await page.getByRole("button", { name: "Add login" }).click();
+  await page.waitForSelector("text=Temporary PIN for Thabo Nkosi");
+  await page.screenshot({ path: out + "/7-logins.png", fullPage: true });
+  await page.getByRole("button", { name: "← Admin" }).click();
+  await page.getByRole("button", { name: /My account/ }).click();
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await page.fill("#lg_user", "thabo"); await page.fill("#lg_pin", "5281");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForSelector("text=Choose your PIN");
+  assert.ok(await page.locator("nav.tabs").isHidden(), "no app until PIN chosen");
+  await page.fill("#cp_old", "5281"); await page.fill("#cp_new", "1234"); await page.fill("#cp_new2", "1234");
+  await page.getByRole("button", { name: "Save my PIN" }).click();
+  await page.waitForSelector("text=simple run");
+  await page.fill("#cp_new", "7319"); await page.fill("#cp_new2", "7319");
+  await page.getByRole("button", { name: "Save my PIN" }).click();
+  await page.getByRole("button", { name: "+ New job" }).waitFor();
+  // storeman: works, but no admin section and no corrections
+  assert.strictEqual((await page.locator("nav button[data-tab=more]").innerText()).trim(), "More");
+  assert.ok(await page.locator("nav button[data-tab=scan]").isVisible());
+  await page.locator("nav button[data-tab=stock]").click();
+  assert.ok(!(await text()).includes("Missing, last 30 days"), "storeman doesn't see the missing-stock report");
+  await page.getByRole("button", { name: "PV cable 6 mm² red" }).click();
+  await page.waitForSelector("text=Movements");
+  assert.strictEqual(await page.getByRole("button", { name: "Reverse this" }).count(), 0, "storeman can't reverse");
+  // viewer: look only
+  await signInAs("owner", "8642");
+  assert.ok(await page.locator("nav button[data-tab=scan]").isHidden());
+  assert.ok(await page.locator("nav button[data-tab=counts]").isHidden());
+  assert.strictEqual(await page.getByRole("button", { name: "+ New job" }).count(), 0);
+  await page.getByText("J-1003").click();
+  await page.waitForSelector("text=View only");
+  await page.locator("nav button[data-tab=more]").click();
+  await page.getByRole("button", { name: /Missing stock report/ }).click();
+  await page.waitForSelector("text=Where it sits");
+  await page.screenshot({ path: out + "/8-viewer-report.png", fullPage: true });
+  await signInAs("admin", "246810");
 
   // dark mode renders
   await page.emulateMedia({ colorScheme: "dark" });

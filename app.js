@@ -11,7 +11,8 @@ var LS = {
   get: function (k, d) { try { var v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
   set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 };
-var cfg = Object.assign({ mode: null, url: "", key: "", name: "", site: "" }, LS.get("sc_cfg", {}));
+var cfg = Object.assign({ mode: null, url: "", token: "", user: null, site: "" }, LS.get("sc_cfg", {}));
+delete cfg.key; delete cfg.name;   // replaced by logins in v1.2
 function saveCfg() { LS.set("sc_cfg", cfg); }
 function siteUrl() { return (cfg.site || (location.origin + location.pathname)).replace(/\?.*$/, ""); }
 
@@ -21,7 +22,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.1";
+var APP_VERSION = "1.2";
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
@@ -74,63 +75,168 @@ function applyOpsLocal(d, ops) {
 
 /* ===================== backends ===================== */
 var NUMBERING = { Jobs: ["J-", 4, 1001], Labels: ["GS-", 4, 1], Vans: ["VAN-", 0, 1] };
-// Demo mode: a pretend Sheet on this phone that follows the same rules as Code.gs.
+
+// The same role rules the Sheet enforces (Code.gs permitted_). Used by the demo, and to hide buttons.
+function permitted(op, role) {
+  if (role === "admin") return null;
+  if (role !== "storeman") return "Your login can view only.";
+  if (op.op === "append") return (op.rows || []).some(function (r) { return r.type === "reverse"; }) ? "Only an admin can record corrections." : null;
+  if (op.op === "create") return op.sheet === "Jobs" || op.sheet === "Labels" ? null : "Only an admin can add vans.";
+  if (op.op === "replaceLines") return null;
+  if (op.op === "upsert") {
+    if (op.sheet === "Jobs") return null;
+    if (op.sheet === "Items" && (op.rows || []).every(function (r) { return Object.keys(r).every(function (k) { return k === "sku" || k === "cost"; }); })) return null;
+    return "Only an admin can change " + (op.sheet === "Items" ? "items." : op.sheet === "VanKit" ? "the van kit." : op.sheet + ".");
+  }
+  return "Only an admin can do that.";
+}
+function pinProblem(pin, role) {
+  var min = role === "admin" ? 6 : 4;
+  pin = String(pin || "");
+  if (!/^\d+$/.test(pin) || pin.length < min || pin.length > 8) return "PIN must be " + min + " to 8 digits" + (role === "admin" ? " for admins." : ".");
+  if (/^(\d)\1+$/.test(pin) || "0123456789".indexOf(pin) >= 0 || "9876543210".indexOf(pin) >= 0) return "Choose a PIN that isn't all the same digit or a simple run like 1234.";
+  return null;
+}
+function suggestPin(len) {
+  var p = "";
+  do { p = ""; var a = new Uint32Array(len); crypto.getRandomValues(a); for (var i = 0; i < len; i++) p += String(a[i] % 10); } while (pinProblem(p, len >= 6 ? "admin" : "storeman"));
+  return p;
+}
+
+/*
+ * Demo mode: a pretend Sheet on this phone that follows the same rules as Code.gs,
+ * including logins and roles, so the demo behaves like the real thing.
+ */
+var DEMO_USERS = [
+  { username: "admin", name: "Kyle (admin)", role: "admin", active: "yes", mustChange: "no", pin: "246810" },
+  { username: "sipho", name: "Sipho (storeman)", role: "storeman", active: "yes", mustChange: "no", pin: "1357" },
+  { username: "owner", name: "Owner (viewer)", role: "viewer", active: "yes", mustChange: "no", pin: "8642" }
+];
+function demoErr(msg, signIn) { var e = new Error(msg); e.signIn = !!signIn; return e; }
 var demo = {
-  sync: function (body) {
+  users: function () { return LS.get("sc_demo_users", null) || JSON.parse(JSON.stringify(DEMO_USERS)); },
+  publicUser: function (u) { return { username: u.username, name: u.name, role: u.role, mustChange: u.mustChange === "yes" }; },
+  call: function (action, body) {
+    var self = this;
     return new Promise(function (resolve, reject) {
-      var d = LS.get("sc_demo", null) || seedDemo();
-      var done = LS.get("sc_demo_batches", {});
-      var assigned = {};
       try {
-        if (body.ops && body.ops.length) {
-          if (done[body.batch]) assigned = done[body.batch];
-          else {
-            var work = JSON.parse(JSON.stringify(d)), newMoves = [];
-            body.ops.forEach(function (raw) {
-              var op = JSON.parse(JSON.stringify(raw), function (k, v) {
-                if (typeof v !== "string" || k === "ref") return v;
-                Object.keys(assigned).forEach(function (r) { v = v.replace(new RegExp(r.replace(/[$]/g, "\\$&") + "(?![A-Za-z0-9_])", "g"), assigned[r]); });
-                return v;
-              });
-              if (op.op === "create") {
-                var nb = NUMBERING[op.sheet], key = KEYS[op.sheet];
-                var id = C.nextNumber(work[op.sheet].map(function (r) { return r[key]; }), nb[0], nb[1]);
-                if (parseInt(id.slice(nb[0].length), 10) < nb[2]) { id = String(nb[2]); while (id.length < nb[1]) id = "0" + id; id = nb[0] + id; }
-                var row = Object.assign({}, op.row); row[key] = id; work[op.sheet].push(row);
-                if (op.ref) assigned[op.ref] = id;
-                return;
-              }
-              if (op.op === "upsert" && op.expect) {
-                op.rows.forEach(function (r) {
-                  var cur = work[op.sheet].find(function (x) { return x[KEYS[op.sheet]] === r[KEYS[op.sheet]]; });
-                  var now = cur ? String(cur[op.expect.field]) : "";
-                  if (op.expect.values.indexOf(now) < 0) throw new Error("Job " + r[KEYS[op.sheet]] + " was already moved on (now '" + (now || "missing") + "'), probably on another device. Refresh.");
-                });
-              }
-              if (op.op === "replaceLines") {
-                var j = work.Jobs.find(function (x) { return x.no === op.job; });
-                if (j && j.status !== "quoted") throw new Error("Job " + op.job + " is already kitted. Its quote materials can't change now.");
-              }
-              if (op.op === "append") {
-                var have = {}; work.Moves.forEach(function (m) { have[m.id] = 1; });
-                newMoves = newMoves.concat(op.rows.filter(function (m) { return !have[m.id]; }));
-              }
-              applyOpsLocal(work, [op]);
-            });
-            var items = {}; work.Items.forEach(function (i) { items[i.sku] = i; });
-            var problem = C.checkBalances(d.Moves, newMoves, items);
-            if (problem) throw new Error(problem);
-            d = work; done[body.batch] = assigned;
-            LS.set("sc_demo", d); LS.set("sc_demo_batches", done);
-          }
+        var users = self.users(), sessions = LS.get("sc_demo_sessions", {});
+        if (action === "login") {
+          var u = users.find(function (x) { return x.username === String(body.username || "").trim().toLowerCase(); });
+          if (!u || u.pin !== String(body.pin)) throw demoErr("Wrong username or PIN.");
+          if (u.active !== "yes") throw demoErr("This login has been switched off. Ask an admin.");
+          var t = uid() + uid();
+          sessions[t] = u.username; LS.set("sc_demo_sessions", sessions);
+          u.lastLogin = now(); LS.set("sc_demo_users", users);
+          return resolve({ ok: true, token: t, user: self.publicUser(u) });
         }
-        if (!LS.get("sc_demo", null)) LS.set("sc_demo", d);
-        var out = JSON.parse(JSON.stringify(d)), have2 = Number(body.have) || 0, total = out.Moves.length;
-        var from = have2 > 0 && have2 <= total ? have2 : 0;
-        out.Moves = out.Moves.slice(from); out.movesFrom = from; out.movesTotal = total;
-        resolve({ assigned: assigned, data: out });
+        var me = users.find(function (x) { return x.username === sessions[body.token]; });
+        if (!me || me.active !== "yes") throw demoErr("Please sign in again.", true);
+        if (me.mustChange === "yes" && action !== "changePin" && action !== "logout") throw demoErr("Choose your own PIN first.", true);
+        if (action === "logout") { delete sessions[body.token]; LS.set("sc_demo_sessions", sessions); return resolve({ ok: true }); }
+        if (action === "changePin") {
+          if (me.pin !== String(body.oldPin)) throw demoErr("Your current PIN is wrong.");
+          var pp = pinProblem(body.newPin, me.role); if (pp) throw demoErr(pp);
+          me.pin = String(body.newPin); me.mustChange = "no"; LS.set("sc_demo_users", users);
+          return resolve({ ok: true, user: self.publicUser(me) });
+        }
+        if (action === "users") return resolve(self.usersCmd(body, me, users, sessions));
+        if (action === "sync") return resolve(self.sync(body, me, users));
+        throw demoErr("Unknown request.");
       } catch (e) { reject(e); }
     });
+  },
+  listUsers: function (users) { return users.map(function (u) { return { username: u.username, name: u.name, role: u.role, active: u.active, mustChange: u.mustChange, lastLogin: u.lastLogin || "" }; }); },
+  endSessions: function (sessions, username) { Object.keys(sessions).forEach(function (t) { if (sessions[t] === username) delete sessions[t]; }); LS.set("sc_demo_sessions", sessions); },
+  usersCmd: function (body, me, users, sessions) {
+    if (me.role !== "admin") throw demoErr("Only an admin can manage logins.");
+    if (body.cmd === "save") {
+      var u = body.user || {}, name = String(u.username || "").trim().toLowerCase();
+      if (!/^[a-z0-9._-]{2,30}$/.test(name)) throw demoErr("Username: 2 to 30 letters, numbers, dots or dashes. No spaces.");
+      if (["admin", "storeman", "viewer"].indexOf(u.role) < 0) throw demoErr("Choose a role.");
+      if (!String(u.name || "").trim()) throw demoErr("Add the person's name.");
+      var cur = users.find(function (x) { return x.username === name; });
+      if (cur && body.isNew) throw demoErr("That username is taken. Choose another.");
+      var active = u.active === "no" ? "no" : "yes";
+      var after = users.filter(function (x) { return x.username !== name; }).concat([{ role: u.role, active: active }]);
+      if (!after.some(function (x) { return x.role === "admin" && x.active === "yes"; })) throw demoErr("There must always be at least one active admin.");
+      if (name === me.username && (active === "no" || u.role !== "admin")) throw demoErr("You can't switch off or demote your own admin login.");
+      if (!cur) {
+        var p1 = pinProblem(body.pin, u.role); if (p1) throw demoErr(p1);
+        users.push({ username: name, name: u.name.trim(), role: u.role, active: active, mustChange: "yes", pin: String(body.pin), created: now() });
+      } else {
+        var promoted = u.role === "admin" && cur.role !== "admin";
+        if (promoted) { var p2 = pinProblem(body.pin, "admin"); if (p2) throw demoErr(p2); cur.pin = String(body.pin); cur.mustChange = "yes"; }
+        if (active === "no" || u.role !== cur.role) this.endSessions(sessions, name);
+        cur.name = u.name.trim(); cur.role = u.role; cur.active = active;
+      }
+      LS.set("sc_demo_users", users);
+      return { ok: true, users: this.listUsers(users) };
+    }
+    if (body.cmd === "resetPin") {
+      var t = users.find(function (x) { return x.username === body.username; });
+      if (!t) throw demoErr("That login no longer exists.");
+      var p3 = pinProblem(body.pin, t.role); if (p3) throw demoErr(p3);
+      t.pin = String(body.pin); t.mustChange = "yes"; this.endSessions(sessions, t.username);
+      LS.set("sc_demo_users", users);
+      return { ok: true, users: this.listUsers(users) };
+    }
+    throw demoErr("Unknown request.");
+  },
+  sync: function (body, me, users) {
+    var d = LS.get("sc_demo", null) || seedDemo();
+    var done = LS.get("sc_demo_batches", {}) || {};
+    var assigned = {};
+    if (body.ops && body.ops.length) {
+      if (done[body.batch]) assigned = done[body.batch];
+      else {
+        var work = JSON.parse(JSON.stringify(d)), newMoves = [];
+        body.ops.forEach(function (raw) {
+          var op = JSON.parse(JSON.stringify(raw), function (k, v) {
+            if (typeof v !== "string" || k === "ref") return v;
+            Object.keys(assigned).forEach(function (r) { v = v.replace(new RegExp(r.replace(/[$]/g, "\\$&") + "(?![A-Za-z0-9_])", "g"), assigned[r]); });
+            return v;
+          });
+          var why = permitted(op, me.role); if (why) throw demoErr(why);
+          if (op.op === "create") {
+            var nb = NUMBERING[op.sheet], key = KEYS[op.sheet];
+            var id = C.nextNumber(work[op.sheet].map(function (r) { return r[key]; }), nb[0], nb[1]);
+            if (parseInt(id.slice(nb[0].length), 10) < nb[2]) { id = String(nb[2]); while (id.length < nb[1]) id = "0" + id; id = nb[0] + id; }
+            var row = Object.assign({}, op.row); row[key] = id; work[op.sheet].push(row);
+            if (op.ref) assigned[op.ref] = id;
+            return;
+          }
+          if (op.op === "upsert" && op.expect) {
+            op.rows.forEach(function (r) {
+              var cur = work[op.sheet].find(function (x) { return x[KEYS[op.sheet]] === r[KEYS[op.sheet]]; });
+              var nowS = cur ? String(cur[op.expect.field]) : "";
+              if (op.expect.values.indexOf(nowS) < 0) throw demoErr("Job " + r[KEYS[op.sheet]] + " was already moved on (now '" + (nowS || "missing") + "'), probably on another device. Refresh.");
+            });
+          }
+          if (op.op === "replaceLines") {
+            var j = work.Jobs.find(function (x) { return x.no === op.job; });
+            if (j && j.status !== "quoted") throw demoErr("Job " + op.job + " is already kitted. Its quote materials can't change now.");
+          }
+          if (op.op === "append") {
+            var have = {}; work.Moves.forEach(function (m) { have[m.id] = 1; });
+            op.rows = op.rows.filter(function (m) { return !have[m.id]; }).map(function (m) { return Object.assign({}, m, { by: me.username }); });
+            newMoves = newMoves.concat(op.rows);
+          }
+          applyOpsLocal(work, [op]);
+        });
+        var items = {}; work.Items.forEach(function (i) { items[i.sku] = i; });
+        var problem = C.checkBalances(d.Moves, newMoves, items);
+        if (problem) throw demoErr(problem);
+        d = work; done[body.batch] = assigned;
+        LS.set("sc_demo", d); LS.set("sc_demo_batches", done);
+      }
+    }
+    if (!LS.get("sc_demo", null)) LS.set("sc_demo", d);
+    var out = JSON.parse(JSON.stringify(d)), have2 = Number(body.have) || 0, total = out.Moves.length;
+    var from = have2 > 0 && have2 <= total ? have2 : 0;
+    out.Moves = out.Moves.slice(from); out.movesFrom = from; out.movesTotal = total;
+    if (me.role === "admin") out.Users = this.listUsers(users);
+    return { ok: true, assigned: assigned, data: out, user: this.publicUser(me) };
   }
 };
 function netError() { var e = new Error("No signal. Your change is saved on this phone and will sync automatically."); e.net = true; return e; }
@@ -139,22 +245,36 @@ function post(url, body) {
     .then(function (res) { return res.text(); }, function () { throw netError(); })
     .then(function (t) {
       var j;
-      try { j = JSON.parse(t); } catch (e) { var er = new Error("The Google Sheet didn't answer properly. Check the web app link in More → Settings."); er.net = true; throw er; }
-      if (!j.ok) throw new Error(j.error || "Save refused.");
+      try { j = JSON.parse(t); } catch (e) { var er = new Error("The Google Sheet didn't answer properly. Check the web app link."); er.net = true; throw er; }
+      if (!j.ok) { var e2 = new Error(j.error || "Refused."); e2.signIn = !!j.signIn; throw e2; }
       return j;
     });
 }
 var api = {
+  call: function (action, body) {
+    body = Object.assign({ action: action, token: cfg.token || "" }, body || {});
+    var p = cfg.mode === "demo" ? demo.call(action, body) : post(cfg.url, body);
+    return p.catch(function (e) { if (e.signIn) signedOut(e.message); throw e; });
+  },
   sync: function (ops, batch, have) {
-    var body = { key: cfg.key, ops: ops || [], batch: batch || "", have: have == null ? SD.Moves.length : have };
-    if (cfg.mode === "demo") return demo.sync(body);
-    return post(cfg.url, body);
+    return api.call("sync", { ops: ops || [], batch: batch || "", have: have == null ? SD.Moves.length : have }).then(function (res) {
+      if (res.user) { cfg.user = res.user; saveCfg(); }
+      return res;
+    });
   }
 };
+// The Sheet said this sign-in is no longer valid. Keep queued work; ask to sign in again.
+function signedOut(msg) {
+  cfg.token = ""; saveCfg(); stopCam();
+  S.loginMsg = msg; S.tab = "jobs"; S.sub = null; S.job = null; S.item = null; S.f = {};
+  setTimeout(render, 0);
+}
+
 // Take the Sheet's answer into SD. Movements arrive as "only the new ones" when possible.
 function applyServer(res) {
   var d = res.data;
   TABS.forEach(function (t) { if (t !== "Moves") SD[t] = d[t] || []; });
+  if (d.Users) S.users = d.Users;
   if (d.movesFrom === 0) SD.Moves = d.Moves;
   else if (d.movesFrom === SD.Moves.length) SD.Moves = SD.Moves.concat(d.Moves);
   else { SD.Moves = []; return false; } // out of step: caller does a full reload
@@ -177,7 +297,7 @@ function dtime(s) { return s ? new Date(s).toLocaleString("en-ZA", { day: "numer
 function now() { return new Date().toISOString(); }
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 function mv(type, sku, qty, from, to, extra) {
-  return Object.assign({ id: uid(), ts: now(), type: type, sku: sku, qty: C.round2(qty), from: from, to: to, by: cfg.name || "",
+  return Object.assign({ id: uid(), ts: now(), type: type, sku: sku, qty: C.round2(qty), from: from, to: to, by: (cfg.user && cfg.user.username) || "",
     value: C.round2(n(qty) * cost(sku)) }, extra || {});
 }
 function bal(loc, sku) { return C.bal(X.B, loc, sku); }
@@ -190,6 +310,10 @@ function serialPlace(serial) {
   D.Moves.forEach(function (m) { if (m.serial && String(m.serial).toUpperCase() === serial) at = m.to; });
   return at;
 }
+var ROLE_LABEL = { admin: "Admin", storeman: "Storeman", viewer: "Viewer" };
+function role() { return (cfg.user && cfg.user.role) || ""; }
+function isAdmin() { return role() === "admin"; }
+function canWork() { return role() === "admin" || role() === "storeman"; }
 var STATUS = { quoted: "Quoted", kitted: "Ready for van", out: "On site", closed: "Closed" };
 
 /* ===================== screen state ===================== */
@@ -204,7 +328,10 @@ function go(tab, extra) {
 }
 function setStatus(k, t) { $("#dot").className = "dot " + (k || ""); $("#statusText").textContent = t; }
 function syncStatus() {
+  var who = $("#who");
+  if (who) { who.hidden = !(cfg.token && cfg.user); if (cfg.user) who.textContent = cfg.user.name + " · " + ROLE_LABEL[cfg.user.role]; }
   if (!cfg.mode) return setStatus("", "Not connected");
+  if (!cfg.token) return setStatus("", "Signed out");
   if (Q.length) return setStatus("err", Q.length + (Q.length === 1 ? " change" : " changes") + " waiting to sync");
   setStatus("ok", cfg.mode === "demo" ? "Demo" : "Up to date " + new Date().toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" }));
 }
@@ -222,6 +349,7 @@ function save(ops, okMsg, after, opts) {
       S.msg = { k: "ok", t: okMsg };
       if (after) after(res.assigned || {});
     }).catch(function (e) {
+      if (e.signIn) return;
       S.msg = { k: "err", t: e.net ? "This needs signal (the Sheet hands out the number). Try again when you're connected." : e.message };
     }).then(function () { S.busy = false; syncStatus(); render(); });
   }
@@ -230,7 +358,7 @@ function save(ops, okMsg, after, opts) {
   ops.forEach(function (op) { if (op.op === "append") newMoves = newMoves.concat(op.rows); });
   var problem = C.checkBalances(D.Moves, newMoves, X.items);
   if (problem) return flash("err", problem);
-  Q.push({ batch: uid(), ops: ops, label: okMsg, ts: now() });
+  Q.push({ batch: uid(), ops: ops, label: okMsg, ts: now(), user: (cfg.user && cfg.user.username) || "" });
   persist(); rebuild();
   S.msg = { k: "ok", t: okMsg };
   if (after) after({});
@@ -241,7 +369,7 @@ function save(ops, okMsg, after, opts) {
 
 var flushing = false;
 function flush() {
-  if (flushing || !Q.length || !cfg.mode) return;
+  if (flushing || !Q.length || !cfg.mode || !cfg.token) return;
   flushing = true;
   var b = Q[0];
   api.sync(b.ops, b.batch).then(function (res) {
@@ -251,7 +379,7 @@ function flush() {
     if (Q.length) flush(); else { syncStatus(); render(); }
   }).catch(function (e) {
     flushing = false;
-    if (e.net) { syncStatus(); return; }      // no signal: keep it, try again later
+    if (e.net || e.signIn) { syncStatus(); return; }      // no signal or signed out: keep it, try again later
     // The Sheet refused it (e.g. stock used on another device). Drop it and tell the person.
     Q.shift(); persist();
     S.msg = { k: "err", t: "Not saved: " + b.label + " Reason: " + e.message };
@@ -259,27 +387,27 @@ function flush() {
   });
 }
 function fullReload() {
-  if (!cfg.mode) { S.loading = false; syncStatus(); render(); return Promise.resolve(); }
+  if (!cfg.mode || !cfg.token) { S.loading = false; syncStatus(); render(); return Promise.resolve(); }
   return api.sync([], "", 0).then(function (res) {
     SD.Moves = []; applyServer(res); S.loading = false; syncStatus(); render(); flush();
   }).catch(function (e) {
     S.loading = false;
-    if (!e.net) S.msg = { k: "err", t: e.message };
-    syncStatus(); if (!Q.length) setStatus("err", "Offline: showing saved data");
+    if (!e.net && !e.signIn) S.msg = { k: "err", t: e.message };
+    syncStatus(); if (!Q.length && e.net) setStatus("err", "Offline: showing saved data");
     render();
   });
 }
 function pull() {
-  if (!cfg.mode || flushing || Q.length) return flush();
+  if (!cfg.mode || !cfg.token || flushing || Q.length) return flush();
   api.sync([], "").then(function (res) { if (!applyServer(res)) return fullReload(); syncStatus(); render(); }).catch(function () { syncStatus(); });
 }
 function reload() {
   rebuild();
-  if (!cfg.mode) { S.loading = false; syncStatus(); render(); return Promise.resolve(); }
+  if (!cfg.mode || !cfg.token) { S.loading = false; syncStatus(); render(); return Promise.resolve(); }
   if (SD.Moves.length || SD.Items.length) { S.loading = false; render(); }   // show saved data at once
   setStatus("", "Syncing…");
   return (Q.length ? Promise.resolve(flush()) : api.sync([], "").then(function (res) { if (!applyServer(res)) return fullReload(); }))
-    .catch(function (e) { if (!e.net) S.msg = { k: "err", t: e.message }; })
+    .catch(function (e) { if (!e.net && !e.signIn) S.msg = { k: "err", t: e.message }; })
     .then(function () { S.loading = false; syncStatus(); if (!Q.length && !navigator.onLine) setStatus("err", "Offline: showing saved data"); render(); });
 }
 window.addEventListener("online", flush);
@@ -287,11 +415,25 @@ setInterval(function () { if (Q.length) flush(); }, 30000);
 
 /* ===================== render ===================== */
 function render() {
-  document.querySelectorAll("nav.tabs button").forEach(function (b) { b.classList.toggle("on", b.dataset.tab === S.tab && b.dataset.tab !== "scan"); });
+  var signedIn = !!(cfg.mode && cfg.token && cfg.user);
+  var ready = signedIn && !cfg.user.mustChange;
+  var nav = document.querySelector("nav.tabs");
+  nav.hidden = !ready;
+  document.body.classList.toggle("nonav", !ready);
+  document.querySelectorAll("nav.tabs button").forEach(function (b) {
+    var t = b.dataset.tab;
+    b.hidden = (t === "scan" || t === "counts") && !canWork();
+    b.classList.toggle("on", t === S.tab && t !== "scan");
+    if (t === "more") b.lastChild.textContent = isAdmin() ? "Admin" : "More";
+  });
+  if (!canWork() && (S.tab === "scan" || S.tab === "counts")) S.tab = "jobs";
   $("#demoBar").hidden = cfg.mode !== "demo";
+  syncStatus();
   var v = $("#view");
   var html;
-  if (!cfg.mode && !(S.tab === "more" && S.sub === "settings")) html = vWelcome();
+  if (!cfg.mode) html = vWelcome();
+  else if (!signedIn) html = vLogin();
+  else if (cfg.user.mustChange) html = vChangePinFirst();
   else if (S.loading) html = '<p class="muted">Loading stock…</p>';
   else html = ({ jobs: vJobs, stock: vStock, scan: vScan, counts: vCounts, more: vMore })[S.tab]();
   // keep what the person was typing
@@ -303,11 +445,11 @@ function render() {
 }
 
 function vWelcome() {
-  return '<section class="panel"><h2>Welcome</h2>' +
+  return '<section class="panel login"><h2>Welcome</h2>' +
     '<p>Every metre that leaves the store is tied to a job, and has to come back or be explained.</p>' +
     '<button class="btn wide" data-action="startDemo">Try it with example data</button>' +
-    '<button class="btn ghost wide" data-action="startLive">Connect our Google Sheet</button>' +
-    '<p class="small muted">Demo data stays on this phone only. You can switch any time in More → Settings.</p></section>';
+    '<button class="btn ghost wide" data-action="goLive">Connect our Google Sheet</button>' +
+    '<p class="small muted">Demo data stays on this phone only. You can switch any time.</p></section>';
 }
 
 /* ---------- Jobs ---------- */
@@ -333,12 +475,12 @@ function vJobs() {
     return '<section class="list"><div class="spread"><h3>' + title + ' <span class="muted">(' + list.length + ")</span></h3>" +
       (hint ? '<span class="tiny muted">' + hint + "</span>" : "") + "</div>" + list.slice(0, limit || 99).map(card).join("") + "</section>";
   }
-  return '<div class="spread"><h2>Jobs</h2><button class="btn small" data-action="newJob">+ New job</button></div>' + msgHtml() +
+  return '<div class="spread"><h2>Jobs</h2>' + (canWork() ? '<button class="btn small" data-action="newJob">+ New job</button>' : "") + "</div>" + msgHtml() +
     sec("To kit", groups.quoted, "Pick these into a crate") +
     sec("Ready for van", groups.kitted, "Scan the crate when collected") +
     sec("On site", groups.out, "Check the crate when it comes back") +
     sec("Closed", groups.closed, "Latest 10", 10) +
-    (D.Jobs.length ? "" : '<p class="muted">No jobs yet. Start with + New job and copy the materials from the quote.</p>');
+    (D.Jobs.length ? "" : '<p class="muted">No jobs yet.' + (canWork() ? " Start with + New job and copy the materials from the quote." : "") + "</p>");
 }
 
 function vJobForm() {
@@ -376,7 +518,8 @@ function vJob(j) {
     '<div class="small muted">' + esc(j.type) + " · " + esc(vanName(j.van)) + " · " + esc(j.installer) + "</div></div>" +
     '<span class="pill p-' + esc(j.status) + '">' + STATUS[j.status] + "</span></div>" + steps(j.status);
   var body = "";
-  if (j.status === "quoted") body = vKit(j, sum);
+  if (!canWork() && j.status !== "closed") body = '<p class="small muted">View only. ' + STATUS[j.status] + ".</p>" + summaryTable(sum, false);
+  else if (j.status === "quoted") body = vKit(j, sum);
   else if (j.status === "kitted") body = vCollect(j, sum);
   else if (j.status === "out") body = vReturn(j, sum);
   else body = vClosed(j, sum);
@@ -538,28 +681,16 @@ function vStock() {
       '<td class="n">' + q(wh, it.sku) + (low ? ' <span class="pill p-kitted">Order</span>' : "") + (wh < -1e-9 ? ' <span class="pill p-bad">Check</span>' : "") + "</td>" +
       '<td class="n">' + q(vv, it.sku) + '</td><td class="n">' + q(jb, it.sku) + '</td><td class="n">' + R((wh + vv + jb) * cost(it.sku)) + "</td></tr>";
   }).join("");
+  var seesLoss = role() === "admin" || role() === "viewer";
   var L = C.losses(D.Moves, 30);
-  function ranked(o, nm) {
-    var e = Object.keys(o).map(function (k) { return [k, o[k]]; }).filter(function (x) { return Math.abs(x[1]) > 0.004; }).sort(function (a, b) { return b[1] - a[1]; });
-    return e.length ? e.map(function (x) { return "<tr><td>" + esc(nm(x[0])) + '</td><td class="n">' + R(x[1]) + "</td></tr>"; }).join("") : '<tr><td class="muted">Nothing missing</td><td></td></tr>';
-  }
-  var since = Date.now() - 30 * 864e5;
-  var overJobs = D.Jobs.filter(function (j) { return j.status === "closed" && new Date(j.closedAt).getTime() >= since; }).map(function (j) {
-    return { j: j, f: C.overQuote(C.jobSummary(j.no, D.Lines, D.Moves, X.items), 10) };
-  }).filter(function (x) { return x.f.length; });
+  var low = D.Items.filter(function (it) { return n(it.reorder) > 0 && bal("WH", it.sku) < n(it.reorder); });
   return "<h2>Stock</h2>" + msgHtml() +
-    '<div class="kpis"><div class="kpi"><div class="l">Missing, last 30 days</div><div class="v ' + (L.total > 0 ? "bad" : "") + '">' + R(L.total) + "</div></div>" +
+    '<div class="kpis">' + (seesLoss ? '<button class="kpi kpibtn" data-action="sub" data-tab2="more" data-sub="reports"><div class="l">Missing, last 30 days ›</div><div class="v ' + (L.total > 0 ? "bad" : "") + '">' + R(L.total) + "</div></button>" :
+      '<div class="kpi"><div class="l">Items to order</div><div class="v' + (low.length ? " bad" : "") + '">' + low.length + "</div></div>") +
     '<div class="kpi"><div class="l">In store</div><div class="v">' + R(whVal) + '</div></div><div class="kpi"><div class="l">In vans</div><div class="v">' + R(vanVal) + "</div></div>" +
     '<div class="kpi"><div class="l">Out on jobs</div><div class="v">' + R(jobVal) + "</div></div></div>" +
-    '<section class="panel"><h3>Where the missing stock sits (30 days)</h3><div class="row" style="align-items:flex-start">' +
-    '<div class="tablewrap" style="flex:1 1 220px"><table><thead><tr><th>Installer</th><th class="n">Value</th></tr></thead><tbody>' + ranked(L.byInstaller, function (x) { return x; }) + "</tbody></table></div>" +
-    '<div class="tablewrap" style="flex:1 1 220px"><table><thead><tr><th>Van / place</th><th class="n">Value</th></tr></thead><tbody>' + ranked(L.byVan, vanName) + "</tbody></table></div></div>" +
-    '<p class="tiny muted">One bad job is noise. The same name at the top every month is a pattern worth a conversation.</p></section>' +
-    (overJobs.length ? '<section class="panel"><h3>Jobs that used more than quoted</h3><div class="tablewrap"><table><thead><tr><th>Job</th><th>Item</th><th class="n">Over</th></tr></thead><tbody>' +
-      overJobs.map(function (x) { return x.f.map(function (f) { return "<tr><td>" + esc(x.j.no) + '<div class="tiny muted">' + esc(x.j.type) + "</div></td><td>" + esc(nameOf(f.sku)) + '</td><td class="n">+' + Math.round(f.overPct) + "%</td></tr>"; }).join(""); }).join("") +
-      '</tbody></table></div><p class="tiny muted">If the same job type keeps going over, the quote template is too low and the business is losing margin.</p></section>' : "") +
     '<section class="panel"><h3>Stock on hand</h3><div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">Store</th><th class="n">Vans</th><th class="n">Jobs</th><th class="n">Value</th></tr></thead><tbody>' + rows + "</tbody></table></div>" +
-    '<p class="tiny muted">Value uses the average landed cost of each item. Tap an item to see every movement and correct mistakes.</p></section>';
+    '<p class="tiny muted">Value uses the average landed cost of each item. Tap an item to see every movement' + (isAdmin() ? " and correct mistakes." : ".") + "</p></section>";
 }
 
 /* ---------- Item history & corrections ---------- */
@@ -568,7 +699,7 @@ var MOVE_LABEL = { receive: "Received", kit: "Kitted to job", extra: "Extra to j
 var REVERSIBLE = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1 };
 function placeName(l) { return !l ? "" : l === "WH" ? "Store" : l.indexOf("JOB:") === 0 ? l.slice(4) : l === "SUPPLIER" ? "Supplier" : l === "USED" ? "Used" : l === "LOSS" ? "Lost/found" : l === "SCRAP" ? "Scrap" : vanName(l); }
 function canReverse(m) {
-  if (!REVERSIBLE[m.type]) return false;
+  if (!isAdmin() || !REVERSIBLE[m.type]) return false;
   if (D.Moves.some(function (x) { return x.type === "reverse" && x.ref === m.id; })) return false;
   if (m.job) { var j = X.jobs[m.job]; if (!j || j.status !== "out") return false; }
   return true;
@@ -635,17 +766,34 @@ function vCounts() {
     msgHtml() + '<button class="btn wide" data-action="saveCount"' + (S.busy || !skus.length ? " disabled" : "") + ">Save count</button></section>";
 }
 
-/* ---------- More ---------- */
-function vMore() {
-  if (S.sub === "items") return vItems();
-  if (S.sub === "labels") return vLabels();
-  if (S.sub === "vans") return vVans();
-  if (S.sub === "settings") return vSettings();
-  function item(sub, t, d) { return '<button class="card" data-action="sub" data-sub="' + sub + '"><div><h3>' + t + '</h3><div class="small muted">' + d + "</div></div><span>›</span></button>"; }
-  return '<h2>More</h2><div class="list">' + item("labels", "Stickers", "Make QR stickers for drums, bins and shelves") + item("items", "Items", "Products, units, reorder levels") +
-    item("vans", "Vans and van kit", "Vans and the small parts each one carries") + item("settings", "Settings", "Google Sheet connection, your name") + "</div>";
+/* ---------- More / Admin ---------- */
+function tile(sub, title, desc, badge) {
+  return '<button class="card" data-action="sub" data-sub="' + sub + '"><div><h3>' + title + '</h3><div class="small muted">' + desc + "</div></div>" +
+    '<div class="right">' + (badge || "") + "<span aria-hidden=\"true\">›</span></div></button>";
 }
-function backMore() { return '<div class="row"><button class="btn ghost small" data-action="sub" data-sub="">← More</button></div>'; }
+function vMore() {
+  var subs = { items: vItems, labels: vLabels, vans: vVans, account: vAccount, users: vUsers, reports: vReports, corrections: vCorrections };
+  var adminOnly = { items: 1, vans: 1, users: 1, corrections: 1 };
+  if (S.sub && subs[S.sub] && (!adminOnly[S.sub] || isAdmin()) && !(S.sub === "reports" && role() === "storeman")) return subs[S.sub]();
+  if (isAdmin()) {
+    var L = C.losses(D.Moves, 30);
+    var users = S.users || [];
+    var reversals = D.Moves.filter(function (m) { return m.type === "reverse"; }).length;
+    return '<h2>Admin</h2><p class="small muted">Only admins see this section. Every change here is checked by the Google Sheet.</p><div class="list">' +
+      tile("users", "Logins", "Who can sign in, their role, PIN resets", users.length ? '<span class="pill p-quoted">' + users.filter(function (u) { return u.active === "yes"; }).length + " active</span>" : "") +
+      tile("reports", "Missing stock report", "By installer, van and job; jobs over quote", L.total > 0 ? '<span class="pill p-bad">' + R(L.total) + " · 30 days</span>" : "") +
+      tile("corrections", "Corrections log", "Every reversed movement, who and why", reversals ? '<span class="pill p-kitted">' + reversals + "</span>" : "") +
+      tile("items", "Items", "Products, units, reorder levels, cable allowance") +
+      tile("vans", "Vans and van kit", "Vans and the small parts each one carries") +
+      tile("labels", "Stickers", "Make and print QR stickers") +
+      tile("account", "My account and connection", "Change PIN, sign out, Google Sheet link") + "</div>";
+  }
+  return "<h2>More</h2><div class=\"list\">" +
+    tile("labels", "Stickers", canWork() ? "Make and print QR stickers for drums, bins and shelves" : "View and print stickers") +
+    (role() === "viewer" ? tile("reports", "Missing stock report", "By installer, van and job; jobs over quote") : "") +
+    tile("account", "My account", "Change PIN, sign out") + "</div>";
+}
+function backMore() { return '<div class="row"><button class="btn ghost small" data-action="sub" data-sub="">← ' + (isAdmin() ? "Admin" : "More") + "</button></div>"; }
 
 function vItems() {
   var f = S.f.it || (S.f.it = { uom: "m", track: "qty", allowancePct: "10" });
@@ -661,7 +809,7 @@ function vItems() {
     '<label class="f">Order when store has less than<input class="num" id="it_reorder" type="number" min="0" data-bind="it.reorder" value="' + esc(f.reorder || "") + '"></label>' +
     '<label class="f">Cable allowance %<input class="num" id="it_allow" type="number" min="0" data-bind="it.allowancePct" value="' + esc(f.allowancePct == null ? "" : f.allowancePct) + '"></label></div>' +
     msgHtml() + '<div class="row"><button class="btn" data-action="saveItem"' + (S.busy ? " disabled" : "") + ">" + (f.editing ? "Save" : "Add item") + "</button>" + (f.editing ? '<button class="btn ghost" data-action="sub" data-sub="items">Cancel</button>' : "") + "</div>" +
-    '<p class="tiny muted">Cost is set automatically from the landed cost when you receive stock.</p></section><div class="list">' + list + "</div>";
+    '<p class="tiny muted">Cost is set automatically from the landed cost when stock is received.</p></section><div class="list">' + list + "</div>";
 }
 
 function vLabels() {
@@ -670,10 +818,10 @@ function vLabels() {
     return '<div class="lbl"><img src="' + qrImg(labelLink(l.code), 4) + '" alt="QR ' + esc(l.code) + '"><div class="id">' + esc(l.code) + "</div><div>" + esc(nameOf(l.sku)) + '</div><div class="tiny muted">' + esc(l.note) + "</div></div>";
   }).join("");
   return backMore() + '<div class="spread"><h2>Stickers</h2><button class="btn ghost small" data-action="printLabels"' + (D.Labels.length ? "" : " disabled") + ">Print sticker sheet</button></div>" +
-    '<section class="panel"><h3>New sticker</h3><p class="small muted">One sticker per drum, roll, box or shelf bin. Panels and inverters use their factory serial barcode instead.</p><div class="row">' +
+    (canWork() ? '<section class="panel"><h3>New sticker</h3><p class="small muted">One sticker per drum, roll, box or shelf bin. Panels and inverters use their factory serial barcode instead.</p><div class="row">' +
     '<label class="f">Item<select id="lb_sku" data-bind="lb.sku"><option value="">Choose…</option>' + D.Items.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (i) { return '<option value="' + esc(i.sku) + '"' + (i.sku === f.sku ? " selected" : "") + ">" + esc(i.name) + "</option>"; }).join("") + "</select></label>" +
     '<label class="f">Where it goes<input id="lb_note" data-bind="lb.note" value="' + esc(f.note || "") + '" placeholder="e.g. Drum 3 · 500 m"></label></div>' +
-    msgHtml() + '<button class="btn" data-action="saveLabel"' + (S.busy ? " disabled" : "") + ">Create sticker</button></section>" +
+    msgHtml() + '<button class="btn" data-action="saveLabel"' + (S.busy ? " disabled" : "") + ">Create sticker</button></section>" : msgHtml()) +
     '<div class="labels">' + (cards || '<p class="muted">No stickers yet.</p>') + "</div>" +
     '<p class="tiny muted">Each sticker holds a link. Pointing the normal phone camera at it opens this app on that item.</p>';
 }
@@ -685,27 +833,129 @@ function vVans() {
   var rows = D.Items.filter(function (i) { return i.uom !== "m" && i.track !== "serial"; }).sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (i) {
     return "<tr><td>" + esc(i.name) + '</td><td class="n" style="min-width:90px"><input class="num" id="kt_' + esc(i.sku) + '" type="number" min="0" data-bind="kt.' + esc(i.sku) + '" value="' + esc(kitT[i.sku] || "") + '" aria-label="Van target ' + esc(i.name) + '"></td></tr>';
   }).join("");
-  return backMore() + "<h2>Vans</h2>" +
+  return backMore() + "<h2>Vans</h2>" + msgHtml() +
     '<section class="panel"><h3>Vans</h3>' + X.vans.map(function (v) { return '<div class="spread"><span>' + esc(v.name) + '</span><span class="mono tiny muted">' + esc(v.id) + "</span></div>"; }).join("") +
     '<div class="row"><label class="f">New van name<input id="vn_name" data-bind="vn.name" value="' + esc(f.name || "") + '" placeholder="e.g. Van 3 · Ranger CA 123-456"></label><button class="btn ghost" data-action="saveVan">Add van</button></div></section>' +
     '<section class="panel"><h3>Van kit (same for every van)</h3><p class="small muted">Small parts only. Cable and big items always go out per job. Leave blank to keep an item off the van.</p>' +
     '<div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">Keep in van</th></tr></thead><tbody>' + rows + "</tbody></table></div>" +
-    msgHtml() + '<button class="btn" data-action="saveKit"' + (S.busy ? " disabled" : "") + ">Save van kit</button></section>";
+    '<button class="btn" data-action="saveKit"' + (S.busy ? " disabled" : "") + ">Save van kit</button></section>";
 }
 
-function vSettings() {
-  var f = S.f.st || (S.f.st = { url: cfg.url, key: cfg.key, name: cfg.name, site: cfg.site });
-  return backMore() + "<h2>Settings</h2>" +
-    '<section class="panel"><label class="f">Your name (shown on every movement)<input id="st_name" data-bind="st.name" value="' + esc(f.name || "") + '"></label></section>' +
-    '<section class="panel"><h3>Google Sheet</h3><p class="small muted">From the setup guide: the web app link and the secret key.</p>' +
-    '<label class="f">Web app link<input id="st_url" data-bind="st.url" value="' + esc(f.url || "") + '" placeholder="https://script.google.com/macros/s/…/exec"></label>' +
-    '<label class="f">Secret key<input id="st_key" data-bind="st.key" value="' + esc(f.key || "") + '" autocomplete="off"></label>' +
-    '<label class="f">This app\'s web address (for stickers)<input id="st_site" data-bind="st.site" value="' + esc(f.site || "") + '" placeholder="' + esc(location.origin + location.pathname) + '"></label>' +
-    msgHtml() + '<button class="btn" data-action="saveSettings"' + (S.busy ? " disabled" : "") + ">Save and connect</button>" +
-    '<p class="small">Now using: <b>' + (cfg.mode === "live" ? "Google Sheet" : "Demo data on this phone") + "</b></p></section>" +
+/* ---- Logins (admin) ---- */
+function vUsers() {
+  var users = (S.users || []).slice().sort(function (a, b) { return (a.active === b.active ? 0 : a.active === "yes" ? -1 : 1) || a.name.localeCompare(b.name); });
+  var f = S.f.us || (S.f.us = { isNew: true, role: "storeman", active: "yes", pin: suggestPin(4) });
+  var temp = S.f.tempPin;
+  var list = users.map(function (u) {
+    return '<button class="card" data-action="editUser" data-u="' + esc(u.username) + '"><div><div>' + esc(u.name) + '</div><div class="tiny muted"><span class="mono">' + esc(u.username) + "</span> · last sign-in " + (u.lastLogin ? esc(dshort(u.lastLogin)) : "never") + "</div></div>" +
+      '<div class="right"><span class="pill ' + (u.role === "admin" ? "p-out" : u.role === "storeman" ? "p-quoted" : "p-kitted") + '">' + ROLE_LABEL[u.role] + "</span>" +
+      (u.active !== "yes" ? '<span class="pill p-bad">Switched off</span>' : u.mustChange === "yes" ? '<span class="tiny muted">PIN not chosen yet</span>' : "") + "</div></button>";
+  }).join("");
+  var roleOpts = ["storeman", "admin", "viewer"].map(function (r) { return '<option value="' + r + '"' + (f.role === r ? " selected" : "") + ">" + ROLE_LABEL[r] + "</option>"; }).join("");
+  var editingSelf = !f.isNew && cfg.user && f.username === cfg.user.username;
+  return backMore() + "<h2>Logins</h2>" +
+    (temp ? '<div class="msg ok"><b>Temporary PIN for ' + esc(temp.name) + ': <span class="mono" style="font-size:1.3em">' + esc(temp.pin) + "</span></b><br>Give it to them in person. They'll choose their own PIN when they first sign in. It won't be shown again.</div>" : "") +
+    '<section class="panel"><h3>' + (f.isNew ? "Add a login" : "Edit " + esc(f.name)) + '</h3><div class="row">' +
+    '<label class="f">Full name<input id="us_name" data-bind="us.name" value="' + esc(f.name || "") + '" placeholder="e.g. Sipho Mokoena"></label>' +
+    '<label class="f">Username<input id="us_user" class="mono" autocapitalize="off" autocomplete="off" data-bind="us.username" value="' + esc(f.username || "") + '"' + (f.isNew ? "" : " readonly") + ' placeholder="e.g. sipho"></label></div><div class="row">' +
+    '<label class="f">Role<select id="us_role" data-bind="us.role"' + (editingSelf ? " disabled" : "") + ">" + roleOpts + "</select></label>" +
+    (f.isNew || (f.role === "admin" && f.origRole !== "admin") ? '<label class="f">Temporary PIN<input id="us_pin" class="num" inputmode="numeric" data-bind="us.pin" value="' + esc(f.pin || "") + '"></label>' : "") +
+    (!f.isNew ? '<label class="f">Status<select id="us_active" data-bind="us.active"' + (editingSelf ? " disabled" : "") + '><option value="yes"' + (f.active !== "no" ? " selected" : "") + '>Can sign in</option><option value="no"' + (f.active === "no" ? " selected" : "") + ">Switched off</option></select></label>" : "") +
+    "</div>" +
+    '<p class="tiny muted"><b>Storeman:</b> daily stock work. <b>Admin:</b> everything, including logins, items, costs and corrections. <b>Viewer:</b> can look at jobs, stock and reports, can\'t change anything. Admins need a 6-digit PIN.</p>' +
+    msgHtml() + '<div class="row"><button class="btn" data-action="saveUser"' + (S.busy ? " disabled" : "") + ">" + (f.isNew ? "Add login" : "Save") + "</button>" +
+    (!f.isNew ? '<button class="btn ghost" data-action="resetUserPin"' + (S.busy ? " disabled" : "") + '>Reset PIN</button><button class="btn ghost" data-action="newUser">Cancel</button>' : "") + "</div>" +
+    (!f.isNew ? '<p class="tiny muted">Switching someone off, changing their role or resetting their PIN signs them out on every device straight away.</p>' : "") + "</section>" +
+    '<div class="list">' + (list || '<p class="muted">Loading logins…</p>') + "</div>";
+}
+
+/* ---- Reports (admin + viewer) ---- */
+function vReports() {
+  var days = n(S.f.days) || 30;
+  var L = C.losses(D.Moves, days);
+  function ranked(o, nm) {
+    var e = Object.keys(o).map(function (k) { return [k, o[k]]; }).filter(function (x) { return Math.abs(x[1]) > 0.004; }).sort(function (a, b) { return b[1] - a[1]; });
+    return e.length ? e.map(function (x) { return "<tr><td>" + esc(nm(x[0])) + '</td><td class="n">' + R(x[1]) + "</td></tr>"; }).join("") : '<tr><td class="muted">Nothing missing</td><td></td></tr>';
+  }
+  var since = Date.now() - days * 864e5;
+  var closed = D.Jobs.filter(function (j) { return j.status === "closed" && new Date(j.closedAt).getTime() >= since; });
+  var missJobs = closed.filter(function (j) { return n(j.missingValue) > 0; }).sort(function (a, b) { return n(b.missingValue) - n(a.missingValue); });
+  var overJobs = closed.map(function (j) { return { j: j, f: C.overQuote(C.jobSummary(j.no, D.Lines, D.Moves, X.items), 10) }; }).filter(function (x) { return x.f.length; });
+  var opts = [30, 90, 365].map(function (d) { return '<option value="' + d + '"' + (d === days ? " selected" : "") + ">Last " + d + " days</option>"; }).join("");
+  return backMore() + '<div class="spread"><h2>Missing stock</h2><select id="rp_days" data-bind="days" style="width:auto">' + opts + "</select></div>" +
+    '<div class="kpis"><div class="kpi"><div class="l">Missing</div><div class="v ' + (L.total > 0 ? "bad" : "") + '">' + R(L.total) + '</div></div>' +
+    '<div class="kpi"><div class="l">Jobs closed</div><div class="v">' + closed.length + '</div></div><div class="kpi"><div class="l">Jobs with missing stock</div><div class="v">' + missJobs.length + "</div></div>" +
+    '<div class="kpi"><div class="l">Jobs over quote</div><div class="v">' + overJobs.length + "</div></div></div>" +
+    '<section class="panel"><h3>Where it sits</h3><div class="row" style="align-items:flex-start">' +
+    '<div class="tablewrap" style="flex:1 1 220px"><table><thead><tr><th>Installer</th><th class="n">Value</th></tr></thead><tbody>' + ranked(L.byInstaller, function (x) { return x; }) + "</tbody></table></div>" +
+    '<div class="tablewrap" style="flex:1 1 220px"><table><thead><tr><th>Van / place</th><th class="n">Value</th></tr></thead><tbody>' + ranked(L.byVan, vanName) + "</tbody></table></div></div>" +
+    '<p class="tiny muted">One bad job is noise. The same name at the top month after month is a pattern worth a conversation.</p></section>' +
+    (missJobs.length ? '<section class="panel"><h3>Jobs closed with missing stock</h3><div class="list">' + missJobs.map(function (j) {
+      return '<button class="card" data-action="openJobFrom" data-job="' + esc(j.no) + '"><div><div><span class="no">' + esc(j.no) + "</span> · " + esc(j.client) + '</div><div class="tiny muted">' + esc(j.installer) + " · " + esc(vanName(j.van)) + " · " + esc(j.reason || "no reason") + '</div></div><span class="pill p-bad">' + R(j.missingValue) + "</span></button>";
+    }).join("") + "</div></section>" : "") +
+    (overJobs.length ? '<section class="panel"><h3>Jobs that used more than quoted</h3><div class="tablewrap"><table><thead><tr><th>Job</th><th>Item</th><th class="n">Over</th></tr></thead><tbody>' +
+      overJobs.map(function (x) { return x.f.map(function (f) { return "<tr><td>" + esc(x.j.no) + '<div class="tiny muted">' + esc(x.j.type) + "</div></td><td>" + esc(nameOf(f.sku)) + '</td><td class="n">+' + Math.round(f.overPct) + "%</td></tr>"; }).join(""); }).join("") +
+      '</tbody></table></div><p class="tiny muted">If the same job type keeps going over, the quote template is too low and the business is losing margin.</p></section>' : "");
+}
+
+/* ---- Corrections log (admin) ---- */
+function vCorrections() {
+  var list = D.Moves.filter(function (m) { return m.type === "reverse"; }).slice().reverse();
+  return backMore() + "<h2>Corrections log</h2><p class=\"small muted\">Every movement that was reversed, by whom and why. Corrections are only possible for admins, from an item's history in Stock.</p>" +
+    '<section class="panel">' + (list.length ? list.map(function (m) {
+      return '<div class="hist"><div class="spread"><div><b>' + esc(nameOf(m.sku)) + '</b><div class="tiny muted">Undid: ' + esc(MOVE_LABEL[m.reverses] || m.reverses) + (m.job ? " · job " + esc(m.job) : "") + "</div></div>" +
+        '<div class="right"><span class="mono">' + q(m.qty, m.sku) + '</span><span class="tiny muted">' + esc(dtime(m.ts)) + " · " + esc(m.by || "") + "</span></div></div>" +
+        '<div class="small">Reason: ' + esc(m.reason || "—") + "</div></div>";
+    }).join("") : '<p class="muted">No corrections yet.</p>') + "</section>";
+}
+
+/* ---- My account ---- */
+function vAccount() {
+  var f = S.f.ac || (S.f.ac = { url: cfg.url, site: cfg.site });
+  var u = cfg.user || {};
+  return backMore() + "<h2>My account</h2>" + msgHtml() +
+    '<section class="panel"><div class="spread"><div><h3>' + esc(u.name) + '</h3><div class="small muted"><span class="mono">' + esc(u.username) + "</span> · " + ROLE_LABEL[u.role] + "</div></div>" +
+    '<button class="btn ghost small" data-action="logout">Sign out</button></div>' +
+    (S.f.confirmLogout ? '<div class="msg warn">' + Q.length + " change(s) haven't reached the Sheet yet. They'll be sent next time <b>you</b> sign in on this phone. Tap Sign out again to continue.</div>" : "") + "</section>" +
+    '<section class="panel"><h3>Change my PIN</h3><div class="row">' +
+    '<label class="f">Current PIN<input id="ac_old" type="password" inputmode="numeric" autocomplete="current-password" data-bind="ac.old"></label>' +
+    '<label class="f">New PIN<input id="ac_new" type="password" inputmode="numeric" autocomplete="new-password" data-bind="ac.new1"></label>' +
+    '<label class="f">New PIN again<input id="ac_new2" type="password" inputmode="numeric" autocomplete="new-password" data-bind="ac.new2"></label></div>' +
+    '<button class="btn" data-action="changePin"' + (S.busy ? " disabled" : "") + ">Change PIN</button></section>" +
     '<section class="panel"><h3>Sync</h3><p class="small">' + (Q.length ? Q.length + " change(s) saved on this phone, waiting for signal." : "Everything is saved to the " + (cfg.mode === "live" ? "Google Sheet." : "demo data.")) + "</p>" +
-    (Q.length ? '<button class="btn ghost small" data-action="syncNow">Try to sync now</button>' : "") + '<p class="tiny muted">App version ' + APP_VERSION + "</p></section>" +
-    '<section class="panel"><h3>Demo</h3><div class="row"><button class="btn ghost" data-action="useDemo">Use demo data</button><button class="btn ghost" data-action="resetDemo">Reset demo data</button></div></section>';
+    (Q.length ? '<button class="btn ghost small" data-action="syncNow">Try to sync now</button>' : "") + '<p class="tiny muted">App version ' + APP_VERSION + " · " + (cfg.mode === "live" ? "Google Sheet" : "Demo data on this phone") + "</p></section>" +
+    (isAdmin() ? '<section class="panel"><h3>Connection (admin)</h3>' +
+      '<label class="f">Google Sheet web app link<input id="ac_url" data-bind="ac.url" value="' + esc(f.url || "") + '" placeholder="https://script.google.com/macros/s/…/exec"></label>' +
+      '<label class="f">This app\'s web address (for stickers)<input id="ac_site" data-bind="ac.site" value="' + esc(f.site || "") + '" placeholder="' + esc(location.origin + location.pathname) + '"></label>' +
+      '<button class="btn ghost" data-action="saveConnection">Save connection</button><p class="tiny muted">Changing the Sheet link signs you out, so you can sign in to the new Sheet.</p></section>' : "") +
+    (cfg.mode === "demo" ? '<section class="panel"><h3>Demo</h3><div class="row"><button class="btn ghost" data-action="resetDemo">Reset demo data</button><button class="btn ghost" data-action="goLive">Connect our Google Sheet</button></div></section>' : "");
+}
+
+/* ---- Sign in ---- */
+function vLogin() {
+  var f = S.f.lg || (S.f.lg = { url: cfg.url || "" });
+  var needUrl = cfg.mode === "live" && !cfg.url;
+  return '<section class="panel login"><div class="eyebrow">' + (cfg.mode === "demo" ? "Demo" : "Stock Counter") + "</div><h2>Sign in</h2>" +
+    (S.loginMsg ? '<div class="msg info">' + esc(S.loginMsg) + "</div>" : "") +
+    (needUrl ? '<label class="f">Google Sheet web app link<input id="lg_url" data-bind="lg.url" value="' + esc(f.url) + '" placeholder="https://script.google.com/macros/s/…/exec"></label><p class="tiny muted">From Part B of the setup guide. Only needed once on this device.</p>' : "") +
+    '<label class="f">Username<input id="lg_user" autocapitalize="off" autocomplete="username" spellcheck="false" data-bind="lg.username" value="' + esc(f.username || "") + '"></label>' +
+    '<label class="f">PIN<input id="lg_pin" type="password" inputmode="numeric" autocomplete="current-password" data-bind="lg.pin" value="' + esc(f.pin || "") + '"></label>' +
+    msgHtml() + '<button class="btn wide" data-action="login"' + (S.busy ? " disabled" : "") + ">Sign in</button>" +
+    (Q.length && Q[0].user ? '<p class="tiny muted">' + Q.length + " change(s) from <b>" + esc(Q[0].user) + "</b> are waiting on this phone. They'll sync when " + esc(Q[0].user) + " signs in.</p>" : "") +
+    (cfg.mode === "demo" ? '<div class="msg info small">Demo logins (any of these):<br><span class="mono">admin</span> PIN <span class="mono">246810</span> (Admin)<br><span class="mono">sipho</span> PIN <span class="mono">1357</span> (Storeman)<br><span class="mono">owner</span> PIN <span class="mono">8642</span> (Viewer)</div>' : "") +
+    '<button class="linkbtn small muted" data-action="' + (cfg.mode === "demo" ? "goLive" : "useDemo") + '">' + (cfg.mode === "demo" ? "Connect our Google Sheet instead" : "Try the demo instead") + "</button>" +
+    (needUrl ? "" : (cfg.mode === "live" ? '<button class="linkbtn small muted" data-action="changeUrl">Use a different Google Sheet</button>' : "")) +
+    "</section>";
+}
+function vChangePinFirst() {
+  var f = S.f.cp || (S.f.cp = {});
+  return '<section class="panel login"><div class="eyebrow">Welcome, ' + esc(cfg.user.name) + "</div><h2>Choose your PIN</h2>" +
+    '<p class="small">You signed in with a temporary PIN. Choose your own now. Only you should know it.' + (isAdmin() ? " Admins need 6 to 8 digits." : " Use 4 to 8 digits.") + "</p>" +
+    '<label class="f">Temporary PIN<input id="cp_old" type="password" inputmode="numeric" autocomplete="current-password" data-bind="cp.old"></label>' +
+    '<label class="f">New PIN<input id="cp_new" type="password" inputmode="numeric" autocomplete="new-password" data-bind="cp.new1"></label>' +
+    '<label class="f">New PIN again<input id="cp_new2" type="password" inputmode="numeric" autocomplete="new-password" data-bind="cp.new2"></label>' +
+    msgHtml() + '<button class="btn wide" data-action="firstPin"' + (S.busy ? " disabled" : "") + ">Save my PIN</button>" +
+    '<button class="linkbtn small muted" data-action="logout">Sign out</button></section>';
 }
 
 /* ===================== actions ===================== */
@@ -717,15 +967,14 @@ function bindValue(path, value) {
 
 // Changing between demo and the real Sheet starts from a clean copy on the phone.
 function switchMode(mode) {
-  cfg.mode = mode; saveCfg();
+  cfg.mode = mode; cfg.token = ""; cfg.user = null; S.users = null; saveCfg();
   SD = emptyData(); Q = []; persist(); rebuild();
 }
 
 var A = {
-  startDemo: function () { switchMode("demo"); cfg.name = cfg.name || "Storeman"; saveCfg(); S.loading = true; render(); reload(); },
-  startLive: function () { S.loading = false; go("more", { sub: "settings" }); },
+  startDemo: function () { switchMode("demo"); S.f = {}; S.loginMsg = null; render(); },
   back: function () { S.sub = null; S.job = null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
-  sub: function (b) { S.sub = b.dataset.sub || null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
+  sub: function (b) { if (b.dataset.tab2) { S.tab = b.dataset.tab2; S.item = null; S.job = null; } S.sub = b.dataset.sub || null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
   newJob: function () { S.sub = "new"; S.f = {}; S.msg = null; render(); },
   openJob: function (b) { S.job = b.dataset.job; S.sub = null; S.f = {}; S.msg = null; render(); window.scrollTo(0, 0); },
   addLine: function () { S.f.nj.lines.push({ sku: "", quoted: "" }); render(); },
@@ -801,7 +1050,7 @@ var A = {
     var res = C.closeJob(j, sum2, usedBy, now());
     if (res.problems.length) return flash("err", "Fill in Used for: " + res.problems.map(nameOf).join(", "));
     if (res.missingValue > 0 && !String(f.reason || "").trim()) return flash("err", "Give a reason for the missing stock.");
-    res.moves.forEach(function (m) { m.id = uid(); m.by = cfg.name || ""; });
+    res.moves.forEach(function (m) { m.id = uid(); m.by = (cfg.user && cfg.user.username) || ""; });
     save([{ op: "append", sheet: "Moves", rows: moves.concat(res.moves) },
           { op: "upsert", sheet: "Jobs", rows: [{ no: j.no, status: "closed", closedAt: now(), missingValue: res.missingValue, reason: f.reason || "" }], expect: { field: "status", values: ["out"] } }],
       res.missingValue > 0 ? "Job closed. " + R(res.missingValue) + " recorded as missing." : "Job closed. Everything accounted for.", function () { S.f = {}; });
@@ -870,7 +1119,7 @@ var A = {
     if (!counted.length) return flash("err", "Enter at least one count.");
     if (place !== "WH" && counted.length < X.kit.length) return flash("err", "Count every line of the van kit, even if it's zero.");
     var moves = C.countMoves(place, c, X.B, X.items, now(), place === "WH" ? "Shelf count" : "Van count");
-    moves.forEach(function (m) { m.id = uid(); m.by = cfg.name || ""; });
+    moves.forEach(function (m) { m.id = uid(); m.by = (cfg.user && cfg.user.username) || ""; });
     if (!moves.length) { S.f.cnt = {}; return flash("ok", "Count matches the system. Nothing to adjust."); }
     var short = moves.filter(function (m) { return m.type === "countshort"; }).reduce(function (s, m) { return s + n(m.value); }, 0);
     save([{ op: "append", sheet: "Moves", rows: moves }],
@@ -915,33 +1164,114 @@ var A = {
     save(ops, "Van kit saved.");
   },
   syncNow: function () { flush(); flash("info", "Trying to sync…"); },
-  saveSettings: function () {
-    var f = S.f.st;
-    cfg.name = f.name || "";
-    cfg.site = (f.site || "").trim();
-    if (!f.url || !f.key) { saveCfg(); return flash("ok", "Name saved. Add the web app link and secret key to connect the Google Sheet."); }
-    var url = f.url.trim(), key = f.key.trim();
-    if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec/.test(url)) return flash("err", "The web app link should start with https://script.google.com/macros/s/ and end with /exec.");
-    if (Q.length && cfg.mode === "live" && (url !== cfg.url)) return flash("err", Q.length + " changes are still waiting to reach the current Sheet. Get signal and let them sync first.");
-    S.busy = true; S.msg = { k: "info", t: "Connecting…" }; render();
-    post(url, { key: key, have: 0, ops: [] }).then(function (res) {
-      if (cfg.mode !== "live" || cfg.url !== url) switchMode("live");
-      cfg.url = url; cfg.key = key; saveCfg();
-      SD.Moves = []; applyServer(res); syncStatus();
-      S.msg = { k: "ok", t: "Connected to the Google Sheet." };
-      flush();
-    }).catch(function (e) { S.msg = { k: "err", t: e.net ? "Couldn't reach the Sheet. Check the link, that the deployment allows Anyone, and that you have signal." : e.message }; })
-      .then(function () { S.busy = false; render(); });
+  /* ---- sign in / account ---- */
+  goLive: function () {
+    if (cfg.mode === "live" && cfg.url) { S.f = {}; S.msg = null; return render(); }
+    if (Q.length) return flash("err", Q.length + " change(s) are still waiting to sync. Let them sync first.");
+    switchMode("live"); cfg.url = ""; saveCfg(); S.f = {}; S.msg = null; S.loginMsg = null; render();
   },
   useDemo: function () {
-    if (cfg.mode === "live" && Q.length) return flash("err", Q.length + " changes are still waiting to reach the Sheet. Let them sync first.");
-    switchMode("demo"); S.loading = true; reload().then(function () { flash("ok", "Using demo data."); });
+    if (cfg.mode === "live" && Q.length) return flash("err", Q.length + " change(s) are still waiting to reach the Sheet. Let them sync first.");
+    switchMode("demo"); S.f = {}; S.msg = null; S.loginMsg = null; render();
+  },
+  changeUrl: function () {
+    if (Q.length) return flash("err", Q.length + " change(s) are still waiting to reach the current Sheet. Let them sync first.");
+    switchMode("live"); cfg.url = ""; saveCfg(); S.f = {}; S.msg = null; render();
+  },
+  login: function () {
+    var f = S.f.lg || {}, username = String(f.username || "").trim().toLowerCase();
+    if (cfg.mode === "live" && !cfg.url) {
+      var url = String(f.url || "").trim();
+      if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec/.test(url)) return flash("err", "The web app link should start with https://script.google.com/macros/s/ and end with /exec.");
+      cfg.url = url;
+    }
+    if (!username || !f.pin) return flash("err", "Enter your username and PIN.");
+    if (Q.length && Q[0].user && Q[0].user !== username) return flash("err", Q.length + " change(s) by " + Q[0].user + " are still waiting to sync on this phone. " + Q[0].user + " must sign in first, so the record shows who did them.");
+    S.busy = true; S.msg = null; render();
+    api.call("login", { username: username, pin: String(f.pin) }).then(function (res) {
+      cfg.token = res.token; cfg.user = res.user; saveCfg();
+      S.f = {}; S.loginMsg = null; S.loading = !res.user.mustChange; S.tab = "jobs";
+      if (!res.user.mustChange) reload().then(openPendingCode);
+    }).catch(function (e) {
+      if (cfg.mode === "live" && e.net && !SD.Items.length) cfg.url = "";   // first connection failed: let them fix the link
+      S.f.lg.pin = "";
+      S.msg = { k: "err", t: e.net ? "Couldn't reach the Google Sheet. Check the link, that the deployment allows Anyone, and that you have signal." : e.message };
+    }).then(function () { S.busy = false; saveCfg(); render(); });
+  },
+  firstPin: function () { changePinFrom("cp"); },
+  changePin: function () { changePinFrom("ac"); },
+  logout: function () {
+    if (Q.length && !S.f.confirmLogout) { S.f.confirmLogout = true; return render(); }
+    var t = cfg.token;
+    if (t) api.call("logout", {}).catch(function () {});
+    cfg.token = ""; saveCfg(); stopCam();
+    S.f = {}; S.msg = null; S.loginMsg = "Signed out."; S.tab = "jobs"; S.sub = null; S.job = null; S.item = null;
+    render();
+  },
+  saveConnection: function () {
+    var f = S.f.ac || {};
+    var url = String(f.url || "").trim(), site = String(f.site || "").trim();
+    cfg.site = site; saveCfg();
+    if (cfg.mode === "live" && url && url !== cfg.url) {
+      if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec/.test(url)) return flash("err", "The web app link should start with https://script.google.com/macros/s/ and end with /exec.");
+      if (Q.length) return flash("err", Q.length + " change(s) are still waiting to reach the current Sheet. Let them sync first.");
+      switchMode("live"); cfg.url = url; saveCfg(); S.loginMsg = "Sign in to the new Google Sheet."; S.f = {}; return render();
+    }
+    flash("ok", "Saved.");
   },
   resetDemo: function () {
-    LS.set("sc_demo", null); LS.set("sc_demo_batches", null);
-    if (cfg.mode === "demo") { switchMode("demo"); S.loading = true; reload().then(function () { flash("ok", "Demo data reset."); }); } else flash("ok", "Demo data reset.");
-  }
+    LS.set("sc_demo", null); LS.set("sc_demo_batches", null); LS.set("sc_demo_users", null); LS.set("sc_demo_sessions", null);
+    switchMode("demo"); S.f = {}; S.loginMsg = "Demo data reset. Sign in with one of the demo logins."; render();
+  },
+
+  /* ---- logins (admin) ---- */
+  newUser: function () { S.f.us = null; S.f.tempPin = null; S.msg = null; render(); },
+  editUser: function (b) {
+    var u = (S.users || []).find(function (x) { return x.username === b.dataset.u; });
+    if (!u) return;
+    S.f.us = { isNew: false, username: u.username, name: u.name, role: u.role, origRole: u.role, active: u.active, pin: suggestPin(6) };
+    S.f.tempPin = null; S.msg = null; render(); window.scrollTo(0, 0);
+  },
+  saveUser: function () {
+    var f = S.f.us;
+    if (f.isNew || (f.role === "admin" && f.origRole !== "admin")) { var pp = pinProblem(f.pin, f.role); if (pp) return flash("err", pp); }
+    S.busy = true; S.msg = null; render();
+    var promoted = !f.isNew && f.role === "admin" && f.origRole !== "admin";
+    api.call("users", { cmd: "save", isNew: !!f.isNew, user: { username: f.username, name: f.name, role: f.role, active: f.active }, pin: (f.isNew || promoted) ? String(f.pin) : undefined })
+      .then(function (res) {
+        S.users = res.users;
+        S.f.tempPin = (f.isNew || promoted) ? { name: f.name, pin: String(f.pin) } : null;
+        S.f.us = null;
+        S.msg = { k: "ok", t: f.isNew ? "Login added for " + f.name + "." : "Saved." };
+      }).catch(function (e) { if (!e.signIn) S.msg = { k: "err", t: e.net ? "Managing logins needs signal." : e.message }; })
+      .then(function () { S.busy = false; render(); window.scrollTo(0, 0); });
+  },
+  resetUserPin: function () {
+    var f = S.f.us, pin = suggestPin(f.role === "admin" ? 6 : 4);
+    S.busy = true; S.msg = null; render();
+    api.call("users", { cmd: "resetPin", username: f.username, pin: pin }).then(function (res) {
+      S.users = res.users; S.f.tempPin = { name: f.name, pin: pin }; S.f.us = null;
+      S.msg = { k: "ok", t: "PIN reset. " + f.name + " has been signed out everywhere." };
+    }).catch(function (e) { if (!e.signIn) S.msg = { k: "err", t: e.net ? "Managing logins needs signal." : e.message }; })
+      .then(function () { S.busy = false; render(); window.scrollTo(0, 0); });
+  },
+  openJobFrom: function (b) { S.tab = "jobs"; S.sub = null; S.item = null; S.job = b.dataset.job; S.f = {}; S.msg = null; render(); window.scrollTo(0, 0); }
 };
+
+function changePinFrom(grp) {
+  var f = S.f[grp] || {};
+  if (!f.old) return flash("err", "Enter your current PIN.");
+  var pp = pinProblem(f.new1, role()); if (pp) return flash("err", pp);
+  if (f.new1 !== f.new2) return flash("err", "The two new PINs don't match.");
+  S.busy = true; S.msg = null; render();
+  api.call("changePin", { oldPin: String(f.old), newPin: String(f.new1) }).then(function (res) {
+    var first = cfg.user.mustChange;
+    cfg.user = res.user; saveCfg(); S.f[grp] = {};
+    S.msg = { k: "ok", t: "PIN changed." };
+    if (first) { S.loading = true; reload().then(openPendingCode); }
+  }).catch(function (e) { S.msg = { k: "err", t: e.net ? "Changing your PIN needs signal." : e.message }; })
+    .then(function () { S.busy = false; render(); });
+}
 
 function printSheet(title, cells, cols) {
   var w = window.open("", "_blank");
@@ -1012,6 +1342,7 @@ function handleCode(raw) {
     render(); window.scrollTo(0, 0); return;
   }
   var sku = X.labels[code] ? X.labels[code].sku : X.items[code] ? code : null;
+  if (sku && !canWork()) { S.tab = "stock"; S.item = sku; S.sub = null; S.job = null; S.f = {}; S.msg = null; render(); window.scrollTo(0, 0); return; }
   if (!sku) { S.tab = "scan"; S.f = { code: code }; return flash("err", code + " isn't a sticker, job or item in the system. Check the code, or create the sticker in More → Stickers."); }
   var keep = S.f.mode === "extra" ? { mode: "extra", job: S.f.job } : {};
   S.tab = "scan"; S.f = Object.assign({ sku: sku, label: X.labels[code] ? code : "", code: "" }, keep); S.msg = null; render();
@@ -1128,10 +1459,13 @@ function seedDemo() {
 /* ===================== start ===================== */
 (function start() {
   if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(function () {});
+  var code = new URLSearchParams(location.search).get("c");
+  if (code) { S.pendingCode = code; history.replaceState(null, "", location.pathname); }
   render();
-  var params = new URLSearchParams(location.search);
-  var code = params.get("c");
-  reload().then(function () {
-    if (code && cfg.mode) { history.replaceState(null, "", location.pathname); handleCode(code); }
-  });
+  reload().then(openPendingCode);
 })();
+// A sticker scanned with the normal camera opens the app on that item, after sign-in if needed.
+function openPendingCode() {
+  if (!S.pendingCode || !cfg.token || !cfg.user || cfg.user.mustChange) return;
+  var c = S.pendingCode; S.pendingCode = null; handleCode(c);
+}
