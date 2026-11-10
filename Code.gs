@@ -7,7 +7,13 @@
  * What this protects:
  *  - Everyone signs in with a username and PIN. PINs are stored hashed, never readable.
  *    5 wrong PINs locks that login for 15 minutes. Sign-ins last 30 days per device.
- *  - Roles are enforced HERE, not just in the app: admin, storeman, viewer.
+ *  - Roles are enforced HERE, not just in the app:
+ *      Senior Admin (admin)          everything, including logins
+ *      Warehouse Manager (manager)   everything except logins: inventory, items, costs, corrections
+ *      User (storeman)               daily stock work; shelf counts go for approval
+ *      Viewer (viewer)               look only
+ *  - Only a Senior Admin or Warehouse Manager can change store stock levels.
+ *    A count is approved once, and never by the person who counted.
  *  - Every movement is stamped with the signed-in user, so names can't be faked.
  *  - Movements (Moves tab) can only be ADDED, never changed or deleted.
  *  - The Sheet hands out job, sticker and van numbers, so two phones never clash.
@@ -17,7 +23,7 @@
  *  - Text that looks like a spreadsheet formula is stored as plain text.
  */
 
-var VERSION = "1.2";
+var VERSION = "1.3";
 
 var SHEETS = {
   Items:    { key: "sku",  cols: ["sku", "name", "uom", "track", "cost", "reorder", "allowancePct"] },
@@ -27,12 +33,15 @@ var SHEETS = {
   Labels:   { key: "code", cols: ["code", "sku", "note"] },
   Vans:     { key: "id",   cols: ["id", "name"] },
   VanKit:   { key: "sku",  cols: ["sku", "target"] },
+  Counts:   { key: "id",   cols: ["id", "place", "ts", "by", "status", "lines", "value", "note", "decidedBy", "decidedAt", "decisionNote"] },
   // Private: never sent to any phone.
   Users:    { key: "username", cols: ["username", "name", "role", "active", "mustChange", "salt", "pinHash", "created", "lastLogin"], private: true },
   Sessions: { key: "tokenHash", cols: ["tokenHash", "username", "created", "expires"], private: true }
 };
 var NUMBERING = { Jobs: { prefix: "J-", pad: 4, first: 1001 }, Labels: { prefix: "GS-", pad: 4, first: 1 }, Vans: { prefix: "VAN-", pad: 0, first: 1 } };
-var ROLES = ["admin", "storeman", "viewer"];
+// admin = Senior Admin, manager = Warehouse Manager, storeman = User, viewer = Viewer (look only)
+var ROLES = ["admin", "manager", "storeman", "viewer"];
+function isManagerRole_(r) { return r === "admin" || r === "manager"; }
 var SESSION_DAYS = 30, MAX_TRIES = 5, LOCK_MINUTES = 15;
 
 /* ---------------- setup ---------------- */
@@ -151,9 +160,9 @@ function findUser_(username) {
   return rows_("Users", 0).filter(function (u) { return u.username === k; })[0] || null;
 }
 function checkPinRules_(pin, role) {
-  var min = role === "admin" ? 6 : 4;
+  var min = isManagerRole_(role) ? 6 : 4;
   if (!/^\d+$/.test(String(pin || "")) || String(pin).length < min || String(pin).length > 8)
-    throw fail_("PIN must be " + min + " to 8 digits" + (role === "admin" ? " for admins." : "."));
+    throw fail_("PIN must be " + min + " to 8 digits" + (isManagerRole_(role) ? " for managers and admins." : "."));
   if (/^(\d)\1+$/.test(pin) || "0123456789".indexOf(pin) >= 0 || "9876543210".indexOf(pin) >= 0)
     throw fail_("Choose a PIN that isn't all the same digit or a simple run like 1234.");
 }
@@ -214,7 +223,7 @@ function changePin_(body, user) {
 
 /** Admin: create/update a login, or reset a PIN. */
 function users_(body, me) {
-  if (me.role !== "admin") throw fail_("Only an admin can manage logins.");
+  if (me.role !== "admin") throw fail_("Only a Senior Admin can manage logins.");
   var all = rows_("Users", 0);
   var activeAdmins = function (list) { return list.filter(function (u) { return u.role === "admin" && u.active === "yes"; }).length; };
   if (body.cmd === "save") {
@@ -233,8 +242,8 @@ function users_(body, me) {
       checkPinRules_(String(body.pin || ""), u.role);
       writeUser_({ username: name, name: String(u.name).trim(), role: u.role, active: active, mustChange: "yes", created: new Date().toISOString() }, String(body.pin));
     } else {
-      var promoted = u.role === "admin" && cur.role !== "admin";
-      if (promoted) checkPinRules_(String(body.pin || ""), "admin");   // admins need a 6+ digit PIN
+      var promoted = isManagerRole_(u.role) && !isManagerRole_(cur.role);
+      if (promoted) checkPinRules_(String(body.pin || ""), u.role);   // managers and admins need a 6+ digit PIN
       writeUser_({ username: name, name: String(u.name).trim(), role: u.role, active: active, mustChange: promoted ? "yes" : undefined }, promoted ? String(body.pin) : null);
       if (active === "no" || u.role !== cur.role) endSessions_(name);
     }
@@ -255,20 +264,25 @@ function users_(body, me) {
 /** What each role may change. Checked for every operation, before anything is written. */
 function permitted_(op, user) {
   var role = user.role;
-  if (role === "admin") return;
+  if (isManagerRole_(role)) return;
   if (role !== "storeman") throw fail_("Your login can view only.");
   if (op.op === "append") {
-    (op.rows || []).forEach(function (r) { if (r.type === "reverse") throw fail_("Only an admin can record corrections."); });
+    (op.rows || []).forEach(function (r) {
+      if (r.type === "reverse") throw fail_("Only a Warehouse Manager or Senior Admin can record corrections.");
+      if (/^(countshort|countover|adjust)$/.test(r.type) && (r.from === "WH" || r.to === "WH"))
+        throw fail_("Only a Warehouse Manager or Senior Admin can change store stock levels. Submit the count for approval instead.");
+    });
     return;
   }
-  if (op.op === "create") { if (op.sheet === "Jobs" || op.sheet === "Labels") return; throw fail_("Only an admin can add vans."); }
+  if (op.op === "create") { if (op.sheet === "Jobs" || op.sheet === "Labels") return; throw fail_("Only a Warehouse Manager or Senior Admin can add vans."); }
   if (op.op === "replaceLines") return;
   if (op.op === "upsert") {
     if (op.sheet === "Jobs") return;
+    if (op.sheet === "Counts") return;   // new submissions only: checked in applyBatch_
     if (op.sheet === "Items" && (op.rows || []).every(function (r) { return Object.keys(r).every(function (k) { return k === "sku" || k === "cost"; }); })) return; // receiving updates the average cost
-    throw fail_("Only an admin can change " + (op.sheet === "Items" ? "items." : op.sheet === "VanKit" ? "the van kit." : op.sheet + "."));
+    throw fail_("Only a Warehouse Manager or Senior Admin can change " + (op.sheet === "Items" ? "items." : op.sheet === "VanKit" ? "the van kit." : op.sheet + "."));
   }
-  throw fail_("Only an admin can do that.");
+  throw fail_("Only a Warehouse Manager or Senior Admin can do that.");
 }
 
 /* ---------------- reading ---------------- */
@@ -367,6 +381,14 @@ function applyBatch_(ops, user) {
         var k = String(r[def.key] || "");
         if (!k) throw new Error("Missing " + def.key + " for " + op.sheet + ".");
         var cur = mm.rows[k];
+        if (op.sheet === "Counts") {
+          if (!isManagerRole_(user.role) && (cur || r.status !== "pending")) throw fail_("Only a Warehouse Manager or Senior Admin can approve or reject counts.");
+          if (!cur) { r.by = user.username; r.status = r.status || "pending"; }
+          if (cur && r.status && r.status !== cur.status) {
+            if (cur.by === user.username) throw fail_("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
+            r.decidedBy = user.username;
+          }
+        }
         if (op.expect) {
           var field = op.expect.field, want = op.expect.values || [];
           var now = cur ? String(cur[field]) : "";

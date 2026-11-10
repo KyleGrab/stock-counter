@@ -22,8 +22,8 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.2";
-var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit"];
+var APP_VERSION = "1.3";
+var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit", "Counts"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
 var Q = LS.get("sc_queue", []) || [];
@@ -47,7 +47,7 @@ function rebuild() {
 }
 function persist() { LS.set("sc_sd", SD); LS.set("sc_queue", Q); }
 
-var KEYS = { Items: "sku", Jobs: "no", Lines: "id", Moves: "id", Labels: "code", Vans: "id", VanKit: "sku" };
+var KEYS = { Items: "sku", Jobs: "no", Lines: "id", Moves: "id", Labels: "code", Vans: "id", VanKit: "sku", Counts: "id" };
 // Apply changes to a local copy (queued saves on screen, and the demo "sheet").
 function applyOpsLocal(d, ops) {
   ops.forEach(function (op) {
@@ -78,22 +78,27 @@ var NUMBERING = { Jobs: ["J-", 4, 1001], Labels: ["GS-", 4, 1], Vans: ["VAN-", 0
 
 // The same role rules the Sheet enforces (Code.gs permitted_). Used by the demo, and to hide buttons.
 function permitted(op, role) {
-  if (role === "admin") return null;
+  if (role === "admin" || role === "manager") return null;
   if (role !== "storeman") return "Your login can view only.";
-  if (op.op === "append") return (op.rows || []).some(function (r) { return r.type === "reverse"; }) ? "Only an admin can record corrections." : null;
+  if (op.op === "append") {
+    var rows = op.rows || [];
+    if (rows.some(function (r) { return r.type === "reverse"; })) return "Only an admin can record corrections.";
+    if (rows.some(function (r) { return /^(countshort|countover|adjust)$/.test(r.type) && (r.from === "WH" || r.to === "WH"); })) return "Only a Warehouse Manager or Senior Admin can change store stock levels. Submit the count for approval instead.";
+    return null;
+  }
   if (op.op === "create") return op.sheet === "Jobs" || op.sheet === "Labels" ? null : "Only an admin can add vans.";
   if (op.op === "replaceLines") return null;
   if (op.op === "upsert") {
-    if (op.sheet === "Jobs") return null;
+    if (op.sheet === "Jobs" || op.sheet === "Counts") return null;
     if (op.sheet === "Items" && (op.rows || []).every(function (r) { return Object.keys(r).every(function (k) { return k === "sku" || k === "cost"; }); })) return null;
     return "Only an admin can change " + (op.sheet === "Items" ? "items." : op.sheet === "VanKit" ? "the van kit." : op.sheet + ".");
   }
   return "Only an admin can do that.";
 }
 function pinProblem(pin, role) {
-  var min = role === "admin" ? 6 : 4;
+  var min = role === "admin" || role === "manager" ? 6 : 4;
   pin = String(pin || "");
-  if (!/^\d+$/.test(pin) || pin.length < min || pin.length > 8) return "PIN must be " + min + " to 8 digits" + (role === "admin" ? " for admins." : ".");
+  if (!/^\d+$/.test(pin) || pin.length < min || pin.length > 8) return "PIN must be " + min + " to 8 digits" + (min === 6 ? " for managers and admins." : ".");
   if (/^(\d)\1+$/.test(pin) || "0123456789".indexOf(pin) >= 0 || "9876543210".indexOf(pin) >= 0) return "Choose a PIN that isn't all the same digit or a simple run like 1234.";
   return null;
 }
@@ -108,8 +113,9 @@ function suggestPin(len) {
  * including logins and roles, so the demo behaves like the real thing.
  */
 var DEMO_USERS = [
-  { username: "admin", name: "Kyle (admin)", role: "admin", active: "yes", mustChange: "no", pin: "246810" },
-  { username: "sipho", name: "Sipho (storeman)", role: "storeman", active: "yes", mustChange: "no", pin: "1357" },
+  { username: "admin", name: "Kyle (senior admin)", role: "admin", active: "yes", mustChange: "no", pin: "246810" },
+  { username: "lebo", name: "Lebo (warehouse manager)", role: "manager", active: "yes", mustChange: "no", pin: "580214" },
+  { username: "sipho", name: "Sipho (user)", role: "storeman", active: "yes", mustChange: "no", pin: "1357" },
   { username: "owner", name: "Owner (viewer)", role: "viewer", active: "yes", mustChange: "no", pin: "8642" }
 ];
 function demoErr(msg, signIn) { var e = new Error(msg); e.signIn = !!signIn; return e; }
@@ -149,11 +155,11 @@ var demo = {
   listUsers: function (users) { return users.map(function (u) { return { username: u.username, name: u.name, role: u.role, active: u.active, mustChange: u.mustChange, lastLogin: u.lastLogin || "" }; }); },
   endSessions: function (sessions, username) { Object.keys(sessions).forEach(function (t) { if (sessions[t] === username) delete sessions[t]; }); LS.set("sc_demo_sessions", sessions); },
   usersCmd: function (body, me, users, sessions) {
-    if (me.role !== "admin") throw demoErr("Only an admin can manage logins.");
+    if (me.role !== "admin") throw demoErr("Only a Senior Admin can manage logins.");
     if (body.cmd === "save") {
       var u = body.user || {}, name = String(u.username || "").trim().toLowerCase();
       if (!/^[a-z0-9._-]{2,30}$/.test(name)) throw demoErr("Username: 2 to 30 letters, numbers, dots or dashes. No spaces.");
-      if (["admin", "storeman", "viewer"].indexOf(u.role) < 0) throw demoErr("Choose a role.");
+      if (["admin", "manager", "storeman", "viewer"].indexOf(u.role) < 0) throw demoErr("Choose a role.");
       if (!String(u.name || "").trim()) throw demoErr("Add the person's name.");
       var cur = users.find(function (x) { return x.username === name; });
       if (cur && body.isNew) throw demoErr("That username is taken. Choose another.");
@@ -165,8 +171,8 @@ var demo = {
         var p1 = pinProblem(body.pin, u.role); if (p1) throw demoErr(p1);
         users.push({ username: name, name: u.name.trim(), role: u.role, active: active, mustChange: "yes", pin: String(body.pin), created: now() });
       } else {
-        var promoted = u.role === "admin" && cur.role !== "admin";
-        if (promoted) { var p2 = pinProblem(body.pin, "admin"); if (p2) throw demoErr(p2); cur.pin = String(body.pin); cur.mustChange = "yes"; }
+        var promoted = (u.role === "admin" || u.role === "manager") && !(cur.role === "admin" || cur.role === "manager");
+        if (promoted) { var p2 = pinProblem(body.pin, u.role); if (p2) throw demoErr(p2); cur.pin = String(body.pin); cur.mustChange = "yes"; }
         if (active === "no" || u.role !== cur.role) this.endSessions(sessions, name);
         cur.name = u.name.trim(); cur.role = u.role; cur.active = active;
       }
@@ -205,6 +211,18 @@ var demo = {
             var row = Object.assign({}, op.row); row[key] = id; work[op.sheet].push(row);
             if (op.ref) assigned[op.ref] = id;
             return;
+          }
+          if (op.op === "upsert" && op.sheet === "Counts") {
+            op.rows.forEach(function (r) {
+              var cur = work.Counts.find(function (x) { return x.id === r.id; });
+              var mgr = me.role === "admin" || me.role === "manager";
+              if (!mgr && (cur || r.status !== "pending")) throw demoErr("Only a Warehouse Manager or Senior Admin can approve or reject counts.");
+              if (!cur) r.by = me.username;
+              if (cur && r.status && r.status !== cur.status) {
+                if (cur.by === me.username) throw demoErr("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
+                r.decidedBy = me.username;
+              }
+            });
           }
           if (op.op === "upsert" && op.expect) {
             op.rows.forEach(function (r) {
@@ -286,7 +304,7 @@ function applyServer(res) {
 var $ = function (s) { return document.querySelector(s); };
 function esc(v) { return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
 function n(v) { var x = Number(v); return isFinite(x) ? x : 0; }
-function R(v) { return "R " + Math.round(n(v)).toLocaleString("en-ZA"); }
+function R(v) { var x = Math.round(n(v)); return (x < 0 ? "\u2212R\u00a0" : "R\u00a0") + Math.abs(x).toLocaleString("en-ZA"); }
 function q(v, sku) { var u = X.items[sku] && X.items[sku].uom; var s = (Math.round(n(v) * 100) / 100).toLocaleString("en-ZA", { maximumFractionDigits: 2 }); return u === "m" ? s + " m" : s; }
 function cost(sku) { return n(X.items[sku] && X.items[sku].cost); }
 function nameOf(sku) { return (X.items[sku] && X.items[sku].name) || sku; }
@@ -310,10 +328,13 @@ function serialPlace(serial) {
   D.Moves.forEach(function (m) { if (m.serial && String(m.serial).toUpperCase() === serial) at = m.to; });
   return at;
 }
-var ROLE_LABEL = { admin: "Admin", storeman: "Storeman", viewer: "Viewer" };
+var ROLE_LABEL = { admin: "Senior Admin", manager: "Warehouse Manager", storeman: "User", viewer: "Viewer" };
 function role() { return (cfg.user && cfg.user.role) || ""; }
-function isAdmin() { return role() === "admin"; }
-function canWork() { return role() === "admin" || role() === "storeman"; }
+function isAdmin() { return role() === "admin"; }                          // Senior Admin: logins, connection
+function isMgrRole(r) { return r === "admin" || r === "manager"; }
+function canManage() { return role() === "admin" || role() === "manager"; }  // inventory, items, costs, corrections
+function canWork() { return role() === "admin" || role() === "manager" || role() === "storeman"; }
+function hubName() { return isAdmin() ? "Admin" : canManage() ? "Manage" : "More"; }
 var STATUS = { quoted: "Quoted", kitted: "Ready for van", out: "On site", closed: "Closed" };
 
 /* ===================== screen state ===================== */
@@ -424,7 +445,7 @@ function render() {
     var t = b.dataset.tab;
     b.hidden = (t === "scan" || t === "counts") && !canWork();
     b.classList.toggle("on", t === S.tab && t !== "scan");
-    if (t === "more") b.lastChild.textContent = isAdmin() ? "Admin" : "More";
+    if (t === "more") b.lastChild.textContent = hubName();
   });
   if (!canWork() && (S.tab === "scan" || S.tab === "counts")) S.tab = "jobs";
   $("#demoBar").hidden = cfg.mode !== "demo";
@@ -440,7 +461,7 @@ function render() {
   var a = document.activeElement, id = a && a.id, pos = null;
   try { pos = a && a.selectionStart; } catch (e) {}
   v.innerHTML = html;
-  patchReturn();
+  patchReturn(); patchCounts();
   if (id) { var el = document.getElementById(id); if (el && el.tagName !== "BUTTON") { el.focus(); try { if (pos != null) el.setSelectionRange(pos, pos); } catch (e) {} } }
 }
 
@@ -690,16 +711,16 @@ function vStock() {
     '<div class="kpi"><div class="l">In store</div><div class="v">' + R(whVal) + '</div></div><div class="kpi"><div class="l">In vans</div><div class="v">' + R(vanVal) + "</div></div>" +
     '<div class="kpi"><div class="l">Out on jobs</div><div class="v">' + R(jobVal) + "</div></div></div>" +
     '<section class="panel"><h3>Stock on hand</h3><div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">Store</th><th class="n">Vans</th><th class="n">Jobs</th><th class="n">Value</th></tr></thead><tbody>' + rows + "</tbody></table></div>" +
-    '<p class="tiny muted">Value uses the average landed cost of each item. Tap an item to see every movement' + (isAdmin() ? " and correct mistakes." : ".") + "</p></section>";
+    '<p class="tiny muted">Value uses the average landed cost of each item. Tap an item to see every movement' + (canManage() ? " and correct mistakes." : ".") + "</p></section>";
 }
 
 /* ---------- Item history & corrections ---------- */
-var MOVE_LABEL = { receive: "Received", kit: "Kitted to job", extra: "Extra to job", "return": "Returned", scrap: "Scrapped", used: "Used on job",
+var MOVE_LABEL = { adjust: "Adjustment", receive: "Received", kit: "Kitted to job", extra: "Extra to job", "return": "Returned", scrap: "Scrapped", used: "Used on job",
   missing: "Missing", topup: "Van top-up", kituse: "Van kit used", countshort: "Count short", countover: "Count over", reverse: "Correction" };
-var REVERSIBLE = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1 };
+var REVERSIBLE = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1, adjust: 1 };
 function placeName(l) { return !l ? "" : l === "WH" ? "Store" : l.indexOf("JOB:") === 0 ? l.slice(4) : l === "SUPPLIER" ? "Supplier" : l === "USED" ? "Used" : l === "LOSS" ? "Lost/found" : l === "SCRAP" ? "Scrap" : vanName(l); }
 function canReverse(m) {
-  if (!isAdmin() || !REVERSIBLE[m.type]) return false;
+  if (!canManage() || !REVERSIBLE[m.type]) return false;
   if (D.Moves.some(function (x) { return x.type === "reverse" && x.ref === m.id; })) return false;
   if (m.job) { var j = X.jobs[m.job]; if (!j || j.status !== "out") return false; }
   return true;
@@ -741,29 +762,47 @@ function countCells(place, sku) {
 }
 function patchCounts() {
   var place = S.f.place || "WH";
+  var t = document.getElementById("cntTotal"); if (t) t.innerHTML = countTotal(place);
   Object.keys(S.f.cnt || {}).forEach(function (sku) {
     var cells = countCells(place, sku), a = document.getElementById("cdiff_" + sku), b = document.getElementById("ctop_" + sku);
     if (a) a.innerHTML = cells[0]; if (b) b.innerHTML = cells[1];
   });
 }
-function vCounts() {
+function vCounts(inInv) {
   var place = S.f.place || "WH";
   var c = S.f.cnt || (S.f.cnt = {});
   var isVan = place !== "WH";
-  var skus = isVan ? X.kit.map(function (k) { return k.sku; }) : D.Items.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (i) { return i.sku; });
+  var flt = String(S.f.cflt || "").trim().toLowerCase();
+  var all = isVan ? X.kit.map(function (k) { return k.sku; }) : D.Items.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (i) { return i.sku; });
+  var skus = all.filter(function (sku) { return !flt || (nameOf(sku) + " " + sku).toLowerCase().indexOf(flt) >= 0; });
   var last = null;
   D.Moves.forEach(function (m) { if ((m.type === "countshort" || m.type === "countover" || m.type === "kituse") && (m.from === place || m.to === place)) last = m.ts; });
+  var pending = (D.Counts || []).filter(function (x) { return x.status === "pending" && x.place === place; });
+  var direct = isVan || canManage();
   var rows = skus.map(function (sku) {
     var raw = c[sku];
-    return "<tr><td>" + esc(nameOf(sku)) + '</td><td class="n">' + q(bal(place, sku), sku) + '</td><td class="n" style="min-width:90px"><input class="num" id="cnt_' + esc(sku) + '" type="number" inputmode="decimal" min="0" step="any" value="' + esc(raw == null ? "" : raw) +
+    return "<tr><td>" + esc(nameOf(sku)) + '<div class="tiny muted mono">' + esc(sku) + '</div></td><td class="n">' + q(bal(place, sku), sku) + '</td><td class="n" style="min-width:90px"><input class="num" id="cnt_' + esc(sku) + '" type="number" inputmode="decimal" min="0" step="any" value="' + esc(raw == null ? "" : raw) +
       '" data-bind="cnt.' + esc(sku) + '" data-live="1" aria-label="Counted ' + esc(nameOf(sku)) + '"></td><td class="n" id="cdiff_' + esc(sku) + '">' + countCells(place, sku)[0] + "</td>" +
       (isVan ? '<td class="n" id="ctop_' + esc(sku) + '">' + countCells(place, sku)[1] + "</td>" : "") + "</tr>";
   }).join("");
-  return '<h2>Counts</h2><section class="panel"><label class="f">What are you counting?<select id="cnt_place" data-bind="place" data-rerender="1" data-reset="cnt">' +
-    '<option value="WH"' + (place === "WH" ? " selected" : "") + ">Warehouse shelves</option>" + X.vans.map(function (v) { return '<option value="' + esc(v.id) + '"' + (v.id === place ? " selected" : "") + ">" + esc(v.name) + " kit</option>"; }).join("") + "</select></label>" +
-    '<p class="small muted">Last counted: ' + (last ? dshort(last) : "never") + ". " + (isVan ? "Count weekly. Shortfalls are booked as parts used on jobs; then top up to target." : "Count cable and expensive items weekly, the rest monthly. Leave a line blank to skip it.") + "</p>" +
-    (skus.length ? '<div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">System</th><th class="n">Counted</th><th class="n">Diff</th>' + (isVan ? '<th class="n">Top up</th>' : "") + "</tr></thead><tbody>" + rows + "</tbody></table></div>" : '<p class="muted">No van kit list yet. Set it up in More → Vans.</p>') +
-    msgHtml() + '<button class="btn wide" data-action="saveCount"' + (S.busy || !skus.length ? " disabled" : "") + ">Save count</button></section>";
+  return (inInv ? "" : "<h2>Counts</h2>") + '<section class="panel"><label class="f">What are you counting?<select id="cnt_place" data-bind="place" data-rerender="1" data-reset="cnt">' +
+    '<option value="WH"' + (place === "WH" ? " selected" : "") + ">Store shelves</option>" + X.vans.map(function (v) { return '<option value="' + esc(v.id) + '"' + (v.id === place ? " selected" : "") + ">" + esc(v.name) + " kit</option>"; }).join("") + "</select></label>" +
+    '<p class="small muted">Last counted: ' + (last ? dshort(last) : "never") + ". " + (isVan ? "Count weekly. Shortfalls are booked as parts used on jobs; then top up to target." :
+      direct ? "As a manager, your count changes stock straight away. Leave a line blank to skip it." : "Count cable and expensive items weekly, the rest monthly. Leave a line blank to skip it. A Warehouse Manager approves the count before stock changes.") + "</p>" +
+    (pending.length && !isVan ? '<div class="msg warn">' + pending.length + " count(s) for the store are waiting for a manager to approve." + (isAdmin() ? "" : "") + "</div>" : "") +
+    (all.length > 8 ? '<label class="f">Find an item<input id="cnt_flt" data-bind="cflt" data-rerender="1" value="' + esc(S.f.cflt || "") + '" placeholder="Type a name or code" autocomplete="off"></label>' : "") +
+    (skus.length ? '<div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">System</th><th class="n">Counted</th><th class="n">Diff</th>' + (isVan ? '<th class="n">Top up</th>' : "") + "</tr></thead><tbody>" + rows + "</tbody></table></div>" :
+      '<p class="muted">' + (all.length ? "No items match." : isVan ? "No van kit list yet. An admin sets it up in Admin → Vans." : "No items yet.") + "</p>") +
+    '<div id="cntTotal"></div>' +
+    (!direct ? '<label class="f">Note for the admin (optional)<input id="cnt_note" data-bind="cnote" value="' + esc(S.f.cnote || "") + '" placeholder="e.g. Drum 2 label damaged, measured by hand"></label>' : "") +
+    msgHtml() + '<button class="btn wide" data-action="saveCount"' + (S.busy || !all.length ? " disabled" : "") + ">" + (direct ? "Save count" : "Submit count for approval") + "</button></section>";
+}
+function countTotal(place) {
+  var lines = C.countLines(place, S.f.cnt || {}, X.B, X.items);
+  var short = 0, over = 0;
+  lines.forEach(function (l) { if (l.value < 0) short += -l.value; else over += l.value; });
+  if (!lines.length) return "";
+  return '<p class="small">' + lines.length + " counted · <b>" + R(short) + "</b> short · <b>" + R(over) + "</b> over</p>";
 }
 
 /* ---------- More / Admin ---------- */
@@ -772,28 +811,131 @@ function tile(sub, title, desc, badge) {
     '<div class="right">' + (badge || "") + "<span aria-hidden=\"true\">›</span></div></button>";
 }
 function vMore() {
-  var subs = { items: vItems, labels: vLabels, vans: vVans, account: vAccount, users: vUsers, reports: vReports, corrections: vCorrections };
-  var adminOnly = { items: 1, vans: 1, users: 1, corrections: 1 };
-  if (S.sub && subs[S.sub] && (!adminOnly[S.sub] || isAdmin()) && !(S.sub === "reports" && role() === "storeman")) return subs[S.sub]();
-  if (isAdmin()) {
+  var subs = { items: vItems, labels: vLabels, vans: vVans, account: vAccount, users: vUsers, reports: vReports, corrections: vCorrections, inventory: vInventory };
+  var need = { users: isAdmin(), items: canManage(), vans: canManage(), corrections: canManage(), inventory: canManage(), reports: role() !== "storeman" };
+  if (S.sub && subs[S.sub] && need[S.sub] !== false) return subs[S.sub]();
+  if (canManage()) {
     var L = C.losses(D.Moves, 30);
     var users = S.users || [];
     var reversals = D.Moves.filter(function (m) { return m.type === "reverse"; }).length;
-    return '<h2>Admin</h2><p class="small muted">Only admins see this section. Every change here is checked by the Google Sheet.</p><div class="list">' +
-      tile("users", "Logins", "Who can sign in, their role, PIN resets", users.length ? '<span class="pill p-quoted">' + users.filter(function (u) { return u.active === "yes"; }).length + " active</span>" : "") +
+    var pending = (D.Counts || []).filter(function (x) { return x.status === "pending"; }).length;
+    var low = D.Items.filter(function (it) { return n(it.reorder) > 0 && bal("WH", it.sku) < n(it.reorder); }).length;
+    return "<h2>" + hubName() + '</h2><p class="small muted">Signed in as ' + esc(ROLE_LABEL[role()]) + ". Every change here is checked by the Google Sheet.</p><div class=\"list\">" +
+      tile("inventory", "Inventory", "Approve counts, stock take, adjust, import and export",
+        (pending ? '<span class="pill p-bad">' + pending + " to approve</span>" : "") + (low ? '<span class="pill p-kitted">' + low + " to order</span>" : "")) +
       tile("reports", "Missing stock report", "By installer, van and job; jobs over quote", L.total > 0 ? '<span class="pill p-bad">' + R(L.total) + " · 30 days</span>" : "") +
       tile("corrections", "Corrections log", "Every reversed movement, who and why", reversals ? '<span class="pill p-kitted">' + reversals + "</span>" : "") +
-      tile("items", "Items", "Products, units, reorder levels, cable allowance") +
+      tile("items", "Items", "Products, units, costs, reorder levels, cable allowance") +
       tile("vans", "Vans and van kit", "Vans and the small parts each one carries") +
       tile("labels", "Stickers", "Make and print QR stickers") +
-      tile("account", "My account and connection", "Change PIN, sign out, Google Sheet link") + "</div>";
+      (isAdmin() ? tile("users", "Logins", "Who can sign in and what they can do", users.length ? '<span class="pill p-quoted">' + users.filter(function (u) { return u.active === "yes"; }).length + " active</span>" : "") : "") +
+      tile("account", isAdmin() ? "My account and connection" : "My account", isAdmin() ? "Change PIN, sign out, Google Sheet link" : "Change PIN, sign out") + "</div>";
   }
   return "<h2>More</h2><div class=\"list\">" +
     tile("labels", "Stickers", canWork() ? "Make and print QR stickers for drums, bins and shelves" : "View and print stickers") +
     (role() === "viewer" ? tile("reports", "Missing stock report", "By installer, van and job; jobs over quote") : "") +
     tile("account", "My account", "Change PIN, sign out") + "</div>";
 }
-function backMore() { return '<div class="row"><button class="btn ghost small" data-action="sub" data-sub="">← ' + (isAdmin() ? "Admin" : "More") + "</button></div>"; }
+
+/* ---- Inventory (Warehouse Manager + Senior Admin) ---- */
+var INV_TABS = { approve: "Approve", take: "Stock take", adjust: "Adjust", io: "Import / export" };
+function vInventory() {
+  var t = S.f.invTab || ((D.Counts || []).some(function (x) { return x.status === "pending"; }) ? "approve" : "take");
+  var pending = (D.Counts || []).filter(function (x) { return x.status === "pending"; }).length;
+  var tabs = '<div class="segs" role="tablist">' + Object.keys(INV_TABS).map(function (k) {
+    return '<button class="seg' + (k === t ? " on" : "") + '" role="tab" aria-selected="' + (k === t) + '" data-action="invTab" data-t="' + k + '">' + INV_TABS[k] +
+      (k === "approve" && pending ? ' <span class="badge">' + pending + "</span>" : "") + "</button>";
+  }).join("") + "</div>";
+  var body = t === "approve" ? vApprove() : t === "take" ? vCounts(true) : t === "adjust" ? vAdjust() : vImport();
+  return backMore() + '<div class="spread"><h2>Inventory</h2><button class="btn ghost small" data-action="refreshAll"' + (S.busy ? " disabled" : "") + ">↻ Refresh from Sheet</button></div>" + tabs + (t === "take" ? "" : msgHtml()) + body;
+}
+
+function countLinesOf(c) { try { return JSON.parse(c.lines || "[]"); } catch (e) { return []; } }
+function vApprove() {
+  var list = (D.Counts || []).slice().sort(function (a, b) { return String(b.ts).localeCompare(String(a.ts)); });
+  var pend = list.filter(function (c) { return c.status === "pending"; });
+  var done = list.filter(function (c) { return c.status !== "pending"; }).slice(0, 10);
+  function linesTable(c) {
+    var lines = countLinesOf(c);
+    return '<div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">System</th><th class="n">Counted</th><th class="n">Diff</th><th class="n">Value</th></tr></thead><tbody>' +
+      lines.map(function (l) {
+        return "<tr><td>" + esc(nameOf(l.sku)) + '</td><td class="n">' + q(l.system, l.sku) + '</td><td class="n">' + q(l.counted, l.sku) + '</td><td class="n">' +
+          (l.diff < 0 ? '<span class="pill p-bad">' + q(l.diff, l.sku) + "</span>" : l.diff > 0 ? "+" + q(l.diff, l.sku) : "✓") + '</td><td class="n">' + (l.diff ? R(l.value) : "") + "</td></tr>";
+      }).join("") + "</tbody></table></div>";
+  }
+  var me = cfg.user && cfg.user.username;
+  var html = pend.length ? pend.map(function (c) {
+    var lines = countLinesOf(c), diffs = lines.filter(function (l) { return l.diff; }).length;
+    var own = c.by === me, open = S.f.rejecting === c.id;
+    return '<section class="panel"><div class="spread"><div><h3>' + (c.place === "WH" ? "Store shelves" : esc(vanName(c.place))) + '</h3><div class="tiny muted">Counted by <b>' + esc(c.by) + "</b> · " + esc(dtime(c.ts)) +
+      " · " + lines.length + (lines.length === 1 ? " line, " : " lines, ") + diffs + " different</div></div>" + '<span class="pill ' + (n(c.value) < 0 ? "p-bad" : "p-closed") + '">' + R(c.value) + "</span></div>" +
+      (c.note ? '<div class="small">Note: ' + esc(c.note) + "</div>" : "") + linesTable(c) +
+      '<p class="tiny muted">Approving books the differences shown, as they were when counted. Stock that moved since then is not affected.</p>' +
+      (own ? '<div class="msg info">This is your own count. Another Warehouse Manager or the Senior Admin must approve it.</div>' :
+        open ? '<label class="f">Why reject it? (required)<input id="rej_' + esc(c.id) + '" data-bind="rejNote" value="' + esc(S.f.rejNote || "") + '" placeholder="e.g. Drum 2 missed, please recount"></label>' +
+          '<div class="row"><button class="btn" data-action="rejectCount" data-id="' + esc(c.id) + '">Reject count</button><button class="btn ghost" data-action="rejCancel">Cancel</button></div>' :
+        '<div class="row"><button class="btn" data-action="approveCount" data-id="' + esc(c.id) + '"' + (S.busy ? " disabled" : "") + ">Approve</button>" +
+          '<button class="btn ghost" data-action="rejStart" data-id="' + esc(c.id) + '">Reject</button></div>') + "</section>";
+  }).join("") : '<section class="panel"><p class="muted">No counts waiting. When a User counts the store shelves, it appears here for approval.</p></section>';
+  if (done.length) html += '<section class="panel"><h3>Recent decisions</h3>' + done.map(function (c) {
+    return '<div class="hist"><div class="spread"><div><b>' + (c.place === "WH" ? "Store shelves" : esc(vanName(c.place))) + '</b><div class="tiny muted">Counted by ' + esc(c.by) + " · " + esc(dshort(c.ts)) +
+      " · " + (c.status === "approved" ? "approved" : "rejected") + " by " + esc(c.decidedBy || "") + "</div></div>" +
+      '<span class="pill ' + (c.status === "approved" ? "p-closed" : "p-bad") + '">' + (c.status === "approved" ? "Approved" : "Rejected") + "</span></div>" +
+      (c.status === "rejected" && c.decisionNote ? '<div class="tiny">Reason: ' + esc(c.decisionNote) + "</div>" : "") + "</div>";
+  }).join("") + "</section>";
+  return html;
+}
+
+var ADJ_REASONS = ["Damaged / written off", "Found", "Count correction", "Supplier short-delivered", "Other"];
+function vAdjust() {
+  var f = S.f.adj || (S.f.adj = { dir: "remove", place: "WH", reason: ADJ_REASONS[0] });
+  var it = X.items[f.sku];
+  var places = '<option value="WH"' + (f.place === "WH" ? " selected" : "") + ">Store</option>" + X.vans.map(function (v) { return '<option value="' + esc(v.id) + '"' + (v.id === f.place ? " selected" : "") + ">" + esc(v.name) + "</option>"; }).join("");
+  var value = it ? n(f.qty) * cost(f.sku) : 0;
+  return '<section class="panel"><h3>Adjust one item</h3><p class="small muted">For damage, finds and fixing a known mistake. The reason is saved with the movement and shows in the item history.</p>' +
+    '<div class="row"><label class="f" style="flex:2 1 200px">Item<select id="adj_sku" data-bind="adj.sku"><option value="">Choose…</option>' + D.Items.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (i) { return '<option value="' + esc(i.sku) + '"' + (i.sku === f.sku ? " selected" : "") + ">" + esc(i.name) + "</option>"; }).join("") + "</select></label>" +
+    '<label class="f">Where<select id="adj_place" data-bind="adj.place">' + places + "</select></label></div>" +
+    (it ? '<p class="small">Now in ' + esc(f.place === "WH" ? "store" : vanName(f.place)) + ': <b class="mono">' + q(bal(f.place, f.sku), f.sku) + "</b></p>" : "") +
+    '<div class="row" role="radiogroup" aria-label="Add or remove"><button class="btn small ' + (f.dir === "remove" ? "" : "ghost") + '" role="radio" aria-checked="' + (f.dir === "remove") + '" data-action="adjDir" data-d="remove">− Remove</button>' +
+    '<button class="btn small ' + (f.dir === "add" ? "" : "ghost") + '" role="radio" aria-checked="' + (f.dir === "add") + '" data-action="adjDir" data-d="add">+ Add</button></div>' +
+    '<div class="row"><label class="f">Quantity' + (it && it.uom === "m" ? " (m)" : "") + '<input class="num" id="adj_qty" type="number" inputmode="decimal" min="0" step="any" data-bind="adj.qty" value="' + esc(f.qty || "") + '"></label>' +
+    '<label class="f" style="flex:2 1 200px">Reason<select id="adj_reason" data-bind="adj.reason">' + ADJ_REASONS.map(function (r) { return "<option" + (r === f.reason ? " selected" : "") + ">" + r + "</option>"; }).join("") + "</select></label></div>" +
+    '<label class="f">Details (required)<input id="adj_note" data-bind="adj.note" value="' + esc(f.note || "") + '" placeholder="e.g. 6 m crushed by forklift, binned"></label>' +
+    (it && n(f.qty) > 0 ? '<p class="small">This ' + (f.dir === "remove" ? "removes" : "adds") + " <b>" + q(f.qty, f.sku) + "</b> worth <b>" + R(value) + "</b>." + (f.dir === "remove" ? " It counts as missing stock in the report." : "") + "</p>" : "") +
+    msgHtml() + '<button class="btn wide" data-action="saveAdjust"' + (S.busy ? " disabled" : "") + ">Save adjustment</button></section>";
+}
+
+function vImport() {
+  var f = S.f.imp || (S.f.imp = { mode: "set", text: "" });
+  var prev = f.preview;
+  var table = "";
+  if (prev) {
+    table = (prev.errors.length ? '<div class="msg err">' + prev.errors.map(esc).join("<br>") + "</div>" : "") +
+      (prev.rows.length ? '<div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">In store</th><th class="n">' + (f.mode === "set" ? "Counted" : "Receive") + '</th><th class="n">Change</th><th class="n">Value</th></tr></thead><tbody>' +
+        prev.rows.map(function (r) {
+          var sys = r.isNew ? 0 : bal("WH", r.sku), chg = f.mode === "set" ? C.round2(r.qty - sys) : r.qty;
+          var c = r.cost != null ? r.cost : cost(r.sku);
+          return "<tr><td>" + esc(r.isNew ? r.name : nameOf(r.sku)) + '<div class="tiny muted mono">' + esc(r.sku) + (r.isNew ? ' · <span class="pill p-quoted">New item</span>' : "") + "</div></td>" +
+            '<td class="n">' + (r.isNew ? "–" : q(sys, r.sku)) + '</td><td class="n">' + r.qty + '</td><td class="n">' + (chg < 0 ? '<span class="pill p-bad">' + chg + "</span>" : chg > 0 ? "+" + chg : "✓") + '</td><td class="n">' + R(chg * c) + "</td></tr>";
+        }).join("") + "</tbody></table></div>" : "") +
+      (prev.rows.length && !prev.errors.length ? '<button class="btn wide" data-action="applyImport"' + (S.busy ? " disabled" : "") + ">Apply " + prev.rows.length + " line(s)</button>" : "") +
+      (prev.errors.length && prev.rows.length ? '<p class="tiny muted">Fix the lines above, then preview again. Nothing is changed until every line is valid.</p>' : "");
+  }
+  return '<section class="panel"><h3>Export</h3><p class="small muted">Download every item with its store quantity and landed cost. Open it in Excel, update the quantities, and paste it back below.</p>' +
+    '<button class="btn ghost" data-action="exportStock">Download stock list (CSV)</button></section>' +
+    '<section class="panel"><h3>Import from Excel</h3>' +
+    '<div class="row" role="radiogroup" aria-label="What the numbers mean">' +
+    '<button class="btn small ' + (f.mode === "set" ? "" : "ghost") + '" role="radio" aria-checked="' + (f.mode === "set") + '" data-action="impMode" data-m="set">Set store stock to these counts</button>' +
+    '<button class="btn small ' + (f.mode === "receive" ? "" : "ghost") + '" role="radio" aria-checked="' + (f.mode === "receive") + '" data-action="impMode" data-m="receive">Add as received (opening stock / delivery)</button></div>' +
+    '<p class="small muted">' + (f.mode === "set" ? "Use for a full stock take done on paper or in Excel. The store quantity becomes the number you give; differences are booked as count adjustments. A cost column, if given, updates the item's landed cost." :
+      "Use for day-one opening stock or a big delivery. The quantities are added to the store at the landed cost you give (moving average).") + "</p>" +
+    '<p class="tiny muted">Columns, in this order: <b>Item code, Quantity</b>, Landed cost, Name, Unit (m or ea). Copy the cells from Excel and paste. A header row is fine. New item codes need a name and are created automatically.</p>' +
+    '<label class="f">Paste here<textarea id="imp_text" rows="7" class="mono" data-bind="imp.text" placeholder="PV6-RED&#9;450&#9;18.90&#10;MC4&#9;120&#9;28&#10;BRK-32A&#9;12&#9;95&#9;Breaker 32 A&#9;ea">' + esc(f.text || "") + "</textarea></label>" +
+    (f.mode === "receive" ? '<label class="f">Reference<input id="imp_ref" data-bind="imp.ref" value="' + esc(f.ref || "") + '" placeholder="e.g. Opening stock 1 Dec 2026"></label>' : "") +
+    '<button class="btn ghost" data-action="previewImport">Preview</button>' + table + "</section>";
+}
+
+function backMore() { return '<div class="row"><button class="btn ghost small" data-action="sub" data-sub="">← ' + hubName() + "</button></div>"; }
 
 function vItems() {
   var f = S.f.it || (S.f.it = { uom: "m", track: "qty", allowancePct: "10" });
@@ -848,10 +990,10 @@ function vUsers() {
   var temp = S.f.tempPin;
   var list = users.map(function (u) {
     return '<button class="card" data-action="editUser" data-u="' + esc(u.username) + '"><div><div>' + esc(u.name) + '</div><div class="tiny muted"><span class="mono">' + esc(u.username) + "</span> · last sign-in " + (u.lastLogin ? esc(dshort(u.lastLogin)) : "never") + "</div></div>" +
-      '<div class="right"><span class="pill ' + (u.role === "admin" ? "p-out" : u.role === "storeman" ? "p-quoted" : "p-kitted") + '">' + ROLE_LABEL[u.role] + "</span>" +
+      '<div class="right"><span class="pill ' + (u.role === "admin" ? "p-out" : u.role === "manager" ? "p-closed" : u.role === "storeman" ? "p-quoted" : "p-kitted") + '">' + ROLE_LABEL[u.role] + "</span>" +
       (u.active !== "yes" ? '<span class="pill p-bad">Switched off</span>' : u.mustChange === "yes" ? '<span class="tiny muted">PIN not chosen yet</span>' : "") + "</div></button>";
   }).join("");
-  var roleOpts = ["storeman", "admin", "viewer"].map(function (r) { return '<option value="' + r + '"' + (f.role === r ? " selected" : "") + ">" + ROLE_LABEL[r] + "</option>"; }).join("");
+  var roleOpts = ["storeman", "manager", "admin", "viewer"].map(function (r) { return '<option value="' + r + '"' + (f.role === r ? " selected" : "") + ">" + ROLE_LABEL[r] + "</option>"; }).join("");
   var editingSelf = !f.isNew && cfg.user && f.username === cfg.user.username;
   return backMore() + "<h2>Logins</h2>" +
     (temp ? '<div class="msg ok"><b>Temporary PIN for ' + esc(temp.name) + ': <span class="mono" style="font-size:1.3em">' + esc(temp.pin) + "</span></b><br>Give it to them in person. They'll choose their own PIN when they first sign in. It won't be shown again.</div>" : "") +
@@ -859,10 +1001,14 @@ function vUsers() {
     '<label class="f">Full name<input id="us_name" data-bind="us.name" value="' + esc(f.name || "") + '" placeholder="e.g. Sipho Mokoena"></label>' +
     '<label class="f">Username<input id="us_user" class="mono" autocapitalize="off" autocomplete="off" data-bind="us.username" value="' + esc(f.username || "") + '"' + (f.isNew ? "" : " readonly") + ' placeholder="e.g. sipho"></label></div><div class="row">' +
     '<label class="f">Role<select id="us_role" data-bind="us.role"' + (editingSelf ? " disabled" : "") + ">" + roleOpts + "</select></label>" +
-    (f.isNew || (f.role === "admin" && f.origRole !== "admin") ? '<label class="f">Temporary PIN<input id="us_pin" class="num" inputmode="numeric" data-bind="us.pin" value="' + esc(f.pin || "") + '"></label>' : "") +
+    (f.isNew || (isMgrRole(f.role) && !isMgrRole(f.origRole)) ? '<label class="f">Temporary PIN<input id="us_pin" class="num" inputmode="numeric" data-bind="us.pin" value="' + esc(f.pin || "") + '"></label>' : "") +
     (!f.isNew ? '<label class="f">Status<select id="us_active" data-bind="us.active"' + (editingSelf ? " disabled" : "") + '><option value="yes"' + (f.active !== "no" ? " selected" : "") + '>Can sign in</option><option value="no"' + (f.active === "no" ? " selected" : "") + ">Switched off</option></select></label>" : "") +
     "</div>" +
-    '<p class="tiny muted"><b>Storeman:</b> daily stock work. <b>Admin:</b> everything, including logins, items, costs and corrections. <b>Viewer:</b> can look at jobs, stock and reports, can\'t change anything. Admins need a 6-digit PIN.</p>' +
+    '<div class="roles tiny"><div><b>User</b> Daily stock work: jobs, kitting, scanning, receiving, returns. Shelf counts go to a manager for approval.</div>' +
+    "<div><b>Warehouse Manager</b> Everything a User does, plus Inventory (approve counts, stock take, adjust, import), items and costs, van kits, corrections, reports.</div>" +
+    "<div><b>Senior Admin</b> Everything, including logins and the Google Sheet connection.</div>" +
+    "<div><b>Viewer</b> Looks at jobs, stock and reports. Can't change anything.</div></div>" +
+    '<p class="tiny muted">Warehouse Managers and Senior Admins need a 6-digit PIN.</p>' +
     msgHtml() + '<div class="row"><button class="btn" data-action="saveUser"' + (S.busy ? " disabled" : "") + ">" + (f.isNew ? "Add login" : "Save") + "</button>" +
     (!f.isNew ? '<button class="btn ghost" data-action="resetUserPin"' + (S.busy ? " disabled" : "") + '>Reset PIN</button><button class="btn ghost" data-action="newUser">Cancel</button>' : "") + "</div>" +
     (!f.isNew ? '<p class="tiny muted">Switching someone off, changing their role or resetting their PIN signs them out on every device straight away.</p>' : "") + "</section>" +
@@ -942,7 +1088,7 @@ function vLogin() {
     '<label class="f">PIN<input id="lg_pin" type="password" inputmode="numeric" autocomplete="current-password" data-bind="lg.pin" value="' + esc(f.pin || "") + '"></label>' +
     msgHtml() + '<button class="btn wide" data-action="login"' + (S.busy ? " disabled" : "") + ">Sign in</button>" +
     (Q.length && Q[0].user ? '<p class="tiny muted">' + Q.length + " change(s) from <b>" + esc(Q[0].user) + "</b> are waiting on this phone. They'll sync when " + esc(Q[0].user) + " signs in.</p>" : "") +
-    (cfg.mode === "demo" ? '<div class="msg info small">Demo logins (any of these):<br><span class="mono">admin</span> PIN <span class="mono">246810</span> (Admin)<br><span class="mono">sipho</span> PIN <span class="mono">1357</span> (Storeman)<br><span class="mono">owner</span> PIN <span class="mono">8642</span> (Viewer)</div>' : "") +
+    (cfg.mode === "demo" ? '<div class="msg info small">Demo logins (any of these):<br><span class="mono">admin</span> PIN <span class="mono">246810</span> (Senior Admin)<br><span class="mono">lebo</span> PIN <span class="mono">580214</span> (Warehouse Manager)<br><span class="mono">sipho</span> PIN <span class="mono">1357</span> (User)<br><span class="mono">owner</span> PIN <span class="mono">8642</span> (Viewer)</div>' : "") +
     '<button class="linkbtn small muted" data-action="' + (cfg.mode === "demo" ? "goLive" : "useDemo") + '">' + (cfg.mode === "demo" ? "Connect our Google Sheet instead" : "Try the demo instead") + "</button>" +
     (needUrl ? "" : (cfg.mode === "live" ? '<button class="linkbtn small muted" data-action="changeUrl">Use a different Google Sheet</button>' : "")) +
     "</section>";
@@ -950,7 +1096,7 @@ function vLogin() {
 function vChangePinFirst() {
   var f = S.f.cp || (S.f.cp = {});
   return '<section class="panel login"><div class="eyebrow">Welcome, ' + esc(cfg.user.name) + "</div><h2>Choose your PIN</h2>" +
-    '<p class="small">You signed in with a temporary PIN. Choose your own now. Only you should know it.' + (isAdmin() ? " Admins need 6 to 8 digits." : " Use 4 to 8 digits.") + "</p>" +
+    '<p class="small">You signed in with a temporary PIN. Choose your own now. Only you should know it.' + (isAdmin() ? " Managers and admins need 6 to 8 digits." : " Use 4 to 8 digits.") + "</p>" +
     '<label class="f">Temporary PIN<input id="cp_old" type="password" inputmode="numeric" autocomplete="current-password" data-bind="cp.old"></label>' +
     '<label class="f">New PIN<input id="cp_new" type="password" inputmode="numeric" autocomplete="new-password" data-bind="cp.new1"></label>' +
     '<label class="f">New PIN again<input id="cp_new2" type="password" inputmode="numeric" autocomplete="new-password" data-bind="cp.new2"></label>' +
@@ -1118,6 +1264,13 @@ var A = {
     var counted = Object.keys(c).filter(function (k) { return c[k] !== "" && c[k] != null; });
     if (!counted.length) return flash("err", "Enter at least one count.");
     if (place !== "WH" && counted.length < X.kit.length) return flash("err", "Count every line of the van kit, even if it's zero.");
+    if (place === "WH" && !canManage()) {
+      // Storeman: the count is a submission. Stock only changes when an admin approves it.
+      var lines = C.countLines(place, c, X.B, X.items);
+      var value = C.round2(lines.reduce(function (s, l) { return s + l.value; }, 0));
+      return save([{ op: "upsert", sheet: "Counts", rows: [{ id: "CNT-" + uid(), place: place, ts: now(), status: "pending", lines: JSON.stringify(lines), value: value, note: S.f.cnote || "" }] }],
+        "Count submitted. A Warehouse Manager will approve it before stock changes.", function () { S.f.cnt = {}; S.f.cnote = ""; });
+    }
     var moves = C.countMoves(place, c, X.B, X.items, now(), place === "WH" ? "Shelf count" : "Van count");
     moves.forEach(function (m) { m.id = uid(); m.by = (cfg.user && cfg.user.username) || ""; });
     if (!moves.length) { S.f.cnt = {}; return flash("ok", "Count matches the system. Nothing to adjust."); }
@@ -1224,6 +1377,103 @@ var A = {
     switchMode("demo"); S.f = {}; S.loginMsg = "Demo data reset. Sign in with one of the demo logins."; render();
   },
 
+  /* ---- inventory (manager + senior admin) ---- */
+  invTab: function (b) { S.f = { invTab: b.dataset.t }; S.msg = null; render(); },
+  refreshAll: function () {
+    if (Q.length) { flush(); return flash("info", Q.length + " change(s) from this phone are being sent first. Tap Refresh again in a moment."); }
+    S.busy = true; render();
+    fullReload().then(function () { S.busy = false; S.msg = S.msg && S.msg.k === "err" ? S.msg : { k: "ok", t: "Up to date with the Google Sheet." }; render(); });
+  },
+  approveCount: function (b) {
+    var c = (D.Counts || []).find(function (x) { return x.id === b.dataset.id; });
+    if (!c || c.status !== "pending") return flash("err", "This count has already been decided.");
+    if (c.by === cfg.user.username) return flash("err", "You can't approve your own count.");
+    var moves = C.linesToMoves(c.place, countLinesOf(c), X.items, now(), "Count by " + c.by + ", approved", c.id);
+    moves.forEach(function (m) { m.id = uid(); m.by = cfg.user.username; });
+    var ops = [];
+    if (moves.length) ops.push({ op: "append", sheet: "Moves", rows: moves });
+    ops.push({ op: "upsert", sheet: "Counts", rows: [{ id: c.id, status: "approved", decidedAt: now() }], expect: { field: "status", values: ["pending"] } });
+    save(ops, "Count approved. " + (moves.length ? moves.length + " adjustment(s) booked (" + R(c.value) + ")." : "Nothing to adjust."), function () { S.f.invTab = "approve"; });
+  },
+  rejStart: function (b) { S.f.rejecting = b.dataset.id; S.f.rejNote = ""; render(); },
+  rejCancel: function () { S.f.rejecting = null; render(); },
+  rejectCount: function (b) {
+    if (!String(S.f.rejNote || "").trim()) return flash("err", "Give a reason, so the counter knows what to fix.");
+    save([{ op: "upsert", sheet: "Counts", rows: [{ id: b.dataset.id, status: "rejected", decidedAt: now(), decisionNote: S.f.rejNote.trim() }], expect: { field: "status", values: ["pending"] } }],
+      "Count rejected. Stock not changed.", function () { S.f.rejecting = null; S.f.invTab = "approve"; });
+  },
+  adjDir: function (b) { S.f.adj.dir = b.dataset.d; render(); },
+  saveAdjust: function () {
+    var f = S.f.adj, it = X.items[f.sku], qty = n(f.qty);
+    if (!it) return flash("err", "Choose the item.");
+    if (!(qty > 0)) return flash("err", "Enter a quantity above zero.");
+    if (!String(f.note || "").trim()) return flash("err", "Add the details. They're saved with the adjustment for the audit trail.");
+    var place = f.place || "WH", van = place === "WH" ? "" : place;
+    var m = f.dir === "remove" ? mv("adjust", it.sku, qty, place, "LOSS", { van: van, reason: f.reason + ": " + f.note.trim() })
+                               : mv("adjust", it.sku, qty, "LOSS", place, { van: van, reason: f.reason + ": " + f.note.trim() });
+    save([{ op: "append", sheet: "Moves", rows: [m] }], "Adjustment saved: " + (f.dir === "remove" ? "−" : "+") + q(qty, it.sku) + " " + it.name + ".",
+      function () { S.f.adj = { dir: f.dir, place: place, reason: f.reason }; S.f.invTab = "adjust"; });
+  },
+  impMode: function (b) { S.f.imp.mode = b.dataset.m; S.f.imp.preview = null; render(); },
+  previewImport: function () {
+    var f = S.f.imp;
+    if (!String(f.text || "").trim()) return flash("err", "Paste the rows from Excel first.");
+    f.preview = C.parseImport(f.text, X.items); S.msg = null;
+    if (!f.preview.rows.length && !f.preview.errors.length) f.preview.errors.push("No rows found. Check the item code is in the first column and the quantity in the second.");
+    render();
+  },
+  applyImport: function () {
+    var f = S.f.imp, rows = (f.preview || {}).rows || [];
+    if (!rows.length || f.preview.errors.length) return flash("err", "Preview again and fix any problems first.");
+    var t = now(), itemOps = [], itemsAfter = Object.assign({}, X.items), moves = [];
+    rows.forEach(function (r) {
+      if (r.isNew) {
+        var ni = { sku: r.sku, name: r.name, uom: r.uom || "ea", track: "qty", cost: r.cost != null ? r.cost : 0, reorder: 0, allowancePct: (r.uom || "ea") === "m" ? 10 : "" };
+        itemOps.push(ni); itemsAfter[r.sku] = ni;
+      }
+    });
+    if (f.mode === "set") {
+      rows.forEach(function (r) {
+        if (!r.isNew && r.cost != null && r.cost !== n(X.items[r.sku].cost)) { itemOps.push({ sku: r.sku, cost: r.cost }); itemsAfter[r.sku] = Object.assign({}, itemsAfter[r.sku], { cost: r.cost }); }
+      });
+      var counts = {}; rows.forEach(function (r) { counts[r.sku] = r.qty; });
+      moves = C.linesToMoves("WH", C.countLines("WH", counts, X.B, itemsAfter), itemsAfter, t, "Imported stock take", "IMPORT-" + t.slice(0, 10));
+    } else {
+      rows.forEach(function (r) {
+        if (!(r.qty > 0)) return;
+        var c = r.cost != null ? r.cost : n(itemsAfter[r.sku].cost);
+        var m = { ts: t, type: "receive", sku: r.sku, qty: r.qty, from: "SUPPLIER", to: "WH", unitCost: c, value: C.round2(r.qty * c), ref: f.ref || "Import " + t.slice(0, 10) };
+        moves.push(m);
+        if (!r.isNew) itemOps.push({ sku: r.sku, cost: C.newAverageCost(C.onHand(X.B, r.sku), n(X.items[r.sku].cost), r.qty, c) });
+      });
+    }
+    moves.forEach(function (m) { m.id = uid(); m.by = cfg.user.username; });
+    var ops = [];
+    if (itemOps.length) ops.push({ op: "upsert", sheet: "Items", rows: itemOps });
+    if (moves.length) ops.push({ op: "append", sheet: "Moves", rows: moves });
+    if (!ops.length) return flash("ok", "Everything already matches. Nothing to change.");
+    var newCount = rows.filter(function (r) { return r.isNew; }).length;
+    save(ops, "Imported " + rows.length + " line(s)" + (newCount ? ", " + newCount + " new item(s)" : "") + ", " + moves.length + " movement(s).",
+      function () { S.f.imp = { mode: f.mode, text: "" }; S.f.invTab = "io"; });
+  },
+  exportStock: function () {
+    var vanIds = X.vans.map(function (v) { return v.id; });
+    function cell(v) { v = String(v == null ? "" : v); return /[",;\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+    var out = [["Item code", "Store qty", "Landed cost", "Name", "Unit", "In vans", "On jobs", "Value"].join(",")];
+    D.Items.slice().sort(function (a, b) { return a.sku.localeCompare(b.sku); }).forEach(function (it) {
+      var wh = bal("WH", it.sku), vv = 0, jb = 0;
+      vanIds.forEach(function (v) { vv += bal(v, it.sku); });
+      Object.keys(X.B).forEach(function (l) { if (l.indexOf("JOB:") === 0) jb += bal(l, it.sku); });
+      out.push([it.sku, C.round2(wh), n(it.cost).toFixed(2), it.name, it.uom === "m" ? "m" : "ea", C.round2(vv), C.round2(jb), (C.round2(wh + vv + jb) * n(it.cost)).toFixed(2)].map(cell).join(","));
+    });
+    var blob = new Blob(["\ufeff" + out.join("\r\n")], { type: "text/csv;charset=utf-8" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "stock-" + now().slice(0, 10) + ".csv";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+    flash("ok", "Stock list downloaded.");
+  },
+
   /* ---- logins (admin) ---- */
   newUser: function () { S.f.us = null; S.f.tempPin = null; S.msg = null; render(); },
   editUser: function (b) {
@@ -1234,9 +1484,9 @@ var A = {
   },
   saveUser: function () {
     var f = S.f.us;
-    if (f.isNew || (f.role === "admin" && f.origRole !== "admin")) { var pp = pinProblem(f.pin, f.role); if (pp) return flash("err", pp); }
+    if (f.isNew || (isMgrRole(f.role) && !isMgrRole(f.origRole))) { var pp = pinProblem(f.pin, f.role); if (pp) return flash("err", pp); }
     S.busy = true; S.msg = null; render();
-    var promoted = !f.isNew && f.role === "admin" && f.origRole !== "admin";
+    var promoted = !f.isNew && isMgrRole(f.role) && !isMgrRole(f.origRole);
     api.call("users", { cmd: "save", isNew: !!f.isNew, user: { username: f.username, name: f.name, role: f.role, active: f.active }, pin: (f.isNew || promoted) ? String(f.pin) : undefined })
       .then(function (res) {
         S.users = res.users;
@@ -1247,7 +1497,7 @@ var A = {
       .then(function () { S.busy = false; render(); window.scrollTo(0, 0); });
   },
   resetUserPin: function () {
-    var f = S.f.us, pin = suggestPin(f.role === "admin" ? 6 : 4);
+    var f = S.f.us, pin = suggestPin(isMgrRole(f.role) ? 6 : 4);
     S.busy = true; S.msg = null; render();
     api.call("users", { cmd: "resetPin", username: f.username, pin: pin }).then(function (res) {
       S.users = res.users; S.f.tempPin = { name: f.name, pin: pin }; S.f.us = null;
@@ -1364,6 +1614,8 @@ document.addEventListener("input", function (e) {
   var t = e.target;
   if (!t.dataset || !t.dataset.bind) return;
   bindValue(t.dataset.bind, t.value);
+  if (t.id === "us_role" && S.f.us && pinProblem(S.f.us.pin, t.value)) S.f.us.pin = suggestPin(isMgrRole(t.value) ? 6 : 4);
+  if (t.id === "cnt_flt") { render(); return; }
   if (t.tagName === "SELECT") { if (t.dataset.reset) S.f[t.dataset.reset] = {}; render(); return; }
   if (t.dataset.live) { if (S.tab === "counts") patchCounts(); else patchReturn(); }
 });
@@ -1376,7 +1628,7 @@ document.addEventListener("visibilitychange", function () { if (document.visibil
 
 /* ===================== demo data ===================== */
 function seedDemo() {
-  var d = { Items: [], Jobs: [], Lines: [], Moves: [], Labels: [], Vans: [], VanKit: [] };
+  var d = { Items: [], Jobs: [], Lines: [], Moves: [], Labels: [], Vans: [], VanKit: [], Counts: [] };
   function ago(days, h) { var t = new Date(Date.now() - days * 864e5); t.setHours(h || 8, 0, 0, 0); return t.toISOString(); }
   var items = [
     ["PV6-RED", "PV cable 6 mm² red", "m", "qty", 18.5, 200, 10], ["PV6-BLK", "PV cable 6 mm² black", "m", "qty", 18.5, 200, 10],
@@ -1393,7 +1645,7 @@ function seedDemo() {
    ["TIES-100", "Shelf bin A2"], ["LUG-16", "Shelf bin A3"], ["FUSE-DC", "Shelf bin A4"]].forEach(function (x, i) { d.Labels.push({ code: "GS-000" + (i + 1), sku: x[0], note: x[1] }); });
   var k = 0;
   function M(ts, type, sku, qty, from, to, extra) {
-    var m = Object.assign({ id: "demo" + (++k), ts: ts, type: type, sku: sku, qty: qty, from: from, to: to, by: "Storeman", value: C.round2(qty * I[sku].cost) }, extra || {});
+    var m = Object.assign({ id: "demo" + (++k), ts: ts, type: type, sku: sku, qty: qty, from: from, to: to, by: "sipho", value: C.round2(qty * I[sku].cost) }, extra || {});
     d.Moves.push(m); return m;
   }
   var ref = { ref: "Container MSKU 48120 (example)" };
@@ -1426,7 +1678,7 @@ function seedDemo() {
     Object.keys(scrap).forEach(function (s) { M(ts, "scrap", s, scrap[s], "JOB:" + j.no, "SCRAP", base); });
     var sum = C.jobSummary(j.no, d.Lines, d.Moves, I);
     var res = C.closeJob(j, sum, used, ts);
-    res.moves.forEach(function (m) { m.id = "demo" + (++k); m.by = "Storeman"; d.Moves.push(m); });
+    res.moves.forEach(function (m) { m.id = "demo" + (++k); m.by = "sipho"; d.Moves.push(m); });
     j.status = "closed"; j.closedAt = ts; j.missingValue = res.missingValue; j.reason = reason || "";
   }
 
@@ -1449,10 +1701,15 @@ function seedDemo() {
   job("J-1005", "Daniels, Parow", "3 kW grid-tie", "VAN-1", "Sipho", "Q-2219", [["PV6-RED", 25], ["PV6-BLK", 25], ["PNL-550", 2], ["INV-5KW", 1]], ago(0));
 
   var B = C.balances(d.Moves);
-  C.countMoves("VAN-1", { "MC4": 6, "TIES-100": 2, "LUG-16": 12, "FUSE-DC": 4 }, B, I, ago(9, 16), "Van count").forEach(function (m) { m.id = "demo" + (++k); m.by = "Storeman"; d.Moves.push(m); });
-  C.countMoves("VAN-2", { "MC4": 8, "TIES-100": 2, "LUG-16": 16, "FUSE-DC": 6 }, B, I, ago(9, 16), "Van count").forEach(function (m) { m.id = "demo" + (++k); m.by = "Storeman"; d.Moves.push(m); });
+  C.countMoves("VAN-1", { "MC4": 6, "TIES-100": 2, "LUG-16": 12, "FUSE-DC": 4 }, B, I, ago(9, 16), "Van count").forEach(function (m) { m.id = "demo" + (++k); m.by = "sipho"; d.Moves.push(m); });
+  C.countMoves("VAN-2", { "MC4": 8, "TIES-100": 2, "LUG-16": 16, "FUSE-DC": 6 }, B, I, ago(9, 16), "Van count").forEach(function (m) { m.id = "demo" + (++k); m.by = "sipho"; d.Moves.push(m); });
   B = C.balances(d.Moves);
-  C.countMoves("WH", { "LUG-16": C.bal(B, "WH", "LUG-16") - 5 }, B, I, ago(7, 16), "Shelf count").forEach(function (m) { m.id = "demo" + (++k); m.by = "Storeman"; d.Moves.push(m); });
+  C.countMoves("WH", { "LUG-16": C.bal(B, "WH", "LUG-16") - 5 }, B, I, ago(7, 16), "Shelf count").forEach(function (m) { m.id = "demo" + (++k); m.by = "lebo"; d.Moves.push(m); });
+  // a shelf count by the User, waiting for a manager to approve
+  B = C.balances(d.Moves);
+  var cl = C.countLines("WH", { "PV6-RED": C.bal(B, "WH", "PV6-RED") - 6, "PV6-BLK": C.bal(B, "WH", "PV6-BLK"), "MC4": C.bal(B, "WH", "MC4") - 2, "RAIL-42": C.bal(B, "WH", "RAIL-42") }, B, I);
+  d.Counts.push({ id: "CNT-demo1", place: "WH", ts: ago(0, 9), by: "sipho", status: "pending", lines: JSON.stringify(cl),
+    value: C.round2(cl.reduce(function (s2, l) { return s2 + l.value; }, 0)), note: "Drum 1 measured by hand, label torn" });
   return d;
 }
 

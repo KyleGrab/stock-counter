@@ -87,13 +87,16 @@ The app is now empty and ready for real stock.
 
 ## Part C2: Create logins for the team (5 min)
 
-**Admin → Logins → Add a login** for each person:
+**Admin → Logins → Add a login** for each person, and choose what they can do:
 
-| Role | Give it to | They can |
+| Access | Give it to | They can |
 |---|---|---|
-| **Storeman** | Whoever runs the store | Jobs, kitting, scanning, receiving, returns, counts, stickers |
-| **Admin** | You / the owner | Everything, plus logins, items, costs, vans, corrections, reports |
+| **User** | Whoever works in the store | Jobs, kitting, scanning, receiving, returns, van counts, stickers. Shelf counts go to a manager for approval |
+| **Warehouse Manager** | The person responsible for stock | Everything a User does, plus **Inventory** (approve counts, stock take, adjust, import/export), items and costs, van kits, corrections, reports |
+| **Senior Admin** | You / the owner | Everything, including logins and the Google Sheet connection |
 | **Viewer** | Owner, accountant | Look at jobs, stock and reports. Can't change anything |
+
+Warehouse Managers and Senior Admins need a 6-digit PIN; Users and Viewers 4 or more.
 
 The app shows a **temporary PIN** once. Give it to the person face to face. They choose their own PIN the first time they sign in.
 
@@ -106,10 +109,11 @@ The app shows a **temporary PIN** once. Give it to the person face to face. They
 
 ## Part D: First day setup
 
-1. **Items** (Admin → Items): add each product. Cable = *Metres*. Panels, inverters, batteries = *Serial number*.
+1. **Items** (Admin → Items, or import them in step 4): add each product. Cable = *Metres*. Panels, inverters, batteries = *Serial number*.
 2. **Vans** (Admin → Vans and van kit): add each van, then set the **van kit** (small parts only: connectors, lugs, fuses, ties).
 3. **Stickers** (Admin → Stickers): one sticker per **drum, roll, box or shelf bin**. Tap **Print sticker sheet**. Use A4 sticker paper, or plain paper and clear tape.
-4. **Opening stock:** walk the store. For each sticker: **Scan → Receive**, enter the quantity on hand and the landed cost. For panels and inverters, scan each serial.
+4. **Opening stock, the fast way:** put your current stock in Excel with columns *Item code, Quantity, Landed cost, Name, Unit*. Then **Inventory → Import / export → Add as received**, paste, **Preview**, **Apply**. New items are created automatically.
+   For panels and inverters you want tracked by serial, receive them with **Scan → Receive** instead, so each serial is captured.
 
 ---
 
@@ -126,9 +130,10 @@ Quote accepted → New job → Kit the crate → Van collects → Crate back →
 | Van collects | **Scan** the crate label → **Van collected it**. |
 | Short on site | **Scan** the drum sticker → **Extra to job**, with a reason. |
 | Crate comes back | **Scan** the crate label. For every line: what's **back in store**, **scrap**, and **used**. Anything left over is **missing** and needs a reason. **Close job**. |
-| Every week | **Counts →** each van kit, and the cable drums on the shelves. |
-| Every month | **Admin → Missing stock report**: who and which van have missing stock, and which job types used more than quoted. |
-| Mistake recorded | Admin opens **Stock → tap the item → Reverse this**, with a reason. Shows in **Admin → Corrections log**. |
+| Every week | **Counts →** each van kit, and the cable drums on the shelves. A User's shelf count goes to **Inventory → Approve** for a Warehouse Manager. Nobody can approve their own count. |
+| Stock changes outside a job | Warehouse Manager: **Inventory → Adjust** (damaged, found, short delivery) with a reason, or **Import / export** for a full stock take from Excel. |
+| Every month | **Admin/Manage → Missing stock report**: who and which van have missing stock, and which job types used more than quoted. |
+| Mistake recorded | A manager opens **Stock → tap the item → Reverse this**, with a reason. Shows in **Corrections log**. |
 
 **Shortcut:** stickers hold a web link. Pointing the normal phone camera at any sticker opens the app on that item or job.
 

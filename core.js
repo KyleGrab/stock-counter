@@ -145,7 +145,7 @@
       if (new Date(m.ts).getTime() < since) return;
       var v = num(m.value) * (isGain ? -1 : 1);
       res.total += v;
-      var who = m.installer || (m.from === "WH" || m.to === "WH" ? "Warehouse count" : "Van count");
+      var who = m.installer || (m.from === "WH" || m.to === "WH" ? "Store counts & write-offs" : "Van count");
       var van = m.van || (m.from === "WH" || m.to === "WH" ? "Warehouse" : "");
       res.byInstaller[who] = round2((res.byInstaller[who] || 0) + v);
       if (van) res.byVan[van] = round2((res.byVan[van] || 0) + v);
@@ -166,26 +166,62 @@
     });
   }
 
-  /** Count result -> adjustment moves. place = "WH" or a van id. */
-  function countMoves(place, counts, B, items, ts, kind) {
-    var out = [];
-    Object.keys(counts).forEach(function (sku) {
-      var raw = counts[sku];
-      if (raw === "" || raw == null) return;
-      var diff = round2(num(raw) - bal(B, place, sku));
+  /** One line per counted item: what the system says, what was counted, the difference and its value. */
+  function countLines(place, counts, B, items) {
+    return Object.keys(counts).filter(function (sku) { var raw = counts[sku]; return raw !== "" && raw != null; }).sort().map(function (sku) {
+      var system = round2(bal(B, place, sku)), counted = round2(num(counts[sku])), diff = round2(counted - system);
+      return { sku: sku, system: system, counted: counted, diff: diff, value: round2(diff * num(items[sku] && items[sku].cost)) };
+    });
+  }
+
+  /** Count lines -> adjustment moves. place = "WH" or a van id. Van shortfalls are parts used on jobs. */
+  function linesToMoves(place, lines, items, ts, reason, ref) {
+    var out = [], isVan = place !== "WH";
+    lines.forEach(function (l) {
+      var diff = round2(l.diff);
       if (Math.abs(diff) <= EPS) return;
-      var cost = num(items[sku] && items[sku].cost);
-      var isVan = place !== "WH";
+      var cost = num(items[l.sku] && items[l.sku].cost);
       if (diff < 0) {
-        // Van kit shortfall = parts used on jobs. Warehouse shortfall = loss.
-        out.push({ ts: ts, type: isVan ? "kituse" : "countshort", sku: sku, qty: -diff, from: place, to: isVan ? "USED" : "LOSS",
-          van: isVan ? place : "", value: round2(-diff * cost), reason: kind || "" });
+        out.push({ ts: ts, type: isVan ? "kituse" : "countshort", sku: l.sku, qty: -diff, from: place, to: isVan ? "USED" : "LOSS",
+          van: isVan ? place : "", value: round2(-diff * cost), reason: reason || "", ref: ref || "" });
       } else {
-        out.push({ ts: ts, type: "countover", sku: sku, qty: diff, from: "LOSS", to: place,
-          van: isVan ? place : "", value: round2(diff * cost), reason: kind || "" });
+        out.push({ ts: ts, type: "countover", sku: l.sku, qty: diff, from: "LOSS", to: place,
+          van: isVan ? place : "", value: round2(diff * cost), reason: reason || "", ref: ref || "" });
       }
     });
     return out;
+  }
+
+  /** Count result -> adjustment moves (kept for simple callers). */
+  function countMoves(place, counts, B, items, ts, kind) {
+    return linesToMoves(place, countLines(place, counts, B, items), items, ts, kind);
+  }
+
+  /**
+   * Rows pasted from Excel or a CSV: code, quantity, [landed cost], [name], [unit m/ea].
+   * Tabs, commas or semicolons. A header row is skipped. Spaces and "R" in money are ignored.
+   */
+  function parseImport(text, items) {
+    var rows = [], errors = [], seen = {};
+    String(text || "").split(/\r?\n/).forEach(function (line, i) {
+      if (!line.trim()) return;
+      var cells = line.split(line.indexOf("\t") >= 0 ? "\t" : /[;,](?=(?:[^"]*"[^"]*")*[^"]*$)/).map(function (c) { return c.trim().replace(/^"|"$/g, "").trim(); });
+      var sku = String(cells[0] || "").toUpperCase();
+      var money = function (v) { return String(v || "").replace(/[R\s]/gi, "").replace(/,(\d{1,2})$/, ".$1").replace(/,/g, ""); };
+      var qtyRaw = money(cells[1]);
+      if (i === 0 && (isNaN(Number(qtyRaw)) || qtyRaw === "")) return; // header
+      if (!sku) return;
+      if (!/^[A-Z0-9][A-Z0-9_.\-]{0,40}$/.test(sku)) { errors.push("Line " + (i + 1) + ": item code '" + cells[0] + "' has spaces or odd characters."); return; }
+      if (qtyRaw === "" || isNaN(Number(qtyRaw)) || Number(qtyRaw) < 0) { errors.push("Line " + (i + 1) + ": quantity for " + sku + " isn't a number."); return; }
+      if (seen[sku]) { errors.push("Line " + (i + 1) + ": " + sku + " is listed twice."); return; }
+      seen[sku] = 1;
+      var costRaw = money(cells[2]);
+      var row = { sku: sku, qty: round2(Number(qtyRaw)), cost: costRaw === "" || isNaN(Number(costRaw)) ? null : round2(Number(costRaw)),
+        name: cells[3] || "", uom: /^m(etres?|eters?)?$/i.test(cells[4] || "") ? "m" : cells[4] ? "ea" : "", line: i + 1, isNew: !(items && items[sku]) };
+      if (row.isNew && !row.name) { errors.push("Line " + (i + 1) + ": " + sku + " is a new item. Add its name in the 4th column."); return; }
+      rows.push(row);
+    });
+    return { rows: rows, errors: errors };
   }
 
   /**
@@ -241,7 +277,7 @@
   var Core = {
     balances: balances, bal: bal, kitDefault: kitDefault, jobSummary: jobSummary, closeJob: closeJob,
     newAverageCost: newAverageCost, onHand: onHand, losses: losses, overQuote: overQuote,
-    countMoves: countMoves, parseScan: parseScan, nextNumber: nextNumber, round2: round2,
+    countMoves: countMoves, countLines: countLines, linesToMoves: linesToMoves, parseImport: parseImport, parseScan: parseScan, nextNumber: nextNumber, round2: round2,
     isRealPlace: isRealPlace, checkBalances: checkBalances
   };
   if (typeof module !== "undefined" && module.exports) module.exports = Core;

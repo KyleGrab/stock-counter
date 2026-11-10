@@ -172,7 +172,70 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: /Missing stock report/ }).click();
   await page.waitForSelector("text=Where it sits");
   await page.screenshot({ path: out + "/8-viewer-report.png", fullPage: true });
+  // --- inventory: User submits a count, Warehouse Manager approves ---
+  await signInAs("sipho", "1357");
+  await page.locator("nav button[data-tab=counts]").click();
+  await page.fill("#cnt_flt", "black");
+  assert.ok(!(await text()).includes("MC4 connector"), "search filters the list");
+  await page.locator("#cnt_PV6-BLK").fill("300"); await page.locator("#cnt_PV6-BLK").blur();
+  await page.waitForSelector("text=short");
+  await page.fill("#cnt_note", "Recounted twice");
+  await page.getByRole("button", { name: "Submit count for approval" }).click();
+  await page.waitForSelector("text=Count submitted");
+  await signInAs("lebo", "580214");
+  assert.strictEqual((await page.locator("nav button[data-tab=more]").innerText()).trim(), "Manage");
+  await page.locator("nav button[data-tab=more]").click();
+  assert.strictEqual(await page.getByRole("button", { name: /Logins/ }).count(), 0, "managers don't manage logins");
+  await page.getByRole("button", { name: /Inventory/ }).click();
+  await page.waitForSelector("text=Counted by");
+  await page.screenshot({ path: out + "/9-approve.png", fullPage: true });
+  const blackBefore = await page.evaluate(() => C.bal(X.B, "WH", "PV6-BLK"));
+  await page.getByRole("button", { name: "Approve" }).first().click();
+  await page.waitForSelector("text=Count approved");
+  await page.getByRole("button", { name: "Approve" }).first().click();
+  await page.waitForSelector("text=Count approved");
+  assert.strictEqual(await page.evaluate(() => C.bal(X.B, "WH", "PV6-BLK")), 300, "approved count sets store stock");
+  assert.notStrictEqual(blackBefore, 300);
+  // manager's own count can't be self-approved (submit as manager goes direct, so test via a User count rejected)
+  // adjust: write off 6 m damaged
+  await page.getByRole("tab", { name: "Adjust" }).click();
+  await page.selectOption("#adj_sku", "PV6-RED"); await page.fill("#adj_qty", "6");
+  await page.getByRole("button", { name: "Save adjustment" }).click();
+  await page.waitForSelector("text=Add the details");
+  await page.fill("#adj_note", "Crushed by forklift");
+  await page.getByRole("button", { name: "Save adjustment" }).click();
+  await page.waitForSelector("text=Adjustment saved");
+  // import: set counts from Excel paste incl. a new item
+  await page.getByRole("tab", { name: "Import / export" }).click();
+  const dl = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Download stock list (CSV)" }).click();
+  const file = await dl;
+  const csv = fs.readFileSync(await file.path(), "utf8");
+  assert.ok(csv.includes("Item code,Store qty,Landed cost") && csv.includes("PV6-RED"));
+  await page.fill("#imp_text", "Code\tQty\tCost\tName\tUnit\nMC4\t50\t30\nBRK-32A\t12\t95\tBreaker 32 A\tea\nbad code\t1");
+  await page.getByRole("button", { name: "Preview" }).click();
+  await page.waitForSelector("text=odd characters");
+  assert.strictEqual(await page.getByRole("button", { name: /^Apply/ }).count(), 0, "nothing applies while a line is wrong");
+  await page.fill("#imp_text", "Code\tQty\tCost\tName\tUnit\nMC4\t50\t30\nBRK-32A\t12\t95\tBreaker 32 A\tea");
+  await page.getByRole("button", { name: "Preview" }).click();
+  await page.waitForSelector("text=New item");
+  await page.screenshot({ path: out + "/10-import.png", fullPage: true });
+  await page.getByRole("button", { name: "Apply 2 line(s)" }).click();
+  await page.waitForSelector("text=Imported 2 line(s), 1 new item(s)");
+  assert.deepStrictEqual(await page.evaluate(() => [C.bal(X.B, "WH", "MC4"), C.bal(X.B, "WH", "BRK-32A"), X.items["MC4"].cost, X.items["BRK-32A"].cost]), [50, 12, 30, 95]);
+  // receive mode: opening stock adds on top
+  await page.getByRole("radio", { name: /Add as received/ }).click();
+  await page.fill("#imp_text", "BRK-32A,8,105");
+  await page.getByRole("button", { name: "Preview" }).click();
+  await page.getByRole("button", { name: "Apply 1 line(s)" }).click();
+  await page.waitForSelector("text=Imported 1 line(s)");
+  assert.deepStrictEqual(await page.evaluate(() => [C.bal(X.B, "WH", "BRK-32A"), X.items["BRK-32A"].cost]), [20, 99], "12 at R95 + 8 at R105 = R99 average");
+  // the User can't use inventory, and the admin sees the role choices
   await signInAs("admin", "246810");
+  await page.locator("nav button[data-tab=more]").click();
+  await page.getByRole("button", { name: /Logins/ }).click();
+  const opts = await page.locator("#us_role option").allInnerTexts();
+  assert.deepStrictEqual(opts, ["User", "Warehouse Manager", "Senior Admin", "Viewer"]);
 
   // dark mode renders
   await page.emulateMedia({ colorScheme: "dark" });

@@ -48,7 +48,7 @@ function signIn(u, pin, newPin) {
 }
 const TS = signIn("sipho", "5832", "7140");
 const TV = signIn("owner", "7391", "2864");
-assert.ok(/Only an admin/.test(post({ action: "users", token: TS, cmd: "save", isNew: true, user: { username: "x", name: "x", role: "admin" }, pin: "123123" }).error));
+assert.ok(/Only a Senior Admin/.test(post({ action: "users", token: TS, cmd: "save", isNew: true, user: { username: "x", name: "x", role: "admin" }, pin: "123123" }).error));
 assert.strictEqual(post({ action: "sync", token: TS }).data.Users, undefined, "storeman doesn't see users");
 
 // --- data rules (as admin unless noted) ---
@@ -123,7 +123,7 @@ r = post({ token: TS, ops: [{ op: "append", sheet: "Moves", rows: [m("s1", { by:
 assert.ok(r.ok, r.error);
 assert.strictEqual(sheets.Moves.rows.find(x => x[0] === "s1")[15], "sipho", "who did it comes from the sign-in, not the phone");
 assert.ok(/corrections/.test(post({ token: TS, ops: [{ op: "append", sheet: "Moves", rows: [m("s2", { type: "reverse", from: "VAN-1", to: "WH" })] }] }).error));
-assert.ok(/Only an admin can change items/.test(post({ token: TS, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", name: "renamed" }] }] }).error));
+assert.ok(/can change items/.test(post({ token: TS, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", name: "renamed" }] }] }).error));
 assert.ok(post({ token: TS, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", cost: 20 }] }] }).ok, "receiving can update average cost");
 assert.ok(/van kit/.test(post({ token: TS, ops: [{ op: "upsert", sheet: "VanKit", rows: [{ sku: "PV", target: 1 }] }] }).error));
 assert.ok(/vans/.test(post({ token: TS, ops: [{ op: "create", sheet: "Vans", ref: "$V", row: { name: "x" } }] }).error));
@@ -148,3 +148,37 @@ assert.ok(post({ action: "sync", token: T2 }).signIn);
 assert.ok(post({ action: "sync", token: T }).ok, "other admin device still signed in");
 
 console.log("backend roles: all tests passed");
+
+// --- v1.3 inventory rules ---
+{
+  const TS2 = signIn("sipho", "6047", "7140");
+  const adj = (id, type, from, to) => ({ id, ts: "2026-11-10T12:00:00.000Z", type, sku: "PV", qty: 1, from, to });
+  assert.ok(/Submit the count/.test(post({ token: TS2, ops: [{ op: "append", sheet: "Moves", rows: [adj("a1", "countshort", "WH", "LOSS")] }] }).error), "storeman can't write off store stock");
+  assert.ok(/Submit the count/.test(post({ token: TS2, ops: [{ op: "append", sheet: "Moves", rows: [adj("a2", "adjust", "LOSS", "WH")] }] }).error));
+  assert.ok(post({ token: TS2, ops: [{ op: "append", sheet: "Moves", rows: [adj("a3", "kituse", "VAN-1", "USED")] }] }).ok, "van kit counts still allowed");
+  // storeman submits a count; it's stamped with their name
+  r = post({ token: TS2, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "c1", place: "WH", status: "pending", by: "admin", lines: "[]", value: -10 }] }] });
+  assert.ok(r.ok, r.error);
+  assert.strictEqual(r.data.Counts[0].by, "sipho");
+  assert.ok(/can approve or reject/.test(post({ token: TS2, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "c1", status: "approved" }] }] }).error));
+  assert.ok(/can approve or reject/.test(post({ token: TS2, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "c2", status: "approved" }] }] }).error), "can't submit pre-approved");
+  // admin approves once; a second approval is refused
+  const approve = { op: "upsert", sheet: "Counts", rows: [{ id: "c1", status: "approved", decidedAt: "x" }], expect: { field: "status", values: ["pending"] } };
+  r = post({ token: T, ops: [{ op: "append", sheet: "Moves", rows: [adj("a4", "countshort", "WH", "LOSS")] }, approve] });
+  assert.ok(r.ok, r.error);
+  assert.strictEqual(r.data.Counts[0].decidedBy, "admin");
+  assert.ok(/already moved on|changed on another device/.test(post({ token: T, ops: [approve] }).error), "can't approve twice");
+  // Warehouse Manager: inventory powers, no login management, can't approve own count
+  assert.ok(/6 to 8/.test(post({ action: "users", token: T, cmd: "save", isNew: true, user: { username: "mgr", name: "Mgr", role: "manager" }, pin: "5832" }).error), "managers need 6 digits");
+  assert.ok(post({ action: "users", token: T, cmd: "save", isNew: true, user: { username: "mgr", name: "Mgr", role: "manager" }, pin: "583217" }).ok);
+  const TM = signIn("mgr", "583217", "640291");
+  assert.ok(post({ token: TM, ops: [{ op: "append", sheet: "Moves", rows: [adj("m1", "adjust", "WH", "LOSS")] }] }).ok, "manager adjusts stock");
+  assert.ok(post({ token: TM, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", name: "PV red 6mm" }] }] }).ok, "manager edits items");
+  assert.ok(/Only a Senior Admin/.test(post({ action: "users", token: TM, cmd: "save", isNew: true, user: { username: "x2", name: "x", role: "storeman" }, pin: "5832" }).error));
+  assert.strictEqual(post({ token: TM }).data.Users, undefined, "manager doesn't see logins");
+  post({ token: TM, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "c9", place: "WH", status: "pending", lines: "[]" }] }] });
+  assert.ok(/own count/.test(post({ token: TM, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "c9", status: "approved" }], expect: { field: "status", values: ["pending"] } }] }).error));
+  post({ token: TS2, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "c10", place: "WH", status: "pending", lines: "[]" }] }] });
+  assert.ok(post({ token: TM, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "c10", status: "approved" }], expect: { field: "status", values: ["pending"] } }] }).ok, "manager approves a User's count");
+  console.log("backend inventory: all tests passed");
+}

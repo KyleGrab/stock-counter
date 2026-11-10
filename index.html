@@ -116,6 +116,14 @@ details summary{cursor:pointer;font-weight:600}
 body.nonav{padding-bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 .kpibtn{text-align:left;font:inherit;color:inherit;cursor:pointer}
 .kpibtn:hover{border-color:var(--accent)}
+.segs{display:flex;gap:4px;overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:4px}
+.seg{flex:1 0 auto;background:transparent;border:0;border-radius:7px;padding:9px 10px;font-weight:600;font-size:14px;color:var(--muted);white-space:nowrap;min-height:42px}
+.seg.on{background:var(--accent-soft);color:var(--accent)}
+.badge{display:inline-block;min-width:18px;padding:0 5px;border-radius:9px;background:var(--bad);color:#fff;font-size:11px;line-height:18px;text-align:center}
+.roles{display:grid;gap:6px;background:var(--bg);border-radius:9px;padding:10px}
+.roles b{display:block;font-size:13px}
+textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px 12px;width:100%;min-width:0;resize:vertical}
+textarea.mono{font-family:var(--f-mono);font-size:13px}
 .hint{border-left:3px solid var(--accent);padding:4px 0 4px 10px;font-size:14px}
 @media print{body{padding:0;background:#fff}nav,header,.noprint{display:none!important}}
 </style>

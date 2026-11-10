@@ -96,3 +96,17 @@ const rs = C.jobSummary("J-1001", lines, rev, items).find(r => r.sku === "PV6-RE
 assert.deepStrictEqual([rs.issued, rs.extra, rs.returned, rs.outstanding], [33, 0, 0, 32.5]);
 assert.strictEqual(C.bal(C.balances(rev), "JOB:J-1001", "PV6-RED"), 32.5, "summary and ledger agree");
 console.log("core v1.1: all tests passed");
+
+// --- v1.3 inventory ---
+const lines2 = C.countLines("WH", { "PV6-RED": 460, "PNL-550": "" }, B, items);
+assert.deepStrictEqual(lines2, [{ sku: "PV6-RED", system: 468, counted: 460, diff: -8, value: -148 }]);
+const lm = C.linesToMoves("WH", lines2, items, "t", "Shelf count", "CNT-1");
+assert.strictEqual(lm[0].type, "countshort"); assert.strictEqual(lm[0].ref, "CNT-1"); assert.strictEqual(lm[0].qty, 8);
+// import: Excel paste with header, tabs, rand amounts, new item
+let im = C.parseImport("Code\tQty\tCost\tName\tUnit\npv6-red\t450\tR 18,90\nNEW-1\t12\t1 250.50\tBreaker 32A\tea\nCAB-10\t100\t\tCable 10mm\tmetres", items);
+assert.deepStrictEqual(im.errors, []);
+assert.deepStrictEqual(im.rows.map(r => [r.sku, r.qty, r.cost, r.isNew, r.uom]), [["PV6-RED", 450, 18.9, false, ""], ["NEW-1", 12, 1250.5, true, "ea"], ["CAB-10", 100, null, true, "m"]]);
+im = C.parseImport("SKU,QTY\nPV6-RED,abc\nGHOST,5\nPV6-RED,1\nbad code,1", items);
+assert.strictEqual(im.errors.length, 3);
+assert.ok(/new item/.test(im.errors[0] + im.errors[1]));
+console.log("core v1.3: all tests passed");
