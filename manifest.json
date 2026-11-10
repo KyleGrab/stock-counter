@@ -1,0 +1,16 @@
+{
+  "name": "Stock Counter",
+  "short_name": "Stock",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#EEF1F4",
+  "theme_color": "#16202A",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#16202A">
+<title>Stock Counter</title>
+<link rel="manifest" href="manifest.json">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<style>
+/* Copper = cable. Cool steel neutrals. One column, bottom tabs, big touch targets for a storeroom. */
+:root{
+  --bg:#EEF1F4; --panel:#FFFFFF; --ink:#16202A; --muted:#5B6773; --line:#D5DBE2;
+  --accent:#A24E1C; --accent-ink:#FFFFFF; --accent-soft:#F6E6DA;
+  --good:#1E7A4C; --good-soft:#E1F2E8; --warn:#8A5A00; --warn-soft:#FBEFD5; --bad:#B42318; --bad-soft:#FDE6E3; --info-soft:#E3ECF7; --info:#1F4E8C;
+  --f-display:"Barlow Condensed","Arial Narrow",system-ui,sans-serif;
+  --f-body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+  --r:10px;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){:root{
+  --bg:#0F151B; --panel:#18212A; --ink:#E6EBF0; --muted:#97A3AF; --line:#2A3540;
+  --accent:#E08A52; --accent-ink:#1A0E06; --accent-soft:#3A2416;
+  --good:#5FC795; --good-soft:#163024; --warn:#E3B24F; --warn-soft:#352A12; --bad:#F2877C; --bad-soft:#3A1A17; --info-soft:#17263A; --info:#8DB8F0;
+  color-scheme:dark}}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+html,body{margin:0;min-height:100%}
+body{background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:16px;line-height:1.45;
+  padding:env(safe-area-inset-top,0px) max(14px,env(safe-area-inset-right,0px)) calc(86px + env(safe-area-inset-bottom,0px)) max(14px,env(safe-area-inset-left,0px))}
+.wrap{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:14px;padding-top:12px}
+header.top{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.brand{font-family:var(--f-display);font-size:26px;font-weight:700;letter-spacing:.02em;text-transform:uppercase;line-height:1}
+.status{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--warn)} .dot.ok{background:var(--good)} .dot.err{background:var(--bad)}
+.demo{background:var(--info-soft);color:var(--info);border-radius:var(--r);padding:9px 12px;font-size:13px}
+h2{font-family:var(--f-display);font-weight:700;font-size:24px;text-transform:uppercase;letter-spacing:.03em;margin:0;line-height:1.1;text-wrap:balance}
+h3{font-size:15px;font-weight:600;margin:0}
+p{margin:0}
+.eyebrow{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:14px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.muted{color:var(--muted)} .small{font-size:13px} .tiny{font-size:12px}
+.mono{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+.row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+.spread{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+button{font:inherit;cursor:pointer}
+.btn{background:var(--accent);color:var(--accent-ink);border:0;border-radius:9px;padding:13px 18px;font-weight:600;min-height:48px}
+.btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+.btn.small{padding:8px 12px;font-size:14px;min-height:38px}
+.btn.wide{width:100%}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn:focus-visible,input:focus-visible,select:focus-visible,.card:focus-visible,nav button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+label.f{display:flex;flex-direction:column;gap:5px;font-size:14px;font-weight:500;min-width:0;flex:1 1 150px}
+input,select,textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:11px 12px;width:100%;min-width:0;min-height:46px}
+input.code{font-family:var(--f-mono);text-transform:uppercase}
+input.num{text-align:right;font-family:var(--f-mono)}
+.msg{font-size:14px;border-radius:9px;padding:10px 12px}
+.msg.ok{background:var(--good-soft);color:var(--good)} .msg.err{background:var(--bad-soft);color:var(--bad)} .msg.warn{background:var(--warn-soft);color:var(--warn)} .msg.info{background:var(--info-soft);color:var(--info)}
+.tablewrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600;text-align:left;padding:7px 6px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:middle}
+td.n,th.n{text-align:right;font-family:var(--f-mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td input{min-height:40px;padding:7px 8px}
+.pill{display:inline-block;font-size:12px;font-weight:600;padding:3px 9px;border-radius:999px;white-space:nowrap}
+.p-quoted{background:var(--info-soft);color:var(--info)} .p-kitted{background:var(--warn-soft);color:var(--warn)}
+.p-out{background:var(--accent-soft);color:var(--accent)} .p-closed{background:var(--good-soft);color:var(--good)}
+.p-bad{background:var(--bad-soft);color:var(--bad)}
+.kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+@media (min-width:640px){.kpis{grid-template-columns:repeat(4,minmax(0,1fr))}}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:12px;min-width:0}
+.kpi .v{font-family:var(--f-display);font-size:28px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+.kpi .v.bad{color:var(--bad)}
+.kpi .l{font-size:12px;color:var(--muted)}
+.list{display:flex;flex-direction:column;gap:8px}
+.card{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;padding:13px;border:1px solid var(--line);border-radius:var(--r);background:var(--panel);text-align:left;color:var(--ink);width:100%}
+.card .no{font-family:var(--f-mono);font-weight:500}
+.right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;text-align:right}
+.steps{display:flex;gap:4px}
+.steps span{flex:1;height:5px;border-radius:3px;background:var(--line)}
+.steps span.on{background:var(--accent)}
+#reader{width:100%;border-radius:var(--r);overflow:hidden;background:#000;min-height:0}
+#reader video{width:100%!important;display:block}
+.qrbig{display:flex;flex-direction:column;align-items:center;gap:6px;padding:10px}
+.qrbig img{width:220px;height:220px;image-rendering:pixelated;background:#fff;padding:8px;border-radius:6px}
+.labels{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.lbl{border:1px dashed var(--line);border-radius:8px;padding:10px;display:flex;flex-direction:column;align-items:center;gap:4px;text-align:center;background:var(--panel)}
+.lbl img{width:110px;height:110px;image-rendering:pixelated;background:#fff;padding:4px;border-radius:4px}
+.lbl .id{font-family:var(--f-mono);font-weight:500;font-size:13px}
+.serials{display:flex;flex-wrap:wrap;gap:6px}
+.serials span{font-family:var(--f-mono);font-size:12px;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:3px 7px}
+nav.tabs{position:fixed;left:0;right:0;bottom:0;z-index:20;background:var(--panel);border-top:1px solid var(--line);
+  padding:6px max(8px,env(safe-area-inset-right,0px)) calc(6px + env(safe-area-inset-bottom,0px)) max(8px,env(safe-area-inset-left,0px))}
+nav.tabs .in{display:flex;gap:4px;max-width:760px;margin:0 auto}
+nav.tabs button{flex:1;background:transparent;border:0;color:var(--muted);padding:7px 2px;border-radius:9px;font-size:12px;font-weight:600;display:flex;flex-direction:column;align-items:center;gap:3px;min-height:52px}
+nav.tabs svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+nav.tabs button.on{color:var(--accent);background:var(--accent-soft)}
+nav.tabs button.scan{color:var(--accent-ink);background:var(--accent)}
+details summary{cursor:pointer;font-weight:600}
+.rline{border-top:1px solid var(--line);padding-top:10px;display:flex;flex-direction:column;gap:8px}
+.rline:first-of-type{border-top:0;padding-top:0}
+.rline .ins{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.rline .ins label{font-size:12px;font-weight:600;color:var(--muted);display:flex;flex-direction:column;gap:4px}
+.sumt{font-size:13px}.sumt td,.sumt th{padding:7px 4px}
+.hint{border-left:3px solid var(--accent);padding:4px 0 4px 10px;font-size:14px}
+@media print{body{padding:0;background:#fff}nav,header,.noprint{display:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">Stock Counter</div>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">Starting…</span></div>
+  </header>
+  <div class="demo" id="demoBar" hidden>Demo mode: made-up stock and jobs, saved only on this phone. Connect the Google Sheet in <b>More → Settings</b>.</div>
+  <section class="panel" id="camBox" hidden>
+    <div id="camTitle" class="eyebrow">Point the camera at the sticker</div>
+    <div id="reader"></div>
+    <div class="spread"><span id="camHint" class="small muted"></span><button class="btn ghost small" id="camStop" type="button">Stop camera</button></div>
+  </section>
+  <main id="view" aria-live="polite"></main>
+</div>
+<nav class="tabs" aria-label="Sections"><div class="in">
+  <button data-tab="jobs"><svg viewBox="0 0 24 24"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V3h6v1M9 10h6M9 14h6"/></svg>Jobs</button>
+  <button data-tab="stock"><svg viewBox="0 0 24 24"><path d="M3 8l9-5 9 5v9l-9 5-9-5z"/><path d="M3 8l9 5 9-5M12 13v9"/></svg>Stock</button>
+  <button data-tab="scan" class="scan"><svg viewBox="0 0 24 24"><path d="M3 7V4h3M18 4h3v3M21 17v3h-3M6 20H3v-3M7 12h10"/></svg>Scan</button>
+  <button data-tab="counts"><svg viewBox="0 0 24 24"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9"/></svg>Counts</button>
+  <button data-tab="more"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>More</button>
+</div></nav>
+<script src="core.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
