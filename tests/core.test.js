@@ -21,6 +21,8 @@ const moves = [
 assert.strictEqual(C.kitDefault(items["PV6-RED"], 30), 33);
 assert.strictEqual(C.kitDefault(items["PNL-550"], 12), 12);
 assert.strictEqual(C.kitDefault({ uom: "m" }, 10), 11, "default allowance 10%");
+assert.strictEqual(C.kitDefault({ uom: "m", allowancePct: 10 }, 50), 55, "floating point: 50 m + 10% is 55, not 56");
+assert.strictEqual(C.kitDefault({ uom: "m", allowancePct: 10 }, 51), 57, "56.1 rounds up to 57");
 
 // balances
 const B = C.balances(moves);
@@ -79,3 +81,18 @@ assert.strictEqual(C.nextNumber(["J-1001", "J-1009", "X-5"], "J-", 4), "J-1010")
 assert.strictEqual(C.nextNumber([], "GS-", 4), "GS-0001");
 
 console.log("core: all tests passed");
+
+// --- v1.1 additions ---
+// balance check: can't issue more than the store holds, LOSS/SUPPLIER can go negative
+assert.strictEqual(C.checkBalances(moves, [{ sku: "PV6-RED", qty: 468, from: "WH", to: "JOB:J-2" }], items), null);
+assert.ok(/Not enough PV cable|Not enough PV6-RED/.test(C.checkBalances(moves, [{ sku: "PV6-RED", qty: 469, from: "WH", to: "JOB:J-2" }], items)));
+assert.strictEqual(C.checkBalances([], [{ sku: "X", qty: 5, from: "LOSS", to: "WH" }], {}), null);
+assert.ok(C.checkBalances(moves, [{ sku: "PV6-RED", qty: 40, from: "JOB:J-1001", to: "WH" }], items), "can't return more than is out");
+
+// reversals undo the right column
+const rev = moves.concat([{ type: "reverse", reverses: "return", sku: "PV6-RED", qty: 3, from: "WH", to: "JOB:J-1001" },
+                          { type: "reverse", reverses: "extra", sku: "PV6-RED", qty: 2, from: "JOB:J-1001", to: "WH" }]);
+const rs = C.jobSummary("J-1001", lines, rev, items).find(r => r.sku === "PV6-RED");
+assert.deepStrictEqual([rs.issued, rs.extra, rs.returned, rs.outstanding], [33, 0, 0, 32.5]);
+assert.strictEqual(C.bal(C.balances(rev), "JOB:J-1001", "PV6-RED"), 32.5, "summary and ledger agree");
+console.log("core v1.1: all tests passed");

@@ -45,7 +45,8 @@
     var q = num(quoted);
     if (!item || item.uom !== "m") return q;
     var pct = item.allowancePct === "" || item.allowancePct == null ? 10 : num(item.allowancePct);
-    return Math.ceil(q * (1 + pct / 100));
+    // round first: 50 x 1.1 is 55.000000000000007 in computer maths and must not become 56
+    return Math.ceil(round2(q * (1 + pct / 100)) - 1e-9);
   }
 
   /**
@@ -62,6 +63,15 @@
     (lines || []).forEach(function (l) { if (l.job === jobNo) row(l.sku).quoted += num(l.quoted); });
     (moves || []).forEach(function (m) {
       var q = num(m.qty);
+      if (m.type === "reverse") {
+        // A correction undoes an earlier movement, so it subtracts from that column.
+        if (m.from !== loc && m.to !== loc) return;
+        var rr = row(m.sku);
+        if (m.reverses === "return") rr.returned -= q;
+        else if (m.reverses === "scrap") rr.scrap -= q;
+        else if (m.reverses === "extra") { rr.issued -= q; rr.extra -= q; }
+        return;
+      }
       if (m.to === loc) {
         var r = row(m.sku);
         r.issued += q;
@@ -202,10 +212,37 @@
     return prefix + next;
   }
 
+  /** Real places hold physical stock and can't go below zero. */
+  function isRealPlace(loc) { return loc === "WH" || /^VAN-/.test(loc || "") || /^JOB:/.test(loc || ""); }
+
+  /**
+   * Would these new movements push any real place below zero?
+   * Returns null if fine, or a plain-English problem.
+   */
+  function checkBalances(existing, incoming, items) {
+    var touched = {};
+    (incoming || []).forEach(function (m) { if (isRealPlace(m.from)) touched[m.from + "\u0000" + m.sku] = [m.from, m.sku]; });
+    var keys = Object.keys(touched);
+    if (!keys.length) return null;
+    var B = balances((existing || []).concat(incoming));
+    for (var i = 0; i < keys.length; i++) {
+      var loc = touched[keys[i]][0], sku = touched[keys[i]][1], b = bal(B, loc, sku);
+      if (b < -0.005) {
+        var name = (items && items[sku] && items[sku].name) || sku;
+        var have = round2(b + (incoming || []).filter(function (m) { return m.from === loc && m.sku === sku; }).reduce(function (s, m) { return s + num(m.qty); }, 0)
+          - (incoming || []).filter(function (m) { return m.to === loc && m.sku === sku; }).reduce(function (s, m) { return s + num(m.qty); }, 0));
+        var where = loc === "WH" ? "the store" : loc.indexOf("JOB:") === 0 ? "job " + loc.slice(4) : loc;
+        return "Not enough " + name + " in " + where + " (only " + have + "). Someone may have used it on another device. Refresh and check.";
+      }
+    }
+    return null;
+  }
+
   var Core = {
     balances: balances, bal: bal, kitDefault: kitDefault, jobSummary: jobSummary, closeJob: closeJob,
     newAverageCost: newAverageCost, onHand: onHand, losses: losses, overQuote: overQuote,
-    countMoves: countMoves, parseScan: parseScan, nextNumber: nextNumber, round2: round2
+    countMoves: countMoves, parseScan: parseScan, nextNumber: nextNumber, round2: round2,
+    isRealPlace: isRealPlace, checkBalances: checkBalances
   };
   if (typeof module !== "undefined" && module.exports) module.exports = Core;
   else root.Core = Core;

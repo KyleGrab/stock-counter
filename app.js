@@ -16,8 +16,17 @@ function saveCfg() { LS.set("sc_cfg", cfg); }
 function siteUrl() { return (cfg.site || (location.origin + location.pathname)).replace(/\?.*$/, ""); }
 
 /* ===================== data ===================== */
+/*
+ * SD = what the Sheet has confirmed (kept on the phone so the app works without signal).
+ * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
+ * D  = what the screens show: SD plus the queued saves applied on top.
+ */
+var APP_VERSION = "1.1";
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit"];
-var D = {}; TABS.forEach(function (t) { D[t] = []; });
+function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
+var SD = LS.get("sc_sd", null) || emptyData();
+var Q = LS.get("sc_queue", []) || [];
+var D = emptyData();
 var X = { items: {}, jobs: {}, labels: {}, vans: [], kit: [], B: {} }; // derived
 
 function derive() {
@@ -29,24 +38,16 @@ function derive() {
   D.Moves.sort(function (a, b) { return String(a.ts).localeCompare(String(b.ts)); });
   X.B = C.balances(D.Moves);
 }
-function setData(data) { TABS.forEach(function (t) { D[t] = (data && data[t]) || []; }); derive(); }
+function rebuild() {
+  D = JSON.parse(JSON.stringify(SD));
+  TABS.forEach(function (t) { D[t] = D[t] || []; });
+  Q.forEach(function (b) { applyOpsLocal(D, b.ops); });
+  derive();
+}
+function persist() { LS.set("sc_sd", SD); LS.set("sc_queue", Q); }
 
-/* ===================== backends ===================== */
-var demo = {
-  load: function () {
-    var d = LS.get("sc_demo", null);
-    if (!d) { d = seedDemo(); LS.set("sc_demo", d); }
-    return Promise.resolve(JSON.parse(JSON.stringify(d)));
-  },
-  send: function (ops) {
-    var d = LS.get("sc_demo", null) || seedDemo();
-    applyOpsLocal(d, ops);
-    LS.set("sc_demo", d);
-    return Promise.resolve(JSON.parse(JSON.stringify(d)));
-  }
-};
-var KEYS = { Items: "sku", Jobs: "no", Lines: "id", Labels: "code", Vans: "id", VanKit: "sku" };
-// Same rules as Code.gs, for demo mode.
+var KEYS = { Items: "sku", Jobs: "no", Lines: "id", Moves: "id", Labels: "code", Vans: "id", VanKit: "sku" };
+// Apply changes to a local copy (queued saves on screen, and the demo "sheet").
 function applyOpsLocal(d, ops) {
   ops.forEach(function (op) {
     var rows = op.rows || [];
@@ -54,7 +55,7 @@ function applyOpsLocal(d, ops) {
     var list = d[op.sheet];
     if (op.op === "append") {
       var have = {}; list.forEach(function (r) { have[r.id] = 1; });
-      rows.forEach(function (r) { if (!have[r.id]) list.push(r); });
+      rows.forEach(function (r) { if (!have[r.id]) { list.push(r); have[r.id] = 1; } });
     } else if (op.op === "upsert") {
       var k = KEYS[op.sheet];
       rows.forEach(function (r) {
@@ -70,24 +71,96 @@ function applyOpsLocal(d, ops) {
     }
   });
 }
-function fetchJSON(url, opt) {
-  return fetch(url, opt).then(function (res) { return res.text(); }).then(function (t) {
-    var j;
-    try { j = JSON.parse(t); } catch (e) { throw new Error("The Google Sheet didn't answer properly. Check the web app link in More → Settings."); }
-    if (!j.ok) throw new Error(j.error || "Save failed.");
-    return j.data;
-  }, function () { throw new Error("No connection to the Google Sheet. Check signal and try again."); });
-}
-var api = {
-  load: function () {
-    if (cfg.mode === "demo") return demo.load();
-    return fetchJSON(cfg.url + (cfg.url.indexOf("?") < 0 ? "?" : "&") + "key=" + encodeURIComponent(cfg.key));
-  },
-  send: function (ops) {
-    if (cfg.mode === "demo") return demo.send(ops);
-    return fetchJSON(cfg.url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ key: cfg.key, ops: ops }) });
+
+/* ===================== backends ===================== */
+var NUMBERING = { Jobs: ["J-", 4, 1001], Labels: ["GS-", 4, 1], Vans: ["VAN-", 0, 1] };
+// Demo mode: a pretend Sheet on this phone that follows the same rules as Code.gs.
+var demo = {
+  sync: function (body) {
+    return new Promise(function (resolve, reject) {
+      var d = LS.get("sc_demo", null) || seedDemo();
+      var done = LS.get("sc_demo_batches", {});
+      var assigned = {};
+      try {
+        if (body.ops && body.ops.length) {
+          if (done[body.batch]) assigned = done[body.batch];
+          else {
+            var work = JSON.parse(JSON.stringify(d)), newMoves = [];
+            body.ops.forEach(function (raw) {
+              var op = JSON.parse(JSON.stringify(raw), function (k, v) {
+                if (typeof v !== "string" || k === "ref") return v;
+                Object.keys(assigned).forEach(function (r) { v = v.replace(new RegExp(r.replace(/[$]/g, "\\$&") + "(?![A-Za-z0-9_])", "g"), assigned[r]); });
+                return v;
+              });
+              if (op.op === "create") {
+                var nb = NUMBERING[op.sheet], key = KEYS[op.sheet];
+                var id = C.nextNumber(work[op.sheet].map(function (r) { return r[key]; }), nb[0], nb[1]);
+                if (parseInt(id.slice(nb[0].length), 10) < nb[2]) { id = String(nb[2]); while (id.length < nb[1]) id = "0" + id; id = nb[0] + id; }
+                var row = Object.assign({}, op.row); row[key] = id; work[op.sheet].push(row);
+                if (op.ref) assigned[op.ref] = id;
+                return;
+              }
+              if (op.op === "upsert" && op.expect) {
+                op.rows.forEach(function (r) {
+                  var cur = work[op.sheet].find(function (x) { return x[KEYS[op.sheet]] === r[KEYS[op.sheet]]; });
+                  var now = cur ? String(cur[op.expect.field]) : "";
+                  if (op.expect.values.indexOf(now) < 0) throw new Error("Job " + r[KEYS[op.sheet]] + " was already moved on (now '" + (now || "missing") + "'), probably on another device. Refresh.");
+                });
+              }
+              if (op.op === "replaceLines") {
+                var j = work.Jobs.find(function (x) { return x.no === op.job; });
+                if (j && j.status !== "quoted") throw new Error("Job " + op.job + " is already kitted. Its quote materials can't change now.");
+              }
+              if (op.op === "append") {
+                var have = {}; work.Moves.forEach(function (m) { have[m.id] = 1; });
+                newMoves = newMoves.concat(op.rows.filter(function (m) { return !have[m.id]; }));
+              }
+              applyOpsLocal(work, [op]);
+            });
+            var items = {}; work.Items.forEach(function (i) { items[i.sku] = i; });
+            var problem = C.checkBalances(d.Moves, newMoves, items);
+            if (problem) throw new Error(problem);
+            d = work; done[body.batch] = assigned;
+            LS.set("sc_demo", d); LS.set("sc_demo_batches", done);
+          }
+        }
+        if (!LS.get("sc_demo", null)) LS.set("sc_demo", d);
+        var out = JSON.parse(JSON.stringify(d)), have2 = Number(body.have) || 0, total = out.Moves.length;
+        var from = have2 > 0 && have2 <= total ? have2 : 0;
+        out.Moves = out.Moves.slice(from); out.movesFrom = from; out.movesTotal = total;
+        resolve({ assigned: assigned, data: out });
+      } catch (e) { reject(e); }
+    });
   }
 };
+function netError() { var e = new Error("No signal. Your change is saved on this phone and will sync automatically."); e.net = true; return e; }
+function post(url, body) {
+  return fetch(url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(body) })
+    .then(function (res) { return res.text(); }, function () { throw netError(); })
+    .then(function (t) {
+      var j;
+      try { j = JSON.parse(t); } catch (e) { var er = new Error("The Google Sheet didn't answer properly. Check the web app link in More → Settings."); er.net = true; throw er; }
+      if (!j.ok) throw new Error(j.error || "Save refused.");
+      return j;
+    });
+}
+var api = {
+  sync: function (ops, batch, have) {
+    var body = { key: cfg.key, ops: ops || [], batch: batch || "", have: have == null ? SD.Moves.length : have };
+    if (cfg.mode === "demo") return demo.sync(body);
+    return post(cfg.url, body);
+  }
+};
+// Take the Sheet's answer into SD. Movements arrive as "only the new ones" when possible.
+function applyServer(res) {
+  var d = res.data;
+  TABS.forEach(function (t) { if (t !== "Moves") SD[t] = d[t] || []; });
+  if (d.movesFrom === 0) SD.Moves = d.Moves;
+  else if (d.movesFrom === SD.Moves.length) SD.Moves = SD.Moves.concat(d.Moves);
+  else { SD.Moves = []; return false; } // out of step: caller does a full reload
+  persist(); rebuild();
+  return true;
+}
 
 /* ===================== helpers ===================== */
 var $ = function (s) { return document.querySelector(s); };
@@ -100,8 +173,9 @@ function nameOf(sku) { return (X.items[sku] && X.items[sku].name) || sku; }
 function vanName(id) { var v = D.Vans.find(function (x) { return x.id === id; }); return v ? v.name : (id || ""); }
 function isSerial(sku) { return X.items[sku] && X.items[sku].track === "serial"; }
 function dshort(s) { return s ? new Date(s).toLocaleDateString("en-ZA", { day: "numeric", month: "short" }) : ""; }
+function dtime(s) { return s ? new Date(s).toLocaleString("en-ZA", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : ""; }
 function now() { return new Date().toISOString(); }
-function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 function mv(type, sku, qty, from, to, extra) {
   return Object.assign({ id: uid(), ts: now(), type: type, sku: sku, qty: C.round2(qty), from: from, to: to, by: cfg.name || "",
     value: C.round2(n(qty) * cost(sku)) }, extra || {});
@@ -124,34 +198,92 @@ function flash(k, t) { S.msg = { k: k, t: t }; render(); }
 function msgHtml() { return S.msg ? '<div class="msg ' + S.msg.k + '" role="status">' + esc(S.msg.t) + "</div>" : ""; }
 function go(tab, extra) {
   if (tab !== "scan" && !(S.scanFor && tab === "jobs")) stopCam();
-  S.tab = tab; S.sub = null; S.job = null; S.msg = null; S.f = {};
+  S.tab = tab; S.sub = null; S.job = null; S.item = null; S.msg = null; S.f = {};
   Object.assign(S, extra || {});
   render(); window.scrollTo(0, 0);
 }
 function setStatus(k, t) { $("#dot").className = "dot " + (k || ""); $("#statusText").textContent = t; }
-
-function save(ops, okMsg, after) {
-  S.busy = true; render();
-  return api.send(ops).then(function (data) {
-    setData(data); S.msg = { k: "ok", t: okMsg };
-    if (after) after();
-    setStatus("ok", cfg.mode === "demo" ? "Demo" : "Saved " + new Date().toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" }));
-  }).catch(function (e) {
-    S.msg = { k: "err", t: e.message };
-  }).then(function () { S.busy = false; render(); });
+function syncStatus() {
+  if (!cfg.mode) return setStatus("", "Not connected");
+  if (Q.length) return setStatus("err", Q.length + (Q.length === 1 ? " change" : " changes") + " waiting to sync");
+  setStatus("ok", cfg.mode === "demo" ? "Demo" : "Up to date " + new Date().toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" }));
 }
-function reload() {
-  if (!cfg.mode) { S.loading = false; setStatus("", "Not connected"); render(); return Promise.resolve(); }
-  setStatus("", "Loading…");
-  return api.load().then(function (data) {
-    setData(data); S.loading = false;
-    setStatus("ok", cfg.mode === "demo" ? "Demo" : "Up to date");
-    render();
+
+/*
+ * save(): most changes are queued on the phone first, shown straight away, and sent in the background.
+ * opts.online = must reach the Sheet now (new jobs, stickers, vans need a number from the Sheet).
+ */
+function save(ops, okMsg, after, opts) {
+  opts = opts || {};
+  if (opts.online) {
+    S.busy = true; render();
+    return api.sync(ops, uid()).then(function (res) {
+      if (!applyServer(res)) return fullReload();
+      S.msg = { k: "ok", t: okMsg };
+      if (after) after(res.assigned || {});
+    }).catch(function (e) {
+      S.msg = { k: "err", t: e.net ? "This needs signal (the Sheet hands out the number). Try again when you're connected." : e.message };
+    }).then(function () { S.busy = false; syncStatus(); render(); });
+  }
+  // check stock against what this phone knows, before queueing
+  var newMoves = [];
+  ops.forEach(function (op) { if (op.op === "append") newMoves = newMoves.concat(op.rows); });
+  var problem = C.checkBalances(D.Moves, newMoves, X.items);
+  if (problem) return flash("err", problem);
+  Q.push({ batch: uid(), ops: ops, label: okMsg, ts: now() });
+  persist(); rebuild();
+  S.msg = { k: "ok", t: okMsg };
+  if (after) after({});
+  syncStatus(); render();
+  flush();
+  return Promise.resolve();
+}
+
+var flushing = false;
+function flush() {
+  if (flushing || !Q.length || !cfg.mode) return;
+  flushing = true;
+  var b = Q[0];
+  api.sync(b.ops, b.batch).then(function (res) {
+    Q.shift();
+    if (!applyServer(res)) { persist(); flushing = false; return fullReload(); }
+    flushing = false;
+    if (Q.length) flush(); else { syncStatus(); render(); }
   }).catch(function (e) {
-    S.loading = false; setStatus("err", "Offline");
-    S.msg = { k: "err", t: e.message }; render();
+    flushing = false;
+    if (e.net) { syncStatus(); return; }      // no signal: keep it, try again later
+    // The Sheet refused it (e.g. stock used on another device). Drop it and tell the person.
+    Q.shift(); persist();
+    S.msg = { k: "err", t: "Not saved: " + b.label + " Reason: " + e.message };
+    fullReload();
   });
 }
+function fullReload() {
+  if (!cfg.mode) { S.loading = false; syncStatus(); render(); return Promise.resolve(); }
+  return api.sync([], "", 0).then(function (res) {
+    SD.Moves = []; applyServer(res); S.loading = false; syncStatus(); render(); flush();
+  }).catch(function (e) {
+    S.loading = false;
+    if (!e.net) S.msg = { k: "err", t: e.message };
+    syncStatus(); if (!Q.length) setStatus("err", "Offline: showing saved data");
+    render();
+  });
+}
+function pull() {
+  if (!cfg.mode || flushing || Q.length) return flush();
+  api.sync([], "").then(function (res) { if (!applyServer(res)) return fullReload(); syncStatus(); render(); }).catch(function () { syncStatus(); });
+}
+function reload() {
+  rebuild();
+  if (!cfg.mode) { S.loading = false; syncStatus(); render(); return Promise.resolve(); }
+  if (SD.Moves.length || SD.Items.length) { S.loading = false; render(); }   // show saved data at once
+  setStatus("", "Syncing…");
+  return (Q.length ? Promise.resolve(flush()) : api.sync([], "").then(function (res) { if (!applyServer(res)) return fullReload(); }))
+    .catch(function (e) { if (!e.net) S.msg = { k: "err", t: e.message }; })
+    .then(function () { S.loading = false; syncStatus(); if (!Q.length && !navigator.onLine) setStatus("err", "Offline: showing saved data"); render(); });
+}
+window.addEventListener("online", flush);
+setInterval(function () { if (Q.length) flush(); }, 30000);
 
 /* ===================== render ===================== */
 function render() {
@@ -393,6 +525,7 @@ function vScan() {
 
 /* ---------- Stock ---------- */
 function vStock() {
+  if (S.item && X.items[S.item]) return vItemHistory(S.item);
   var vanIds = X.vans.map(function (v) { return v.id; });
   var whVal = 0, vanVal = 0, jobVal = 0;
   var rows = D.Items.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (it) {
@@ -401,7 +534,7 @@ function vStock() {
     Object.keys(X.B).forEach(function (l) { if (l.indexOf("JOB:") === 0) jb += bal(l, it.sku); });
     whVal += wh * cost(it.sku); vanVal += vv * cost(it.sku); jobVal += jb * cost(it.sku);
     var low = n(it.reorder) > 0 && wh < n(it.reorder);
-    return "<tr><td>" + esc(it.name) + '<div class="tiny muted mono">' + esc(it.sku) + "</div></td>" +
+    return '<tr><td><button class="linkbtn" data-action="itemHistory" data-sku="' + esc(it.sku) + '">' + esc(it.name) + '</button><div class="tiny muted mono">' + esc(it.sku) + "</div></td>" +
       '<td class="n">' + q(wh, it.sku) + (low ? ' <span class="pill p-kitted">Order</span>' : "") + (wh < -1e-9 ? ' <span class="pill p-bad">Check</span>' : "") + "</td>" +
       '<td class="n">' + q(vv, it.sku) + '</td><td class="n">' + q(jb, it.sku) + '</td><td class="n">' + R((wh + vv + jb) * cost(it.sku)) + "</td></tr>";
   }).join("");
@@ -426,7 +559,45 @@ function vStock() {
       overJobs.map(function (x) { return x.f.map(function (f) { return "<tr><td>" + esc(x.j.no) + '<div class="tiny muted">' + esc(x.j.type) + "</div></td><td>" + esc(nameOf(f.sku)) + '</td><td class="n">+' + Math.round(f.overPct) + "%</td></tr>"; }).join(""); }).join("") +
       '</tbody></table></div><p class="tiny muted">If the same job type keeps going over, the quote template is too low and the business is losing margin.</p></section>' : "") +
     '<section class="panel"><h3>Stock on hand</h3><div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">Store</th><th class="n">Vans</th><th class="n">Jobs</th><th class="n">Value</th></tr></thead><tbody>' + rows + "</tbody></table></div>" +
-    '<p class="tiny muted">Value uses the average landed cost of each item.</p></section>';
+    '<p class="tiny muted">Value uses the average landed cost of each item. Tap an item to see every movement and correct mistakes.</p></section>';
+}
+
+/* ---------- Item history & corrections ---------- */
+var MOVE_LABEL = { receive: "Received", kit: "Kitted to job", extra: "Extra to job", "return": "Returned", scrap: "Scrapped", used: "Used on job",
+  missing: "Missing", topup: "Van top-up", kituse: "Van kit used", countshort: "Count short", countover: "Count over", reverse: "Correction" };
+var REVERSIBLE = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1 };
+function placeName(l) { return !l ? "" : l === "WH" ? "Store" : l.indexOf("JOB:") === 0 ? l.slice(4) : l === "SUPPLIER" ? "Supplier" : l === "USED" ? "Used" : l === "LOSS" ? "Lost/found" : l === "SCRAP" ? "Scrap" : vanName(l); }
+function canReverse(m) {
+  if (!REVERSIBLE[m.type]) return false;
+  if (D.Moves.some(function (x) { return x.type === "reverse" && x.ref === m.id; })) return false;
+  if (m.job) { var j = X.jobs[m.job]; if (!j || j.status !== "out") return false; }
+  return true;
+}
+function vItemHistory(sku) {
+  var it = X.items[sku];
+  var list = D.Moves.filter(function (m) { return m.sku === sku; }).slice(-150).reverse();
+  var places = Object.keys(X.B).filter(function (l) { return C.isRealPlace(l) && Math.abs(bal(l, sku)) > 0.004; });
+  var reversed = {}; D.Moves.forEach(function (m) { if (m.type === "reverse") reversed[m.ref] = true; });
+  var pending = {}; Q.forEach(function (b) { b.ops.forEach(function (op) { (op.op === "append" ? op.rows : []).forEach(function (r) { pending[r.id] = true; }); }); });
+  var rows = list.map(function (m) {
+    var open = S.f.rev === m.id;
+    return '<div class="hist"><div class="spread"><div><b>' + esc(MOVE_LABEL[m.type] || m.type) + "</b>" + (m.type === "reverse" ? ' <span class="tiny muted">of ' + esc(MOVE_LABEL[m.reverses] || m.reverses) + "</span>" : "") +
+      (reversed[m.id] ? ' <span class="pill p-closed">Corrected</span>' : "") + (pending[m.id] ? ' <span class="pill p-kitted">Waiting to sync</span>' : "") +
+      '<div class="tiny muted">' + esc(dtime(m.ts)) + (m.by ? " · " + esc(m.by) : "") + "</div></div>" +
+      '<div class="right"><span class="mono">' + q(m.qty, sku) + '</span><span class="tiny muted">' + esc(placeName(m.from)) + " → " + esc(placeName(m.to)) + "</span></div></div>" +
+      ((m.reason || m.ref || m.serial) ? '<div class="tiny muted">' + [m.serial ? "Serial " + esc(m.serial) : "", m.reason ? esc(m.reason) : "", m.ref && m.type !== "reverse" ? esc(m.ref) : ""].filter(Boolean).join(" · ") + "</div>" : "") +
+      (canReverse(m) && !open ? '<button class="btn ghost small" data-action="revStart" data-id="' + esc(m.id) + '">Reverse this</button>' : "") +
+      (open ? '<div class="panel" style="padding:10px"><p class="small">This records a correction that undoes the movement above. Nothing is deleted.</p>' +
+        '<label class="f">Why? (required)<input id="rev_reason" data-bind="revReason" value="' + esc(S.f.revReason || "") + '" placeholder="e.g. Typed 100 instead of 10"></label>' +
+        '<div class="row"><button class="btn small" data-action="revConfirm" data-id="' + esc(m.id) + '">Confirm correction</button><button class="btn ghost small" data-action="revCancel">Cancel</button></div></div>' : "") +
+      "</div>";
+  }).join("");
+  return '<div class="row"><button class="btn ghost small" data-action="itemBack">← Stock</button></div>' +
+    '<div><div class="eyebrow">' + esc(sku) + "</div><h2>" + esc(it.name) + '</h2><div class="small muted">Average landed cost ' + R(it.cost) + (it.uom === "m" ? " per metre" : " each") + "</div></div>" +
+    msgHtml() +
+    '<section class="panel"><h3>Where it is now</h3>' + (places.length ? places.map(function (l) { return '<div class="spread"><span>' + esc(placeName(l)) + '</span><span class="mono">' + q(bal(l, sku), sku) + "</span></div>"; }).join("") : '<p class="muted small">None in stock.</p>') + "</section>" +
+    '<section class="panel"><h3>Movements</h3><p class="tiny muted">Newest first. Movements are never edited or deleted; mistakes are reversed with a reason, so the record stays complete for an audit.</p>' +
+    (rows || '<p class="muted">No movements yet.</p>') + "</section>";
 }
 
 /* ---------- Counts ---------- */
@@ -532,6 +703,8 @@ function vSettings() {
     '<label class="f">This app\'s web address (for stickers)<input id="st_site" data-bind="st.site" value="' + esc(f.site || "") + '" placeholder="' + esc(location.origin + location.pathname) + '"></label>' +
     msgHtml() + '<button class="btn" data-action="saveSettings"' + (S.busy ? " disabled" : "") + ">Save and connect</button>" +
     '<p class="small">Now using: <b>' + (cfg.mode === "live" ? "Google Sheet" : "Demo data on this phone") + "</b></p></section>" +
+    '<section class="panel"><h3>Sync</h3><p class="small">' + (Q.length ? Q.length + " change(s) saved on this phone, waiting for signal." : "Everything is saved to the " + (cfg.mode === "live" ? "Google Sheet." : "demo data.")) + "</p>" +
+    (Q.length ? '<button class="btn ghost small" data-action="syncNow">Try to sync now</button>' : "") + '<p class="tiny muted">App version ' + APP_VERSION + "</p></section>" +
     '<section class="panel"><h3>Demo</h3><div class="row"><button class="btn ghost" data-action="useDemo">Use demo data</button><button class="btn ghost" data-action="resetDemo">Reset demo data</button></div></section>';
 }
 
@@ -542,8 +715,14 @@ function bindValue(path, value) {
   o[parts[parts.length - 1]] = value;
 }
 
+// Changing between demo and the real Sheet starts from a clean copy on the phone.
+function switchMode(mode) {
+  cfg.mode = mode; saveCfg();
+  SD = emptyData(); Q = []; persist(); rebuild();
+}
+
 var A = {
-  startDemo: function () { cfg.mode = "demo"; cfg.name = cfg.name || "Storeman"; saveCfg(); S.loading = true; render(); reload(); },
+  startDemo: function () { switchMode("demo"); cfg.name = cfg.name || "Storeman"; saveCfg(); S.loading = true; render(); reload(); },
   startLive: function () { S.loading = false; go("more", { sub: "settings" }); },
   back: function () { S.sub = null; S.job = null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
   sub: function (b) { S.sub = b.dataset.sub || null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
@@ -564,13 +743,19 @@ var A = {
     if (!lines.length) return flash("err", "Add at least one item from the quote.");
     var seen = {};
     for (var i = 0; i < lines.length; i++) { if (seen[lines[i].sku]) return flash("err", nameOf(lines[i].sku) + " is listed twice. Combine them into one line."); seen[lines[i].sku] = 1; }
-    var no = f.no || C.nextNumber(D.Jobs.map(function (j) { return j.no; }), "J-", 4);
-    if (!f.no && no === "J-0001") no = "J-1001";
-    var job = { no: no, client: f.client, type: f.type || "", van: f.van, installer: f.installer, quoteRef: f.quoteRef || "" };
-    if (!f.no) { job.status = "quoted"; job.created = now(); }
-    save([{ op: "upsert", sheet: "Jobs", rows: [job] },
-          { op: "replaceLines", sheet: "Lines", job: no, rows: lines.map(function (l) { return { id: no + "|" + l.sku, job: no, sku: l.sku, quoted: C.round2(l.quoted) }; }) }],
-      (f.no ? "Saved " : "Job " + no + " created. ") + "Next: pick the kit.", function () { S.sub = null; S.job = no; S.f = {}; });
+    var job = { client: f.client, type: f.type || "", van: f.van, installer: f.installer, quoteRef: f.quoteRef || "" };
+    function lineRows(no) { return lines.map(function (l) { return { id: no + "|" + l.sku, job: no, sku: l.sku, quoted: C.round2(l.quoted) }; }); }
+    if (f.no) {
+      job.no = f.no;
+      return save([{ op: "upsert", sheet: "Jobs", rows: [job], expect: { field: "status", values: ["quoted"] } },
+            { op: "replaceLines", sheet: "Lines", job: f.no, rows: lineRows(f.no) }],
+        "Saved " + f.no + ". Next: pick the kit.", function () { S.sub = null; S.job = f.no; S.f = {}; });
+    }
+    // New job: the Sheet hands out the number, so two devices can never clash.
+    job.status = "quoted"; job.created = now();
+    save([{ op: "create", sheet: "Jobs", ref: "$JOB", row: job },
+          { op: "replaceLines", sheet: "Lines", job: "$JOB", rows: lineRows("$JOB") }],
+      "Job created. Next: pick the kit.", function (a) { S.sub = null; S.job = a.$JOB; S.f = {}; S.msg = { k: "ok", t: "Job " + a.$JOB + " created. Next: pick the kit." }; }, { online: true });
   },
   recordKit: function () {
     var j = X.jobs[S.job], sum = C.jobSummary(j.no, D.Lines, D.Moves, X.items), k = S.f.kit || {}, moves = [];
@@ -594,12 +779,12 @@ var A = {
       } else moves.push(mv("kit", r.sku, qty, "WH", "JOB:" + j.no, { job: j.no, van: j.van, installer: j.installer }));
     }
     if (!moves.length) return flash("err", "Nothing to kit. Enter kit quantities.");
-    save([{ op: "append", sheet: "Moves", rows: moves }, { op: "upsert", sheet: "Jobs", rows: [{ no: j.no, status: "kitted", kittedAt: now() }] }],
+    save([{ op: "append", sheet: "Moves", rows: moves }, { op: "upsert", sheet: "Jobs", rows: [{ no: j.no, status: "kitted", kittedAt: now() }], expect: { field: "status", values: ["quoted"] } }],
       "Kit recorded. Put the crate label on and wait for the van.", function () { S.f = {}; });
   },
   collected: function () {
     var j = X.jobs[S.job];
-    save([{ op: "upsert", sheet: "Jobs", rows: [{ no: j.no, status: "out", outAt: now() }] }], j.no + " is on site. Check the crate when it comes back.", function () { S.f = {}; });
+    save([{ op: "upsert", sheet: "Jobs", rows: [{ no: j.no, status: "out", outAt: now() }], expect: { field: "status", values: ["kitted"] } }], j.no + " is on site. Check the crate when it comes back.", function () { S.f = {}; });
   },
   extra: function () { var j = S.job; stopCam(); go("scan"); S.f = { mode: "extra", job: j }; S.msg = { k: "info", t: "Scan or type the sticker of the extra item for " + j + "." }; render(); },
   closeJob: function () {
@@ -618,8 +803,21 @@ var A = {
     if (res.missingValue > 0 && !String(f.reason || "").trim()) return flash("err", "Give a reason for the missing stock.");
     res.moves.forEach(function (m) { m.id = uid(); m.by = cfg.name || ""; });
     save([{ op: "append", sheet: "Moves", rows: moves.concat(res.moves) },
-          { op: "upsert", sheet: "Jobs", rows: [{ no: j.no, status: "closed", closedAt: now(), missingValue: res.missingValue, reason: f.reason || "" }] }],
+          { op: "upsert", sheet: "Jobs", rows: [{ no: j.no, status: "closed", closedAt: now(), missingValue: res.missingValue, reason: f.reason || "" }], expect: { field: "status", values: ["out"] } }],
       res.missingValue > 0 ? "Job closed. " + R(res.missingValue) + " recorded as missing." : "Job closed. Everything accounted for.", function () { S.f = {}; });
+  },
+  itemHistory: function (b) { S.item = b.dataset.sku; S.f = {}; S.msg = null; render(); window.scrollTo(0, 0); },
+  itemBack: function () { S.item = null; S.f = {}; S.msg = null; render(); },
+  revStart: function (b) { S.f.rev = b.dataset.id; S.f.revReason = ""; S.msg = null; render(); },
+  revCancel: function () { S.f.rev = null; render(); },
+  revConfirm: function (b) {
+    var m = D.Moves.find(function (x) { return x.id === b.dataset.id; });
+    if (!m || !canReverse(m)) return flash("err", "This movement can't be reversed any more.");
+    if (!String(S.f.revReason || "").trim()) return flash("err", "Give a reason for the correction.");
+    var r = mv("reverse", m.sku, n(m.qty), m.to, m.from, { reverses: m.type, ref: m.id, job: m.job || "", van: m.van || "", installer: m.installer || "",
+      serial: m.serial || "", reason: S.f.revReason.trim() });
+    r.value = n(m.value);
+    save([{ op: "append", sheet: "Moves", rows: [r] }], "Correction recorded.", function () { S.f = {}; });
   },
   startCam: function () { startCam("Point the camera at a sticker or crate label"); },
   lookup: function () { handleCode(S.f.code); },
@@ -691,8 +889,8 @@ var A = {
   saveLabel: function () {
     var f = S.f.lb;
     if (!f.sku) return flash("err", "Choose the item.");
-    var code = C.nextNumber(D.Labels.map(function (l) { return l.code; }), "GS-", 4);
-    save([{ op: "upsert", sheet: "Labels", rows: [{ code: code, sku: f.sku, note: f.note || "" }] }], "Sticker " + code + " created.", function () { S.f.lb = { sku: f.sku }; });
+    save([{ op: "create", sheet: "Labels", ref: "$L", row: { sku: f.sku, note: f.note || "" } }], "Sticker created.",
+      function (a) { S.f.lb = { sku: f.sku }; S.msg = { k: "ok", t: "Sticker " + a.$L + " created." }; }, { online: true });
   },
   printLabels: function () {
     printSheet("Sticker sheet", D.Labels.slice().sort(function (a, b) { return a.code.localeCompare(b.code); }).map(function (l) {
@@ -705,8 +903,7 @@ var A = {
   },
   saveVan: function () {
     var f = S.f.vn; if (!f.name) return flash("err", "Give the van a name.");
-    var id = C.nextNumber(D.Vans.map(function (v) { return v.id; }), "VAN-", 0);
-    save([{ op: "upsert", sheet: "Vans", rows: [{ id: id, name: f.name }] }], "Van added.", function () { S.f.vn = {}; });
+    save([{ op: "create", sheet: "Vans", ref: "$V", row: { name: f.name } }], "Van added.", function () { S.f.vn = {}; }, { online: true });
   },
   saveKit: function () {
     var t = S.f.kt || {}, up = [], rm = [];
@@ -717,6 +914,7 @@ var A = {
     if (!ops.length) return flash("err", "Enter at least one quantity.");
     save(ops, "Van kit saved.");
   },
+  syncNow: function () { flush(); flash("info", "Trying to sync…"); },
   saveSettings: function () {
     var f = S.f.st;
     cfg.name = f.name || "";
@@ -724,15 +922,25 @@ var A = {
     if (!f.url || !f.key) { saveCfg(); return flash("ok", "Name saved. Add the web app link and secret key to connect the Google Sheet."); }
     var url = f.url.trim(), key = f.key.trim();
     if (!/^https:\/\/script\.google\.com\/macros\/s\/[^/]+\/exec/.test(url)) return flash("err", "The web app link should start with https://script.google.com/macros/s/ and end with /exec.");
+    if (Q.length && cfg.mode === "live" && (url !== cfg.url)) return flash("err", Q.length + " changes are still waiting to reach the current Sheet. Get signal and let them sync first.");
     S.busy = true; S.msg = { k: "info", t: "Connecting…" }; render();
-    fetchJSON(url + "?key=" + encodeURIComponent(key)).then(function (data) {
-      cfg.mode = "live"; cfg.url = url; cfg.key = key; saveCfg();
-      setData(data); setStatus("ok", "Up to date");
+    post(url, { key: key, have: 0, ops: [] }).then(function (res) {
+      if (cfg.mode !== "live" || cfg.url !== url) switchMode("live");
+      cfg.url = url; cfg.key = key; saveCfg();
+      SD.Moves = []; applyServer(res); syncStatus();
       S.msg = { k: "ok", t: "Connected to the Google Sheet." };
-    }).catch(function (e) { S.msg = { k: "err", t: e.message }; }).then(function () { S.busy = false; render(); });
+      flush();
+    }).catch(function (e) { S.msg = { k: "err", t: e.net ? "Couldn't reach the Sheet. Check the link, that the deployment allows Anyone, and that you have signal." : e.message }; })
+      .then(function () { S.busy = false; render(); });
   },
-  useDemo: function () { cfg.mode = "demo"; saveCfg(); S.loading = true; reload().then(function () { flash("ok", "Using demo data."); }); },
-  resetDemo: function () { LS.set("sc_demo", null); if (cfg.mode === "demo") { S.loading = true; reload().then(function () { flash("ok", "Demo data reset."); }); } else flash("ok", "Demo data reset."); }
+  useDemo: function () {
+    if (cfg.mode === "live" && Q.length) return flash("err", Q.length + " changes are still waiting to reach the Sheet. Let them sync first.");
+    switchMode("demo"); S.loading = true; reload().then(function () { flash("ok", "Using demo data."); });
+  },
+  resetDemo: function () {
+    LS.set("sc_demo", null); LS.set("sc_demo_batches", null);
+    if (cfg.mode === "demo") { switchMode("demo"); S.loading = true; reload().then(function () { flash("ok", "Demo data reset."); }); } else flash("ok", "Demo data reset.");
+  }
 };
 
 function printSheet(title, cells, cols) {
@@ -833,7 +1041,7 @@ document.addEventListener("keydown", function (e) {
   if (e.target.id === "sc_code") { e.preventDefault(); A.lookup(); }
   if (e.target.id === "ser_manual") { e.preventDefault(); A.addSerial(); }
 });
-document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible" && cfg.mode === "live" && !S.busy) reload(); });
+document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible" && cfg.mode === "live" && !S.busy) pull(); });
 
 /* ===================== demo data ===================== */
 function seedDemo() {
@@ -919,6 +1127,7 @@ function seedDemo() {
 
 /* ===================== start ===================== */
 (function start() {
+  if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(function () {});
   render();
   var params = new URLSearchParams(location.search);
   var code = params.get("c");

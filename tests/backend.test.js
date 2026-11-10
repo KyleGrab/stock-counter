@@ -1,103 +1,80 @@
 // Runs Code.gs against a fake Google Sheet, to check the backend rules without Google.
-const fs = require("fs");
-const vm = require("vm");
 const assert = require("assert");
+const { makeGas } = require("./fake-gas");
+const { sheets, key, post, get } = makeGas();
 
-function makeEnv() {
-  const sheets = {};
-  const props = {};
-  function Sheet(name) {
-    const rows = []; // rows[r][c], 0-based
-    const self = {
-      name,
-      rows,
-      getMaxRows: () => 1000,
-      getLastRow: () => rows.length,
-      setFrozenRows() {},
-      deleteRow(r) { rows.splice(r - 1, 1); },
-      getRange(r, c, nr = 1, nc = 1) {
-        if (typeof r === "string") return { setNumberFormat() { return this; } };
-        return {
-          setNumberFormat() { return this; },
-          setFontWeight() { return this; },
-          getValues() {
-            const out = [];
-            for (let i = 0; i < nr; i++) { const row = rows[r - 1 + i] || []; const o = []; for (let j = 0; j < nc; j++) o.push(row[c - 1 + j] ?? ""); out.push(o); }
-            return out;
-          },
-          setValues(vals) {
-            vals.forEach((v, i) => { const ri = r - 1 + i; rows[ri] = rows[ri] || []; v.forEach((x, j) => { rows[ri][c - 1 + j] = x; }); });
-            return this;
-          }
-        };
-      }
-    };
-    return self;
-  }
-  const ss = {
-    getSheetByName: n => sheets[n] || null,
-    insertSheet: n => (sheets[n] = Sheet(n)),
-    getSheets: () => Object.values(sheets),
-    deleteSheet: s => delete sheets[s.name]
-  };
-  const ctx = {
-    SpreadsheetApp: { getActiveSpreadsheet: () => ss, flush() {} },
-    PropertiesService: { getScriptProperties: () => ({ getProperty: k => props[k] || null, setProperty: (k, v) => (props[k] = v) }) },
-    Utilities: { getUuid: () => "abcd-1234-efgh-5678-ijkl-9999" },
-    LockService: { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
-    Logger: { log() {} },
-    ContentService: { MimeType: { JSON: "json" }, createTextOutput: s => ({ setMimeType: () => ({ body: s }) }) },
-    Date
-  };
-  vm.createContext(ctx);
-  vm.runInContext(fs.readFileSync(__dirname + "/../Code.gs", "utf8"), ctx);
-  return { ctx, sheets };
-}
-
-const { ctx, sheets } = makeEnv();
-const key = ctx.setup();
 assert.ok(key && key.length === 20);
 assert.deepStrictEqual(sheets.Moves.rows[0].slice(0, 3), ["id", "ts", "type"]);
 
-const get = p => JSON.parse(ctx.doGet({ parameter: p }).body);
-const post = b => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(b) } }).body);
+// GET gives no data, only a hello
+const hello = get();
+assert.strictEqual(hello.ok, true); assert.strictEqual(hello.data, undefined);
 
-assert.strictEqual(get({ key: "wrong" }).ok, false, "wrong key rejected");
-assert.strictEqual(get({ key, action: "ping" }).ok, true);
+// wrong key
+assert.strictEqual(post({ key: "wrong" }).ok, false);
+// plain read
+assert.strictEqual(post({ key }).ok, true);
 
-// upsert an item, then update one field only
-let r = post({ key, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV6-RED", name: "PV red", uom: "m", track: "qty", cost: 18.5 }] }] });
+// items: upsert, then merge one field
+let r = post({ key, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", name: "PV red", uom: "m", track: "qty", cost: 18.5 }] }] });
 assert.ok(r.ok, r.error);
-r = post({ key, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV6-RED", cost: 19 }] }] });
+r = post({ key, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", cost: 19 }] }] });
 assert.strictEqual(r.data.Items[0].name, "PV red", "merge keeps other fields");
-assert.strictEqual(r.data.Items[0].cost, "19");
 
-// append moves, retry is ignored
-const mv = { id: "m1", ts: "2026-11-10T10:00:00.000Z", type: "receive", sku: "PV6-RED", qty: 100, from: "SUPPLIER", to: "WH" };
-post({ key, ops: [{ op: "append", sheet: "Moves", rows: [mv] }] });
-r = post({ key, ops: [{ op: "append", sheet: "Moves", rows: [mv] }] });
-assert.strictEqual(r.data.Moves.length, 1, "duplicate id not saved twice");
-assert.strictEqual(r.data.Moves[0].ts, "2026-11-10T10:00:00.000Z");
+// the Sheet hands out job numbers, and placeholders are filled in later ops
+r = post({ key, ops: [
+  { op: "create", sheet: "Jobs", ref: "$JOB", row: { client: "A", status: "quoted" } },
+  { op: "replaceLines", sheet: "Lines", job: "$JOB", rows: [{ id: "$JOB|PV", job: "$JOB", sku: "PV", quoted: 30 }] }] });
+assert.ok(r.ok, r.error);
+assert.strictEqual(r.assigned.$JOB, "J-1001");
+assert.strictEqual(r.data.Lines[0].id, "J-1001|PV");
+r = post({ key, ops: [{ op: "create", sheet: "Jobs", ref: "$JOB", row: { client: "B", status: "quoted" } }] });
+assert.strictEqual(r.assigned.$JOB, "J-1002", "second job gets the next number, never a clash");
+r = post({ key, ops: [{ op: "create", sheet: "Labels", ref: "$L", row: { sku: "PV" } }, { op: "create", sheet: "Labels", ref: "$L2", row: { sku: "PV" } }] });
+assert.deepStrictEqual([r.assigned.$L, r.assigned.$L2], ["GS-0001", "GS-0002"]);
 
-// moves can't be edited
-r = post({ key, ops: [{ op: "upsert", sheet: "Moves", rows: [mv] }] });
+// stock: receive 100, issue 80 OK, issue 30 more refused (only 20 left)
+const mv = (id, qty, from, to, x) => Object.assign({ id, ts: "2026-11-10T10:00:00.000Z", type: "kit", sku: "PV", qty, from, to }, x || {});
+r = post({ key, ops: [{ op: "append", sheet: "Moves", rows: [mv("m1", 100, "SUPPLIER", "WH", { type: "receive" })] }] });
+assert.ok(r.ok, r.error);
+r = post({ key, ops: [{ op: "append", sheet: "Moves", rows: [mv("m2", 80, "WH", "JOB:J-1001")] }, { op: "upsert", sheet: "Jobs", rows: [{ no: "J-1001", status: "kitted" }], expect: { field: "status", values: ["quoted"] } }] });
+assert.ok(r.ok, r.error);
+r = post({ key, ops: [{ op: "append", sheet: "Moves", rows: [mv("m3", 30, "WH", "JOB:J-1002")] }] });
+assert.strictEqual(r.ok, false); assert.ok(/Not enough/.test(r.error));
+
+// job step check: kitting J-1001 again is refused, and NOTHING from that save is written (all-or-nothing)
+const before = sheets.Moves.rows.length;
+r = post({ key, ops: [{ op: "append", sheet: "Moves", rows: [mv("m4", 5, "WH", "JOB:J-1001")] }, { op: "upsert", sheet: "Jobs", rows: [{ no: "J-1001", status: "kitted" }], expect: { field: "status", values: ["quoted"] } }] });
+assert.strictEqual(r.ok, false); assert.ok(/already moved on/.test(r.error));
+assert.strictEqual(sheets.Moves.rows.length, before, "refused save wrote nothing");
+
+// quote lines can't change after kitting
+r = post({ key, ops: [{ op: "replaceLines", sheet: "Lines", job: "J-1001", rows: [] }] });
 assert.strictEqual(r.ok, false);
-// bad movement rejected
-r = post({ key, ops: [{ op: "append", sheet: "Moves", rows: [{ id: "m2", sku: "X", qty: 0 }] }] });
-assert.strictEqual(r.ok, false);
-// unknown tab rejected
+
+// retry safety: same batch id twice is applied once; same movement id twice saved once
+const batch = { key, batch: "b-123", ops: [{ op: "append", sheet: "Moves", rows: [mv("m5", 3, "JOB:J-1001", "WH", { type: "return" })] }] };
+assert.ok(post(batch).ok);
+r = post(batch);
+assert.ok(r.ok);
+assert.strictEqual(sheets.Moves.rows.filter(x => x[0] === "m5").length, 1);
+r = post({ key, batch: "b-other", ops: batch.ops });
+assert.strictEqual(sheets.Moves.rows.filter(x => x[0] === "m5").length, 1);
+
+// incremental sync: phone has 2 movements -> only the newer ones come back
+r = post({ key, have: 2 });
+assert.strictEqual(r.data.movesFrom, 2); assert.strictEqual(r.data.Moves.length, r.data.movesTotal - 2);
+r = post({ key, have: 999 });
+assert.strictEqual(r.data.movesFrom, 0, "phone ahead of the sheet -> full resend");
+
+// movements can't be edited; unknown tabs and bad removes refused
+assert.strictEqual(post({ key, ops: [{ op: "upsert", sheet: "Moves", rows: [{ id: "m1" }] }] }).ok, false);
 assert.strictEqual(post({ key, ops: [{ op: "upsert", sheet: "Secrets", rows: [{}] }] }).ok, false);
-
-// replace job lines
-post({ key, ops: [{ op: "replaceLines", sheet: "Lines", job: "J-1001", rows: [{ id: "J-1001|A", job: "J-1001", sku: "A", quoted: 1 }, { id: "J-1001|B", job: "J-1001", sku: "B", quoted: 2 }] },
-                  { op: "replaceLines", sheet: "Lines", job: "J-1002", rows: [{ id: "J-1002|A", job: "J-1002", sku: "A", quoted: 5 }] }] });
-r = post({ key, ops: [{ op: "replaceLines", sheet: "Lines", job: "J-1001", rows: [{ id: "J-1001|C", job: "J-1001", sku: "C", quoted: 3 }] }] });
-assert.deepStrictEqual(r.data.Lines.map(l => l.id).sort(), ["J-1001|C", "J-1002|A"]);
-
-// remove allowed only on small lists
-post({ key, ops: [{ op: "upsert", sheet: "Labels", rows: [{ code: "GS-0001", sku: "A" }, { code: "GS-0002", sku: "B" }] }] });
-r = post({ key, ops: [{ op: "remove", sheet: "Labels", rows: [{ code: "GS-0001" }] }] });
-assert.deepStrictEqual(r.data.Labels.map(l => l.code), ["GS-0002"]);
 assert.strictEqual(post({ key, ops: [{ op: "remove", sheet: "Jobs", rows: [{ no: "J-1" }] }] }).ok, false);
+assert.strictEqual(post({ key, ops: [{ op: "append", sheet: "Moves", rows: [{ id: "x", sku: "PV", qty: 0 }] }] }).ok, false);
+
+// formula guard
+post({ key, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "EVIL", name: "=IMPORTXML(\"http://x\")" }] }] });
+assert.ok(sheets.Items.rows.some(row => row[1] === "'=IMPORTXML(\"http://x\")"));
 
 console.log("backend: all tests passed");

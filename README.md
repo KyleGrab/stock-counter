@@ -11,9 +11,9 @@ A free stock app for the phone. Every metre of cable that leaves the store is ti
 
 | File | What it is | Where it goes |
 |---|---|---|
-| `index.html`, `app.js`, `core.js`, `manifest.json`, `icon.svg` | The phone app | GitHub (Part A) |
+| `index.html`, `app.js`, `core.js`, `sw.js`, `manifest.json`, `icon.svg` | The phone app | GitHub (Part A) |
 | `Code.gs` | The link to the Google Sheet | Google Apps Script (Part B) |
-| `tests/` | Checks used while building. Not needed | Nowhere |
+| `tests/`, `.github/` | Automatic checks that run on every change | Already on GitHub |
 
 ---
 
@@ -27,7 +27,7 @@ A free stock app for the phone. Every metre of cable that leaves the store is ti
    - Name: `stock-counter`
    - Choose **Public**. Free hosting needs this. Only the app's code is public; your stock data lives in the Google Sheet, and the secret key is never in these files.
    - Click **Create repository**.
-4. Click **uploading an existing file**. Open the `stock-app` folder and drag in **these 5 files**: `index.html`, `app.js`, `core.js`, `manifest.json`, `icon.svg`. Click **Commit changes**.
+4. Click **uploading an existing file**. Open the `stock-app` folder and drag in **these 6 files**: `index.html`, `app.js`, `core.js`, `sw.js`, `manifest.json`, `icon.svg`. Click **Commit changes**.
    - ⚠️ Drag the **files**, not the folder. If the files end up inside a `stock-app/` folder on GitHub, the link won't work.
 5. Go to **Settings → Pages** (left menu). Under *Branch*, choose **main** and **/(root)**. Click **Save**.
 6. Wait 1–5 minutes, then refresh. The link appears at the top of the Pages screen:
@@ -134,4 +134,12 @@ Quote accepted → New job → Kit the crate → Van collects → Crate back →
 
 **Backups:** the Google Sheet keeps its own history (File → Version history). Download a copy monthly: File → Download → Excel.
 
-**Limits to know:** the phone needs signal to save. Use one phone for jobs so job numbers never clash. Google's free limits are far above what a business this size needs.
+## No signal?
+
+Keep working. Receiving, kitting, van collection, returns, closing jobs and counts are **saved on the phone** and sent to the Sheet automatically when signal returns. The top of the screen shows how many changes are waiting.
+
+Three things need signal, because the Sheet hands out the number: **new jobs, new stickers, new vans.**
+
+If another device used the same stock while you were offline, the Sheet refuses the clashing change and the app tells you exactly which one, so nothing goes negative.
+
+**Limits to know:** the app stores its copy of the data on the phone; clearing Chrome/Safari data removes that copy (the Sheet still has everything). Google's free limits are far above what a business this size needs.
