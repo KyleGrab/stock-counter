@@ -8,7 +8,8 @@ var C = window.Core;
 
 /* ===================== settings & storage ===================== */
 var LS = {
-  get: function (k, d) { try { var v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  // A saved "null" (from a reset) counts as missing, so callers always get their default.
+  get: function (k, d) { try { var v = localStorage.getItem(k); var x = v == null ? null : JSON.parse(v); return x == null ? d : x; } catch (e) { return d; } },
   set: function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
 };
 var cfg = Object.assign({ mode: null, url: "", token: "", user: null, site: "" }, LS.get("sc_cfg", {}));
@@ -22,7 +23,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.7";
+var APP_VERSION = "1.8";
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit", "Counts"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
@@ -135,7 +136,7 @@ var demo = {
     var self = this;
     return new Promise(function (resolve, reject) {
       try {
-        var users = self.users(), sessions = LS.get("sc_demo_sessions", {});
+        var users = self.users(), sessions = LS.get("sc_demo_sessions", {}) || {};
         if (action === "login") {
           var u = users.find(function (x) { return x.username === String(body.username || "").trim().toLowerCase(); });
           if (!u || u.pin !== String(body.pin)) throw demoErr("Wrong username or PIN.");
@@ -502,7 +503,8 @@ function render() {
   syncStatus();
   var v = $("#view");
   var html;
-  if (!cfg.mode) html = vWelcome();
+  if (!cfg.mode && !S.pendingReset) html = vWelcome();
+  else if (S.pendingReset) html = vResetConfirm();
   else if (!signedIn) html = vLogin();
   else if (cfg.user.mustChange) html = vChangePinFirst();
   else if (S.loading) html = '<p class="muted">Loading stock…</p>';
@@ -513,6 +515,33 @@ function render() {
   v.innerHTML = html;
   patchReturn(); patchCounts();
   if (id) { var el = document.getElementById(id); if (el && el.tagName !== "BUTTON") { el.focus(); try { if (pos != null) el.setSelectionRange(pos, pos); } catch (e) {} } }
+}
+
+/*
+ * A link like ...?reset=demo-empty clears the DEMO data on this phone after one confirmation.
+ * It never touches the real Google Sheet, and is refused while changes are waiting to sync.
+ */
+function vResetConfirm() {
+  var empty = S.pendingReset === "demo-empty";
+  var blocked = cfg.mode === "live" && Q.length;
+  return '<section class="panel login"><div class="eyebrow">Reset link</div><h2>' + (empty ? "Clear and start empty?" : "Load example data?") + "</h2>" +
+    "<p>" + (empty ? "This deletes all demo stock, items, jobs, stickers and counts <b>on this phone</b>, and resets the demo logins. The two vans are kept." :
+      "This replaces the demo data on this phone with the made-up example data, and resets the demo logins.") + "</p>" +
+    (cfg.mode === "live" ? '<p class="small">This phone is connected to the real Google Sheet. The Sheet is <b>not</b> changed; this phone just switches to demo mode.</p>' : "") +
+    (blocked ? '<div class="msg err">' + Q.length + " change(s) on this phone haven't reached the Google Sheet yet. Let them sync first.</div>" : "") +
+    '<div class="row"><button class="btn" data-action="confirmReset"' + (blocked ? " disabled" : "") + ">" + (empty ? "Yes, clear and start empty" : "Yes, load example data") + "</button>" +
+    '<button class="btn ghost" data-action="cancelReset">Cancel</button></div></section>';
+}
+function applyResetLink(kind) {
+  if (cfg.mode === "live" && Q.length) return;
+  var vans = seedDemo().Vans;
+  LS.set("sc_demo_users", null); LS.set("sc_demo_sessions", null); LS.set("sc_demo_batches", null);
+  if (kind === "demo-empty") { LS.set("sc_demo", { Items: [], Jobs: [], Lines: [], Moves: [], Labels: [], Vans: vans, VanKit: [], Counts: [] }); LS.set("sc_demo_kind", "empty"); }
+  else { LS.set("sc_demo", null); LS.set("sc_demo_kind", null); }
+  switchMode("demo");
+  S.pendingReset = null; S.f = { lg: { username: "admin" } }; S.pendingCode = null;
+  S.msg = { k: "ok", t: kind === "demo-empty" ? "Cleared. Sign in as admin (PIN 246810), then go to Admin → Inventory → Import / export to add your stock." : "Example data loaded. Sign in with one of the demo logins below." };
+  render(); var pn = $("#lg_pin"); if (pn) pn.focus();
 }
 
 function vWelcome() {
@@ -1162,6 +1191,7 @@ function vLogin() {
     msgHtml() + '<button class="btn wide" data-action="login"' + (S.busy ? " disabled" : "") + ">Sign in</button>" +
     (Q.length && Q[0].user ? '<p class="tiny muted">' + Q.length + " change(s) from <b>" + esc(Q[0].user) + "</b> are waiting on this phone. They'll sync when " + esc(Q[0].user) + " signs in.</p>" : "") +
     (cfg.mode === "demo" ? '<div class="msg info small">Demo logins (any of these):<br><span class="mono">admin</span> PIN <span class="mono">246810</span> (Senior Admin)<br><span class="mono">lebo</span> PIN <span class="mono">580214</span> (Warehouse Manager)<br><span class="mono">sipho</span> PIN <span class="mono">1357</span> (User)<br><span class="mono">owner</span> PIN <span class="mono">8642</span> (Viewer)</div>' : "") +
+    (cfg.mode === "demo" ? '<button class="linkbtn small muted" data-action="resetDemoLogins">Can\'t sign in? Reset demo logins</button>' : "") +
     '<button class="linkbtn small muted" data-action="' + (cfg.mode === "demo" ? "goLive" : "useDemo") + '">' + (cfg.mode === "demo" ? "Connect our Google Sheet instead" : "Try the demo instead") + "</button>" +
     (needUrl ? "" : (cfg.mode === "live" ? '<button class="linkbtn small muted" data-action="changeUrl">Use a different Google Sheet</button>' : "")) +
     "</section>";
@@ -1452,6 +1482,14 @@ var A = {
     }
     flash("ok", "Saved.");
   },
+  resetDemoLogins: function () {
+    LS.set("sc_demo_users", null); LS.set("sc_demo_sessions", null);
+    S.f = { lg: { username: "admin" } };
+    S.msg = { k: "ok", t: "Demo logins reset. Sign in as admin with PIN 246810. Your demo stock wasn't touched." };
+    render(); var pn = $("#lg_pin"); if (pn) pn.focus();
+  },
+  confirmReset: function () { applyResetLink(S.pendingReset); },
+  cancelReset: function () { S.pendingReset = null; render(); },
   emptyDemo: function () {
     if (!isAdmin()) return flash("err", "Only a Senior Admin can clear the data.");
     if (!S.f.confirmEmpty) { S.f.confirmEmpty = true; return render(); }
@@ -1743,7 +1781,14 @@ document.addEventListener("change", function (e) {
   if (t.dataset && t.dataset.rerender && t.tagName !== "SELECT" && t.type !== "checkbox") render();
 });
 document.addEventListener("keydown", function (e) {
-  if (e.key !== "Enter") return;
+  if (e.key !== "Enter" || e.isComposing) return;
+  var id = e.target.id || "";
+  // Sign-in: Enter on the username moves to the PIN; Enter on the PIN signs in
+  if (id === "lg_url") { e.preventDefault(); var u = $("#lg_user"); if (u) u.focus(); return; }
+  if (id === "lg_user") { e.preventDefault(); if (!String((S.f.lg || {}).pin || "")) { var pn = $("#lg_pin"); if (pn) pn.focus(); } else A.login(); return; }
+  if (id === "lg_pin") { e.preventDefault(); if (!S.busy) A.login(); return; }
+  if (/^cp_/.test(id)) { e.preventDefault(); if (!S.busy) A.firstPin(); return; }
+  if (/^ac_(old|new|new2)$/.test(id)) { e.preventDefault(); if (!S.busy) A.changePin(); return; }
   if (e.target.id === "sc_code") { e.preventDefault(); A.lookup(); }
   if (e.target.id === "ser_manual") { e.preventDefault(); A.addSerial(); }
 });
@@ -1847,8 +1892,11 @@ function seedDemo() {
     });
     navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then(function (reg) { reg.update(); }).catch(function () {});
   }
-  var code = new URLSearchParams(location.search).get("c");
-  if (code) { S.pendingCode = code; history.replaceState(null, "", location.pathname); }
+  var params = new URLSearchParams(location.search);
+  var code = params.get("c"), reset = params.get("reset");
+  if (code) S.pendingCode = code;
+  if (reset === "demo-empty" || reset === "demo-example") S.pendingReset = reset;
+  if (code || reset) history.replaceState(null, "", location.pathname);
   render();
   reload().then(openPendingCode);
 })();

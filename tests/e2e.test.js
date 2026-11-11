@@ -23,10 +23,10 @@ const server = http.createServer((req, res) => {
   await page.getByText("Try it with example data").click();
   // sign in as the demo admin
   await page.fill("#lg_user", "admin"); await page.fill("#lg_pin", "000000");
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page.waitForSelector("text=Wrong username or PIN");
   await page.fill("#lg_user", "Admin"); await page.fill("#lg_pin", "246810");
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page.waitForSelector("text=To kit");
   assert.ok((await page.locator("#who").innerText()).includes("Admin"));
   // codes with dots keep their typed values (bug found with real supplier codes)
@@ -55,7 +55,7 @@ const server = http.createServer((req, res) => {
   await page.waitForSelector("#lg_user");
   assert.ok(await page.locator("#navHome").isHidden(), "on the login page");
   await page.fill("#lg_user", "admin"); await page.fill("#lg_pin", "246810");
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page.waitForSelector("text=To kit");
   assert.ok((await text()).includes("J-1005"));
   await page.screenshot({ path: out + "/1-jobs.png", fullPage: true });
@@ -157,7 +157,7 @@ const server = http.createServer((req, res) => {
     await page.getByRole("button", { name: /My account/ }).click();
     await page.getByRole("button", { name: "Sign out" }).click();
     await page.fill("#lg_user", u); await page.fill("#lg_pin", pin);
-    await page.getByRole("button", { name: "Sign in" }).click();
+    await page.getByRole("button", { name: "Sign in", exact: true }).click();
     await page.locator("nav.tabs").waitFor();
   }
   // admin adds a storeman login; the new person must choose their own PIN
@@ -172,7 +172,7 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: /My account/ }).click();
   await page.getByRole("button", { name: "Sign out" }).click();
   await page.fill("#lg_user", "thabo"); await page.fill("#lg_pin", "5281");
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page.waitForSelector("text=Choose your PIN");
   assert.ok(await page.locator("nav.tabs").isHidden(), "no app until PIN chosen");
   await page.fill("#cp_old", "5281"); await page.fill("#cp_new", "1234"); await page.fill("#cp_new2", "1234");
@@ -294,6 +294,40 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: "Apply 2 line(s)" }).click();
   await page.waitForSelector("text=Imported 2 line(s), 2 new item(s)");
   assert.deepStrictEqual(await page.evaluate(() => [D.Items.length, C.bal(X.B, "WH", "TEST-A1"), X.items["TEST-A1"].uom, X.items["TEST-B2"].cost]), [2, 50, "m", 100]);
+
+  // Enter key signs in; wrong PIN is rejected; reset link clears demo data after confirmation
+  await page.goto("http://localhost:8765/?reset=demo-empty");
+  await page.waitForSelector("text=Clear and start empty?");
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await page.locator("nav.tabs").waitFor();
+  assert.ok((await page.evaluate(() => D.Items.length)) === 2, "cancel leaves data alone");
+  await page.goto("http://localhost:8765/?reset=demo-empty");
+  await page.getByRole("button", { name: "Yes, clear and start empty" }).click();
+  await page.waitForSelector("text=Cleared. Sign in as admin");
+  assert.strictEqual(await page.inputValue("#lg_user"), "admin");
+  assert.ok(!page.url().includes("reset"), "link removed from the address so a refresh doesn't clear again");
+  await page.locator("#lg_pin").fill("111111"); await page.locator("#lg_pin").press("Enter");
+  await page.waitForSelector("text=Wrong username or PIN");
+  await page.locator("#lg_user").fill("ADMIN "); await page.locator("#lg_user").press("Enter");
+  assert.strictEqual(await page.evaluate(() => document.activeElement.id), "lg_pin", "Enter on username moves to PIN when PIN is empty");
+  await page.locator("#lg_pin").fill("246810"); await page.locator("#lg_pin").press("Enter");
+  await page.getByRole("button", { name: "+ New job" }).waitFor();
+  assert.deepStrictEqual(await page.evaluate(() => [D.Items.length, D.Jobs.length, D.Moves.length, D.Vans.length]), [0, 0, 0, 2]);
+  // reset demo logins from the sign-in page
+  await page.evaluate(() => { var u = LS.get("sc_demo_users", null) || demo.users(); u.find(x => x.username === "admin").pin = "999999"; LS.set("sc_demo_users", u); });
+  await page.locator("#navHome").click(); await page.getByRole("button", { name: "Sign out", exact: true }).first().click();
+  await page.locator("#lg_user").fill("admin"); await page.locator("#lg_pin").fill("246810"); await page.locator("#lg_pin").press("Enter");
+  await page.waitForSelector("text=Wrong username or PIN");
+  await page.getByRole("button", { name: "Can't sign in? Reset demo logins" }).click();
+  await page.locator("#lg_pin").fill("246810"); await page.locator("#lg_pin").press("Enter");
+  await page.getByRole("button", { name: "+ New job" }).waitFor();
+  assert.strictEqual(await page.evaluate(() => D.Items.length), 0, "resetting logins kept the data");
+  // example data link
+  await page.goto("http://localhost:8765/?reset=demo-example");
+  await page.getByRole("button", { name: "Yes, load example data" }).click();
+  await page.locator("#lg_pin").fill("246810"); await page.locator("#lg_pin").press("Enter");
+  await page.getByRole("button", { name: "+ New job" }).waitFor();
+  assert.ok((await page.evaluate(() => D.Items.length)) > 5);
 
   // dark mode renders
   await page.emulateMedia({ colorScheme: "dark" });

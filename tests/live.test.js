@@ -62,7 +62,7 @@ assert.ok(seed.ok, seed.error);
   assert.ok(gas.post({ action: "users", token: key, cmd: "save", isNew: true, user: { username: "sipho", name: "Sipho M", role: "storeman" }, pin: "5832" }).ok);
   await page.goto("http://localhost:8766/");
   await page.fill("#lg_user", "sipho"); await page.fill("#lg_pin", "5832");
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page.waitForSelector("text=Choose your PIN");
   await page.fill("#cp_old", "5832"); await page.fill("#cp_new", "7140"); await page.fill("#cp_new2", "7140");
   await page.getByRole("button", { name: "Save my PIN" }).click();
@@ -136,7 +136,7 @@ assert.ok(seed.ok, seed.error);
   await page.getByRole("button", { name: /My account/ }).click();
   await page.getByRole("button", { name: "Sign out" }).click();
   await page.fill("#lg_user", "admin"); await page.fill("#lg_pin", ADMIN_PIN);
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page.waitForSelector("text=+ New job");
   // Correction: reverse the drum receipt partly? Reverse the 3 m return (job closed -> not allowed), reverse a receive instead.
   await page.locator("nav button[data-tab=stock]").click();
