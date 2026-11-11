@@ -19,6 +19,17 @@
 
   var EPS = 1e-9;
 
+  /** Units: "m" metres (default for anything measured by length), "in" inches, "ea" countable units. */
+  var VAT_RATE = 0.15;
+  function isLength(uom) { return uom === "m" || uom === "in"; }
+  function unitOf(text) {
+    var t = String(text || "").trim().toLowerCase();
+    if (!t) return "";
+    if (/^(m|mtr|mtrs|metres?|meters?|lm)$/.test(t)) return "m";
+    if (/^(in|ins|inch|inches|")$/.test(t)) return "in";
+    return "ea";
+  }
+
   function num(v) { var n = Number(v); return isFinite(n) ? n : 0; }
   function round2(n) { return Math.round(num(n) * 100) / 100; }
 
@@ -43,7 +54,7 @@
   /** Kit quantity = quoted + allowance. Cable rounds up to whole metres. */
   function kitDefault(item, quoted) {
     var q = num(quoted);
-    if (!item || item.uom !== "m") return q;
+    if (!item || !isLength(item.uom)) return q;
     var pct = item.allowancePct === "" || item.allowancePct == null ? 10 : num(item.allowancePct);
     // round first: 50 x 1.1 is 55.000000000000007 in computer maths and must not become 56
     return Math.ceil(round2(q * (1 + pct / 100)) - 1e-9);
@@ -217,18 +228,27 @@
     ["name", /desc|name/],
     ["unit", /^(unit|uom|unit of measure|units?)$/]
   ];
-  /** Work out which column is which from a header row. Returns null if it isn't a header. */
+  /**
+   * Work out which column is which from a header row. Returns null if it isn't a header.
+   * A money column labelled "incl" (incl. VAT) is noted, so VAT can be taken off.
+   * If both an excl and an incl column exist, the excl one wins.
+   */
   function mapHeader(cells) {
-    var map = {};
+    var map = {}, incl = {};
     cells.forEach(function (c, i) {
       var t = String(c || "").trim().toLowerCase();
       if (!t) return;
       for (var h = 0; h < HEADERS.length; h++) {
         var key = HEADERS[h][0];
-        if (map[key] === undefined && HEADERS[h][1].test(t)) { map[key] = i; return; }
+        if (!HEADERS[h][1].test(t)) continue;
+        var isIncl = /incl|inc\.? ?vat|vat ?incl/.test(t);
+        if (map[key] === undefined || (incl[key] && !isIncl)) { map[key] = i; incl[key] = isIncl; }
+        return;
       }
     });
-    return map.code !== undefined && map.qty !== undefined ? map : null;
+    if (map.code === undefined || map.qty === undefined) return null;
+    map.inclCost = !!incl.cost; map.inclTotal = !!incl.total;
+    return map;
   }
 
   /**
@@ -264,11 +284,11 @@
       if (seen[sku]) { errors.push("Line " + (i + 1) + ": " + sku + " is listed twice. Combine the lines."); return; }
       seen[sku] = 1;
       var qty = round2(Number(qtyRaw));
-      var costRaw = money(get("cost")), totalRaw = money(get("total")), cost = null;
-      if (totalRaw !== "" && !isNaN(Number(totalRaw)) && qty > 0) cost = round4(Number(totalRaw) / qty);
-      else if (costRaw !== "" && !isNaN(Number(costRaw))) cost = round4(Number(costRaw));
-      var unitText = get("unit");
-      var row = { sku: sku, qty: qty, cost: cost, name: get("name"), uom: /^m(etres?|eters?|tr)?$/i.test(unitText) ? "m" : unitText ? "ea" : "",
+      var costRaw = money(get("cost")), totalRaw = money(get("total")), cost = null, vatRemoved = false;
+      if (totalRaw !== "" && !isNaN(Number(totalRaw)) && qty > 0) { cost = Number(totalRaw) / qty; vatRemoved = !!col.inclTotal; }
+      else if (costRaw !== "" && !isNaN(Number(costRaw))) { cost = Number(costRaw); vatRemoved = !!col.inclCost; }
+      if (cost != null) cost = round4(vatRemoved ? cost / (1 + VAT_RATE) : cost);
+      var row = { sku: sku, qty: qty, cost: cost, name: get("name"), uom: unitOf(get("unit")), vatRemoved: vatRemoved,
         line: i + 1, isNew: !(items && items[sku]), original: raw.trim().toUpperCase() !== sku ? raw.trim() : "" };
       if (row.isNew && !row.name) { errors.push("Line " + (i + 1) + ": " + sku + " is a new item. Add its name (description)."); return; }
       rows.push(row);
@@ -329,7 +349,7 @@
   var Core = {
     balances: balances, bal: bal, kitDefault: kitDefault, jobSummary: jobSummary, closeJob: closeJob,
     newAverageCost: newAverageCost, onHand: onHand, losses: losses, overQuote: overQuote,
-    countMoves: countMoves, countLines: countLines, linesToMoves: linesToMoves, parseImport: parseImport, parseScan: parseScan, normCode: normCode, round4: round4, nextNumber: nextNumber, round2: round2,
+    countMoves: countMoves, countLines: countLines, linesToMoves: linesToMoves, parseImport: parseImport, parseScan: parseScan, normCode: normCode, round4: round4, isLength: isLength, unitOf: unitOf, VAT_RATE: VAT_RATE, nextNumber: nextNumber, round2: round2,
     isRealPlace: isRealPlace, checkBalances: checkBalances
   };
   if (typeof module !== "undefined" && module.exports) module.exports = Core;

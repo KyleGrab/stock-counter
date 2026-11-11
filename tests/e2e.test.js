@@ -259,6 +259,19 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: "Apply 1 line(s)" }).click();
   await page.waitForSelector("text=Imported 1 line(s)");
   assert.deepStrictEqual(await page.evaluate(() => [C.bal(X.B, "WH", "BRK-32A"), X.items["BRK-32A"].cost]), [20, 99], "12 at R95 + 8 at R105 = R99 average");
+  // units: new items default to metres, inches available
+  await page.getByRole("button", { name: "← Manage" }).click();
+  await page.getByRole("button", { name: /^Items/ }).click();
+  assert.strictEqual(await page.inputValue("#it_uom"), "m", "metres by default");
+  assert.deepStrictEqual(await page.locator("#it_uom option").allInnerTexts(), ["Metres (length)", "Inches (length)", "Units (count)"]);
+  await page.fill("#it_sku", "conduit 20mm"); await page.fill("#it_name", "Conduit 20 mm"); await page.selectOption("#it_uom", "in");
+  await page.getByRole("button", { name: "Add item" }).click();
+  await page.waitForSelector("text=Added CONDUIT-20MM");
+  assert.ok((await text()).includes("inches"));
+  await page.locator("nav button[data-tab=scan]").click();
+  await page.fill("#sc_code", "conduit 20mm"); await page.getByRole("button", { name: "Go", exact: true }).click();
+  await page.waitForSelector("text=Quantity (in)");
+  assert.ok((await text()).includes("excl. VAT"));
   // the User can't use inventory, and the admin sees the role choices
   await signInAs("admin", "246810");
   await page.locator("nav button[data-tab=more]").click();

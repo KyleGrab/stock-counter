@@ -131,3 +131,17 @@ console.log("core v1.3: all tests passed");
   assert.strictEqual(C.parseScan("abc box 4x4"), "ABC-BOX-4X4");
   console.log("core v1.5: all tests passed");
 }
+
+// --- v1.6 units and VAT ---
+{
+  assert.deepStrictEqual(["m", "Metres", "mtr", "in", "inches", '"', "ea", "each", ""].map(C.unitOf), ["m", "m", "m", "in", "in", "in", "ea", "ea", ""]);
+  assert.strictEqual(C.kitDefault({ uom: "in", allowancePct: 10 }, 20), 22, "inches get the length allowance too");
+  // price column labelled incl VAT -> 15% taken off; excl column preferred when both exist
+  let r = C.parseImport("Item code,Qty,Price incl VAT\nA1,2,115", {"A1": {}});
+  assert.deepStrictEqual([r.rows[0].cost, r.rows[0].vatRemoved], [100, true]);
+  r = C.parseImport("Item code,Qty,Total Incl VAT,Total Excl VAT\nA1,4,460,400", {"A1": {}});
+  assert.deepStrictEqual([r.rows[0].cost, r.rows[0].vatRemoved], [100, false]);
+  r = C.parseImport("Item code,Qty,Total Ex Vat,Unit\nA1,4,400,inch", {"A1": {}});
+  assert.deepStrictEqual([r.rows[0].cost, r.rows[0].uom, r.rows[0].vatRemoved], [100, "in", false]);
+  console.log("core v1.6: all tests passed");
+}

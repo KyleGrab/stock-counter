@@ -22,7 +22,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.5";
+var APP_VERSION = "1.6";
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit", "Counts"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
@@ -314,7 +314,11 @@ var $ = function (s) { return document.querySelector(s); };
 function esc(v) { return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
 function n(v) { var x = Number(v); return isFinite(x) ? x : 0; }
 function R(v) { var x = Math.round(n(v)); return (x < 0 ? "\u2212R\u00a0" : "R\u00a0") + Math.abs(x).toLocaleString("en-ZA"); }
-function q(v, sku) { var u = X.items[sku] && X.items[sku].uom; var s = (Math.round(n(v) * 100) / 100).toLocaleString("en-ZA", { maximumFractionDigits: 2 }); return u === "m" ? s + " m" : s; }
+var UNIT = { m: { short: "m", long: "metres", per: "metre" }, "in": { short: "in", long: "inches", per: "inch" }, ea: { short: "", long: "units", per: "unit" } };
+function isLen(u) { return u === "m" || u === "in"; }
+function unitOfSku(sku) { var u = X.items[sku] && X.items[sku].uom; return UNIT[u] ? u : "ea"; }
+function q(v, sku) { var u = unitOfSku(sku); var s = (Math.round(n(v) * 100) / 100).toLocaleString("en-ZA", { maximumFractionDigits: 2 }); return u === "ea" ? s : s + "\u00a0" + UNIT[u].short; }
+function unitHint(sku) { var u = unitOfSku(sku); return u === "ea" ? "" : " (" + UNIT[u].short + ")"; }
 function cost(sku) { return n(X.items[sku] && X.items[sku].cost); }
 function nameOf(sku) { return (X.items[sku] && X.items[sku].name) || sku; }
 function vanName(id) { var v = D.Vans.find(function (x) { return x.id === id; }); return v ? v.name : (id || ""); }
@@ -553,7 +557,7 @@ function vJobForm() {
   var lineRows = f.lines.map(function (l, i) {
     return '<div class="row"><label class="f" style="flex:3 1 180px">Item<select id="nl_sku_' + i + '" data-bind="nj.lines.' + i + '.sku">' +
       '<option value="">Choose…</option>' + items.map(function (it) { return '<option value="' + esc(it.sku) + '"' + (it.sku === l.sku ? " selected" : "") + ">" + esc(it.name) + "</option>"; }).join("") +
-      '</select></label><label class="f" style="flex:1 1 90px">Quoted' + (l.sku && X.items[l.sku] && X.items[l.sku].uom === "m" ? " (m)" : "") +
+      '</select></label><label class="f" style="flex:1 1 90px">Quoted' + (l.sku ? unitHint(l.sku) : "") +
       '<input class="num" id="nl_q_' + i + '" type="number" inputmode="decimal" min="0" step="any" value="' + esc(l.quoted) + '" data-bind="nj.lines.' + i + '.quoted"></label>' +
       '<button class="btn ghost small" data-action="delLine" data-i="' + i + '" aria-label="Remove line">✕</button></div>';
   }).join("");
@@ -712,14 +716,14 @@ function vScan() {
     }).join("") + "</div>";
   var sers = (f.serials && f.serials[it.sku]) || [];
   if (mode === "receive") {
-    form += '<div class="row"><label class="f">Quantity' + (it.uom === "m" ? " (m)" : "") + '<input class="num" id="rc_qty" type="number" inputmode="decimal" min="0" step="any" data-bind="qty" value="' + esc(serial ? sers.length || "" : f.qty || "") + '"' + (serial ? " readonly" : "") + "></label>" +
-      '<label class="f">Landed cost per ' + (it.uom === "m" ? "metre" : "unit") + ' (R)<input class="num" id="rc_cost" type="number" inputmode="decimal" min="0" step="any" data-bind="cost" value="' + esc(f.cost != null ? f.cost : (n(it.cost) || "")) + '"></label></div>' +
+    form += '<div class="row"><label class="f">Quantity' + unitHint(it.sku) + '<input class="num" id="rc_qty" type="number" inputmode="decimal" min="0" step="any" data-bind="qty" value="' + esc(serial ? sers.length || "" : f.qty || "") + '"' + (serial ? " readonly" : "") + "></label>" +
+      '<label class="f">Landed cost per ' + UNIT[unitOfSku(it.sku)].per + ' (R, excl. VAT)<input class="num" id="rc_cost" type="number" inputmode="decimal" min="0" step="any" data-bind="cost" value="' + esc(f.cost != null ? f.cost : (n(it.cost) || "")) + '"></label></div>' +
       '<label class="f">Shipment or invoice ref<input id="rc_ref" data-bind="ref" value="' + esc(f.ref || "") + '" placeholder="e.g. Container MSKU 12345"></label>' +
-      '<p class="tiny muted">Landed cost = supplier price + freight + duty + clearing, per unit.</p>' +
+      '<p class="tiny muted">Landed cost = supplier price + freight + duty + clearing, per unit, all excluding VAT (the business claims VAT back).</p>' +
       (serial ? '<div class="serials">' + sers.map(function (s) { return "<span>" + esc(s) + "</span>"; }).join("") + '</div><button class="btn ghost small" data-action="scanSerials" data-sku="' + esc(it.sku) + '" data-need="999">Scan serial numbers (' + sers.length + ")</button>" : "");
   } else if (mode === "extra") {
     var jobs = D.Jobs.filter(function (j) { return j.status === "out" || j.status === "kitted"; });
-    form += '<div class="row"><label class="f">Quantity' + (it.uom === "m" ? " (m)" : "") + '<input class="num" id="ex_qty" type="number" inputmode="decimal" min="0" step="any" data-bind="qty" value="' + esc(f.qty || "") + '"></label>' +
+    form += '<div class="row"><label class="f">Quantity' + unitHint(it.sku) + '<input class="num" id="ex_qty" type="number" inputmode="decimal" min="0" step="any" data-bind="qty" value="' + esc(f.qty || "") + '"></label>' +
       '<label class="f">Job<select id="ex_job" data-bind="job"><option value="">Choose…</option>' + jobs.map(function (j) { return '<option value="' + esc(j.no) + '"' + (j.no === f.job ? " selected" : "") + ">" + esc(j.no) + " · " + esc(j.client) + "</option>"; }).join("") + "</select></label></div>" +
       '<label class="f">Reason (required)<input id="ex_reason" data-bind="reason" value="' + esc(f.reason || "") + '" placeholder="e.g. Longer run to DB board than quoted"></label>';
   } else {
@@ -788,7 +792,7 @@ function vItemHistory(sku) {
       "</div>";
   }).join("");
   return '<div class="row"><button class="btn ghost small" data-action="itemBack">← Stock</button></div>' +
-    '<div><div class="eyebrow">' + esc(sku) + "</div><h2>" + esc(it.name) + '</h2><div class="small muted">Average landed cost ' + R(it.cost) + (it.uom === "m" ? " per metre" : " each") + "</div></div>" +
+    '<div><div class="eyebrow">' + esc(sku) + "</div><h2>" + esc(it.name) + '</h2><div class="small muted">Average landed cost (excl. VAT) ' + R(it.cost) + (isLen(it.uom) ? " per " + UNIT[it.uom].per : " each") + "</div></div>" +
     msgHtml() +
     '<section class="panel"><h3>Where it is now</h3>' + (places.length ? places.map(function (l) { return '<div class="spread"><span>' + esc(placeName(l)) + '</span><span class="mono">' + q(bal(l, sku), sku) + "</span></div>"; }).join("") : '<p class="muted small">None in stock.</p>') + "</section>" +
     '<section class="panel"><h3>Movements</h3><p class="tiny muted">Newest first. Movements are never edited or deleted; mistakes are reversed with a reason, so the record stays complete for an audit.</p>' +
@@ -948,7 +952,7 @@ function vAdjust() {
     (it ? '<p class="small">Now in ' + esc(f.place === "WH" ? "store" : vanName(f.place)) + ': <b class="mono">' + q(bal(f.place, f.sku), f.sku) + "</b></p>" : "") +
     '<div class="row" role="radiogroup" aria-label="Add or remove"><button class="btn small ' + (f.dir === "remove" ? "" : "ghost") + '" role="radio" aria-checked="' + (f.dir === "remove") + '" data-action="adjDir" data-d="remove">− Remove</button>' +
     '<button class="btn small ' + (f.dir === "add" ? "" : "ghost") + '" role="radio" aria-checked="' + (f.dir === "add") + '" data-action="adjDir" data-d="add">+ Add</button></div>' +
-    '<div class="row"><label class="f">Quantity' + (it && it.uom === "m" ? " (m)" : "") + '<input class="num" id="adj_qty" type="number" inputmode="decimal" min="0" step="any" data-bind="adj.qty" value="' + esc(f.qty || "") + '"></label>' +
+    '<div class="row"><label class="f">Quantity' + (it ? unitHint(it.sku) : "") + '<input class="num" id="adj_qty" type="number" inputmode="decimal" min="0" step="any" data-bind="adj.qty" value="' + esc(f.qty || "") + '"></label>' +
     '<label class="f" style="flex:2 1 200px">Reason<select id="adj_reason" data-bind="adj.reason">' + ADJ_REASONS.map(function (r) { return "<option" + (r === f.reason ? " selected" : "") + ">" + r + "</option>"; }).join("") + "</select></label></div>" +
     '<label class="f">Details (required)<input id="adj_note" data-bind="adj.note" value="' + esc(f.note || "") + '" placeholder="e.g. 6 m crushed by forklift, binned"></label>' +
     (it && n(f.qty) > 0 ? '<p class="small">This ' + (f.dir === "remove" ? "removes" : "adds") + " <b>" + q(f.qty, f.sku) + "</b> worth <b>" + R(value) + "</b>." + (f.dir === "remove" ? " It counts as missing stock in the report." : "") + "</p>" : "") +
@@ -968,8 +972,8 @@ function vImport() {
           var sys = r.isNew ? 0 : bal("WH", r.sku), chg = recv ? r.qty : C.round2(r.qty - sys);
           var c = r.cost != null ? r.cost : cost(r.sku);
           total += chg * c;
-          return "<tr><td>" + esc(r.isNew ? r.name : nameOf(r.sku)) + '<div class="tiny muted"><span class="mono">' + esc(r.sku) + "</span>" + (r.isNew ? ' · <span class="pill p-quoted">New' + (r.uom === "m" ? ", metres" : "") + "</span>" : "") + "</div></td>" +
-            (recv ? '<td class="n">' + r.qty + (r.uom === "m" ? "\u00a0m" : "") + '</td><td class="n">' + money2(c) + "</td>" :
+          return "<tr><td>" + esc(r.isNew ? r.name : nameOf(r.sku)) + '<div class="tiny muted"><span class="mono">' + esc(r.sku) + "</span>" + (r.isNew ? ' · <span class="pill p-quoted">New, ' + UNIT[r.uom || "ea"].long + "</span>" : "") + (r.vatRemoved ? ' · <span class="pill p-kitted">VAT removed</span>' : "") + "</div></td>" +
+            (recv ? '<td class="n">' + r.qty + (r.uom && r.uom !== "ea" ? "\u00a0" + UNIT[r.uom].short : "") + '</td><td class="n">' + money2(c) + "</td>" :
               '<td class="n">' + (r.isNew ? "–" : q(sys, r.sku)) + '</td><td class="n">' + r.qty + '</td><td class="n">' + (chg < 0 ? '<span class="pill p-bad">' + chg + "</span>" : chg > 0 ? "+" + chg : "✓") + "</td>") +
             '<td class="n">' + money2(chg * c) + "</td></tr>";
         }).join("") + '</tbody><tfoot><tr><td colspan="' + (recv ? 3 : 4) + '"><b>Total value</b></td><td class="n"><b>' + money2(total) + "</b></td></tr></tfoot></table></div>" +
@@ -988,7 +992,7 @@ function vImport() {
     '<p class="small muted">' + (f.mode === "set" ? "Use for a full stock take done on paper or in Excel. The store quantity becomes the number you give; differences are booked as count adjustments. A cost column, if given, updates the item's landed cost." :
       "Use for day-one opening stock or a big delivery. The quantities are added to the store at the landed cost you give (moving average).") + "</p>" +
     '<p class="tiny muted">Paste from Excel or a supplier invoice <b>with a header row</b> and the columns are found by name: <b>Item code, Quantity</b>, Description, Unit price or Total (excl. VAT), Unit (m or ea). If there\'s a line total, cost = total ÷ quantity, so it matches the invoice to the cent. Without a header, the order is: code, quantity, cost, name, unit.</p>' +
-    '<p class="tiny muted">Supplier codes with spaces or slashes are fine: <span class="mono">ABC BOX 4X4</span> is stored as <span class="mono">ABC-BOX-4X4</span>. New items are created automatically. If the business is VAT-registered, use prices <b>excluding VAT</b>.</p>' +
+    '<p class="tiny muted">Supplier codes with spaces or slashes are fine: <span class="mono">ABC BOX 4X4</span> is stored as <span class="mono">ABC-BOX-4X4</span>. New items are created automatically. Stock is costed <b>excluding VAT</b> (VAT-registered, 15%). If your price or total column is labelled <i>incl VAT</i>, the 15% is taken off automatically and marked in the preview. Units: <b>m</b> metres (default for lengths), <b>in</b> inches, <b>ea</b> units.</p>' +
     '<label class="f">Paste here<textarea id="imp_text" rows="7" class="mono" data-bind="imp.text" placeholder="PV6-RED&#9;450&#9;18.90&#10;MC4&#9;120&#9;28&#10;BRK-32A&#9;12&#9;95&#9;Breaker 32 A&#9;ea">' + esc(f.text || "") + "</textarea></label>" +
     (f.mode === "receive" ? '<label class="f">Supplier and invoice number (required)<input id="imp_ref" data-bind="imp.ref" value="' + esc(f.ref || "") + '" placeholder="e.g. Supplier name INV123456, or Opening stock 1 Dec 2026"></label>' : "") +
     '<button class="btn ghost" data-action="previewImport">Preview</button>' + table + "</section>";
@@ -999,13 +1003,13 @@ function backMore() { return '<div class="row"><button class="btn ghost small" d
 function vItems() {
   var f = S.f.it || (S.f.it = { uom: "m", track: "qty", allowancePct: "10" });
   var list = D.Items.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (i) {
-    return '<button class="card" data-action="editItem" data-sku="' + esc(i.sku) + '"><div><div>' + esc(i.name) + '</div><div class="tiny muted mono">' + esc(i.sku) + " · " + (i.uom === "m" ? "metres" : "units") + (i.track === "serial" ? " · serial" : "") + '</div></div><span class="mono small">' + R(i.cost) + (i.uom === "m" ? "/m" : "") + "</span></button>";
+    return '<button class="card" data-action="editItem" data-sku="' + esc(i.sku) + '"><div><div>' + esc(i.name) + '</div><div class="tiny muted mono">' + esc(i.sku) + " · " + UNIT[unitOfSku(i.sku)].long + (i.track === "serial" ? " · serial" : "") + '</div></div><span class="mono small">' + R(i.cost) + (isLen(i.uom) ? "/" + UNIT[i.uom].short : "") + "</span></button>";
   }).join("");
   return backMore() + "<h2>Items</h2>" +
     '<section class="panel"><h3>' + (f.editing ? "Edit " + esc(f.sku) : "Add an item") + '</h3><div class="row">' +
     '<label class="f">Item code<input class="code" id="it_sku" data-bind="it.sku" value="' + esc(f.sku || "") + '"' + (f.editing ? " readonly" : "") + ' placeholder="PV6-RED"></label>' +
     '<label class="f" style="flex:2 1 200px">Description<input id="it_name" data-bind="it.name" value="' + esc(f.name || "") + '" placeholder="PV cable 6 mm² red"></label></div><div class="row">' +
-    '<label class="f">Counted in<select id="it_uom" data-bind="it.uom"><option value="m"' + (f.uom === "m" ? " selected" : "") + '>Metres</option><option value="ea"' + (f.uom !== "m" ? " selected" : "") + ">Units</option></select></label>" +
+    '<label class="f">Measured in<select id="it_uom" data-bind="it.uom">' + [["m", "Metres (length)"], ["in", "Inches (length)"], ["ea", "Units (count)"]].map(function (o) { return '<option value="' + o[0] + '"' + ((f.uom || "m") === o[0] ? " selected" : "") + ">" + o[1] + "</option>"; }).join("") + "</select></label>" +
     '<label class="f">Tracked by<select id="it_track" data-bind="it.track"><option value="qty">Quantity</option><option value="serial"' + (f.track === "serial" ? " selected" : "") + ">Serial number</option></select></label>" +
     '<label class="f">Order when store has less than<input class="num" id="it_reorder" type="number" min="0" data-bind="it.reorder" value="' + esc(f.reorder || "") + '"></label>' +
     '<label class="f">Cable allowance %<input class="num" id="it_allow" type="number" min="0" data-bind="it.allowancePct" value="' + esc(f.allowancePct == null ? "" : f.allowancePct) + '"></label></div>' +
@@ -1031,7 +1035,7 @@ function vVans() {
   var f = S.f.vn || (S.f.vn = {});
   var kitT = S.f.kt || (S.f.kt = {});
   D.VanKit.forEach(function (k) { if (kitT[k.sku] === undefined) kitT[k.sku] = String(k.target); });
-  var rows = D.Items.filter(function (i) { return i.uom !== "m" && i.track !== "serial"; }).sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (i) {
+  var rows = D.Items.filter(function (i) { return !isLen(i.uom) && i.track !== "serial"; }).sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (i) {
     return "<tr><td>" + esc(i.name) + '</td><td class="n" style="min-width:90px"><input class="num" id="kt_' + esc(i.sku) + '" type="number" min="0" data-bind="kt.' + esc(i.sku) + '" value="' + esc(kitT[i.sku] || "") + '" aria-label="Van target ' + esc(i.name) + '"></td></tr>';
   }).join("");
   return backMore() + "<h2>Vans</h2>" + msgHtml() +
@@ -1304,7 +1308,7 @@ var A = {
     if (!(qty > 0)) return flash("err", mode === "receive" && serial ? "Scan the serial numbers first." : "Enter a quantity above zero.");
     var ops = [], moves = [], label = { label: f.label || "" };
     if (mode === "receive") {
-      if (f.cost == null && !(n(it.cost) > 0) || f.cost === "") return flash("err", "Enter the landed cost per " + (it.uom === "m" ? "metre." : "unit."));
+      if (f.cost == null && !(n(it.cost) > 0) || f.cost === "") return flash("err", "Enter the landed cost per " + UNIT[unitOfSku(it.sku)].per + ", excluding VAT.");
       var c = f.cost == null ? n(it.cost) : n(f.cost);
       var avg = C.newAverageCost(C.onHand(X.B, it.sku), n(it.cost), qty, c);
       if (serial) sers.forEach(function (s) { var m = mv("receive", it.sku, 1, "SUPPLIER", "WH", { unitCost: c, ref: f.ref || "", serial: s }); m.value = c; moves.push(m); });
@@ -1350,7 +1354,7 @@ var A = {
     if (!sku || sku.length > 40) return flash("err", "Give the item a code, up to 40 characters.");
     if (!f.name) return flash("err", "Add a description.");
     if (!f.editing && (X.items[sku] || X.labels[sku] || X.jobs[sku])) return flash("err", "That code is already used.");
-    var row = { sku: sku, name: f.name, uom: f.uom === "m" ? "m" : "ea", track: f.track === "serial" ? "serial" : "qty", reorder: n(f.reorder), allowancePct: f.allowancePct === "" ? "" : n(f.allowancePct) };
+    var row = { sku: sku, name: f.name, uom: UNIT[f.uom] ? f.uom : "m", track: f.track === "serial" ? "serial" : "qty", reorder: n(f.reorder), allowancePct: f.allowancePct === "" ? "" : n(f.allowancePct) };
     if (!f.editing) row.cost = 0;
     save([{ op: "upsert", sheet: "Items", rows: [row] }], (f.editing ? "Saved " : "Added ") + sku + ".", function () { S.f.it = { uom: "m", track: "qty", allowancePct: "10" }; });
   },
@@ -1498,7 +1502,7 @@ var A = {
     var t = now(), itemOps = [], itemsAfter = Object.assign({}, X.items), moves = [];
     rows.forEach(function (r) {
       if (r.isNew) {
-        var ni = { sku: r.sku, name: r.name, uom: r.uom || "ea", track: "qty", cost: r.cost != null ? r.cost : 0, reorder: 0, allowancePct: (r.uom || "ea") === "m" ? 10 : "" };
+        var ni = { sku: r.sku, name: r.name, uom: r.uom || "ea", track: "qty", cost: r.cost != null ? r.cost : 0, reorder: 0, allowancePct: isLen(r.uom) ? 10 : "" };
         itemOps.push(ni); itemsAfter[r.sku] = ni;
       }
     });
@@ -1534,7 +1538,7 @@ var A = {
       var wh = bal("WH", it.sku), vv = 0, jb = 0;
       vanIds.forEach(function (v) { vv += bal(v, it.sku); });
       Object.keys(X.B).forEach(function (l) { if (l.indexOf("JOB:") === 0) jb += bal(l, it.sku); });
-      out.push([it.sku, C.round2(wh), n(it.cost).toFixed(2), it.name, it.uom === "m" ? "m" : "ea", C.round2(vv), C.round2(jb), (C.round2(wh + vv + jb) * n(it.cost)).toFixed(2)].map(cell).join(","));
+      out.push([it.sku, C.round2(wh), n(it.cost).toFixed(2), it.name, UNIT[it.uom] ? it.uom : "ea", C.round2(vv), C.round2(jb), (C.round2(wh + vv + jb) * n(it.cost)).toFixed(2)].map(cell).join(","));
     });
     var blob = new Blob(["\ufeff" + out.join("\r\n")], { type: "text/csv;charset=utf-8" });
     var a = document.createElement("a");
