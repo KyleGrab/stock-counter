@@ -1,12 +1,17 @@
 /**
- * Stock Counter - Google Sheet backend (v1.2).
+ * Stock Counter - Google Sheet backend.
  *
  * Paste this whole file into Extensions > Apps Script of the Google Sheet,
  * run setup() once, then Deploy > New deployment > Web app. See SETUP.md.
  *
  * What this protects:
  *  - Everyone signs in with a username and PIN. PINs are stored hashed, never readable.
- *    5 wrong PINs locks that login for 15 minutes. Sign-ins last 30 days per device.
+ *    PIN hashes are keyed with a secret kept in Script Properties (not in the Sheet), so a
+ *    leaked or downloaded copy of the Sheet can't be used to work out PINs.
+ *    5 wrong PINs locks that login for 15 minutes; 30 wrong PINs across all logins pauses
+ *    new sign-ins for 15 minutes (phones already signed in keep working).
+ *    Sign-ins last 30 days per device. Sign-ins and login changes are written to a private Log tab.
+ *  - Requests are size-limited, so nobody can flood the Sheet with one huge save.
  *  - Roles are enforced HERE, not just in the app:
  *      Senior Admin (admin)          everything, including logins
  *      Warehouse Manager (manager)   everything except logins: inventory, items, costs, corrections
@@ -23,7 +28,7 @@
  *  - Text that looks like a spreadsheet formula is stored as plain text.
  */
 
-var VERSION = "1.4";
+var VERSION = "1.5";
 
 var SHEETS = {
   Items:    { key: "sku",  cols: ["sku", "name", "uom", "track", "cost", "reorder", "allowancePct"] },
@@ -36,13 +41,16 @@ var SHEETS = {
   Counts:   { key: "id",   cols: ["id", "place", "ts", "by", "status", "lines", "value", "note", "decidedBy", "decidedAt", "decisionNote"] },
   // Private: never sent to any phone.
   Users:    { key: "username", cols: ["username", "name", "role", "active", "mustChange", "salt", "pinHash", "created", "lastLogin"], private: true },
-  Sessions: { key: "tokenHash", cols: ["tokenHash", "username", "created", "expires"], private: true }
+  Sessions: { key: "tokenHash", cols: ["tokenHash", "username", "created", "expires"], private: true },
+  Log:      { key: "ts",   cols: ["ts", "username", "event", "detail"], private: true }
 };
 var NUMBERING = { Jobs: { prefix: "J-", pad: 4, first: 1001 }, Labels: { prefix: "GS-", pad: 4, first: 1 }, Vans: { prefix: "VAN-", pad: 0, first: 1 } };
 // admin = Senior Admin, manager = Warehouse Manager, storeman = User, viewer = Viewer (look only)
 var ROLES = ["admin", "manager", "storeman", "viewer"];
 function isManagerRole_(r) { return r === "admin" || r === "manager"; }
-var SESSION_DAYS = 30, MAX_TRIES = 5, LOCK_MINUTES = 15;
+var SESSION_DAYS = 30, MAX_TRIES = 5, LOCK_MINUTES = 15, MAX_TRIES_ALL = 30;
+// Size limits per request: generous for real use (under 100 products, a few vans), tight for abuse.
+var MAX_BODY = 1000000, MAX_OPS = 300, MAX_ROWS = 3000, MAX_TEXT = 2000, LOG_KEEP = 1000;
 
 /* ---------------- setup ---------------- */
 
@@ -72,7 +80,8 @@ function resetAdmin() {
   var pin = randomPin_(6);
   writeUser_({ username: "admin", name: "Admin", role: "admin", active: "yes", mustChange: "yes" }, pin);
   endSessions_("admin");
-  CacheService.getScriptCache().remove("fail_admin");
+  unlock_("admin");
+  log_("admin", "admin reset", "from the script editor");
   Logger.log("Admin reset -> username: admin   PIN: " + pin);
   return pin;
 }
@@ -111,7 +120,8 @@ function setAdminPin_(pin, again) {
   var cur = findUser_("admin");
   writeUser_({ username: "admin", name: cur ? cur.name : "Admin", role: "admin", active: "yes", mustChange: "no", created: cur ? undefined : new Date().toISOString() }, pin);
   endSessions_("admin");
-  CacheService.getScriptCache().remove("fail_admin");
+  unlock_("admin");
+  log_("admin", "admin PIN set", "from the spreadsheet menu");
   return "The 'admin' login now uses the PIN you typed. Sign in on the phone with username admin and that PIN.";
 }
 
@@ -130,6 +140,7 @@ function adminStatus_() {
     "Switched on: " + (u.active === "yes" ? "yes" : "NO (switched off)"),
     "PIN set: " + (u.pinHash ? "yes" : "NO"),
     "Must choose own PIN at next sign-in: " + (u.mustChange === "yes" ? "yes" : "no"),
+    "Wrong PIN tries across all logins just now: " + Number(CacheService.getScriptCache().get("fail_all") || 0) + (Number(CacheService.getScriptCache().get("fail_all") || 0) >= MAX_TRIES_ALL ? " (new sign-ins PAUSED; Set admin PIN… clears it)" : ""),
     "Wrong PIN tries just now: " + tries + (tries >= MAX_TRIES ? " (LOCKED for up to " + LOCK_MINUTES + " minutes; Set admin PIN… unlocks it)" : ""),
     "Signed in on: " + sessions + " device(s)",
     "Last sign-in: " + (u.lastLogin || "never"),
@@ -161,7 +172,10 @@ function doGet() {
 function doPost(e) {
   var out;
   try {
-    var body = JSON.parse(e.postData.contents);
+    var raw = e && e.postData ? String(e.postData.contents || "") : "";
+    if (!raw || raw.length > MAX_BODY) throw new Error("Request too large or empty.");
+    var body = JSON.parse(raw);
+    if (!body || typeof body !== "object") throw new Error("Bad request.");
     var action = body.action || "sync";
     var lock = LockService.getScriptLock();
     lock.waitLock(25000);
@@ -190,6 +204,9 @@ function fail_(msg, signIn) { var e = new Error(msg); e.signIn = !!signIn; retur
 function sync_(body, user) {
   var assigned = {};
   var ops = body.ops || [];
+  if (!Array.isArray(ops) || ops.length > MAX_OPS) throw fail_("Too many changes in one save. Save in smaller parts.");
+  ops.forEach(function (op) { if (op && op.rows && (!Array.isArray(op.rows) || op.rows.length > MAX_ROWS)) throw fail_("Too many rows in one save. Import in smaller parts."); });
+  if (body.batch && String(body.batch).length > 100) throw fail_("Bad request.");
   if (ops.length) {
     var cache = CacheService.getScriptCache();
     var done = body.batch ? cache.get("b_" + body.batch) : null;
@@ -210,6 +227,41 @@ function sync_(body, user) {
 function hash_(text) {
   var bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8);
   return bytes.map(function (b) { var h = ((b + 256) % 256).toString(16); return h.length === 1 ? "0" + h : h; }).join("");
+}
+/** Secret key for PIN hashes. Lives in Script Properties (Project Settings), never in the Sheet. */
+function pepper_() {
+  var p = PropertiesService.getScriptProperties(), v = p.getProperty("PIN_PEPPER");
+  if (!v) { v = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, ""); p.setProperty("PIN_PEPPER", v); }
+  return v;
+}
+function pinHash_(salt, pin) {
+  var bytes = Utilities.computeHmacSha256Signature(salt + ":" + pin, pepper_());
+  return "v2:" + bytes.map(function (b) { var h = ((b + 256) % 256).toString(16); return h.length === 1 ? "0" + h : h; }).join("");
+}
+/** True if the PIN is right. Understands old (v1) hashes so existing logins keep working. */
+function pinMatches_(u, pin) {
+  if (!u || !u.pinHash || !u.salt) return false;
+  var stored = String(u.pinHash);
+  return stored.indexOf("v2:") === 0 ? stored === pinHash_(u.salt, pin) : stored === hash_(u.salt + ":" + pin);
+}
+function unlock_(username) {
+  var c = CacheService.getScriptCache();
+  c.remove("fail_" + cleanName_(username)); c.remove("fail_all");
+}
+/** Private audit trail of sign-ins and login changes. Never sent to phones. Keeps the latest rows only. */
+function log_(username, event, detail) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet(), sh = ss.getSheetByName("Log");
+    if (!sh) {
+      sh = ss.insertSheet("Log");
+      sh.getRange(1, 1, 1, SHEETS.Log.cols.length).setValues([SHEETS.Log.cols]).setFontWeight("bold");
+      sh.setFrozenRows(1);
+      if (sh.hideSheet) sh.hideSheet();
+    }
+    sh.getRange(sh.getLastRow() + 1, 1, 1, 4).setValues([[new Date().toISOString(), safe_(String(username || "").slice(0, 40)), safe_(event), safe_(String(detail || "").slice(0, 200))]]);
+    var extra = sh.getLastRow() - 1 - LOG_KEEP;
+    if (extra > 100) sh.deleteRows(2, extra);
+  } catch (e) { /* the log must never block a sign-in */ }
 }
 function randomPin_(len) {
   var hex = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, ""), pin = "";
@@ -236,7 +288,7 @@ function checkPinRules_(pin, role) {
 function writeUser_(u, pin) {
   var row = { username: cleanName_(u.username) };
   ["name", "role", "active", "mustChange", "created", "lastLogin"].forEach(function (k) { if (u[k] !== undefined) row[k] = u[k]; });
-  if (pin != null) { var salt = Utilities.getUuid(); row.salt = salt; row.pinHash = hash_(salt + ":" + pin); }
+  if (pin != null) { var salt = Utilities.getUuid(); row.salt = salt; row.pinHash = pinHash_(salt, pin); }
   write_({ op: "upsert", sheet: "Users", rows: [row] });
 }
 function endSessions_(username) {
@@ -247,17 +299,24 @@ function endSessions_(username) {
 function endSession_(token) { if (token) write_({ op: "remove", sheet: "Sessions", rows: [{ tokenHash: hash_(String(token)) }] }); }
 
 function login_(body) {
-  var name = cleanName_(body.username), cache = CacheService.getScriptCache(), fk = "fail_" + name;
+  var name = cleanName_(body.username).slice(0, 40), pin = cleanPin_(body.pin).slice(0, 20);
+  var cache = CacheService.getScriptCache(), fk = "fail_" + name;
+  var all = Number(cache.get("fail_all") || 0);
+  if (all >= MAX_TRIES_ALL) { log_(name, "sign-in blocked", "too many wrong PINs on all logins"); throw fail_("Too many wrong sign-ins on this system just now. New sign-ins are paused for " + LOCK_MINUTES + " minutes. Phones already signed in keep working."); }
   var tries = Number(cache.get(fk) || 0);
-  if (tries >= MAX_TRIES) throw fail_("Too many wrong PINs. This login is locked for " + LOCK_MINUTES + " minutes, or an admin can reset the PIN.");
+  if (tries >= MAX_TRIES) { log_(name, "sign-in blocked", "login locked"); throw fail_("Too many wrong PINs. This login is locked for " + LOCK_MINUTES + " minutes, or an admin can reset the PIN."); }
   var u = findUser_(name);
-  var ok = u && u.active === "yes" && u.pinHash === hash_(u.salt + ":" + cleanPin_(body.pin));
+  var ok = u && u.active === "yes" && pinMatches_(u, pin);
   if (!ok) {
     cache.put(fk, String(tries + 1), LOCK_MINUTES * 60);
+    cache.put("fail_all", String(all + 1), LOCK_MINUTES * 60);
+    log_(name, "sign-in failed", !u ? "no such login" : u.active !== "yes" ? "login switched off" : "wrong PIN (" + (tries + 1) + ")");
     var left = MAX_TRIES - tries - 1;
     throw fail_(u && u.active !== "yes" ? "This login has been switched off. Ask an admin." : "Wrong username or PIN." + (left > 0 && left <= 2 ? " " + left + " tries left." : ""));
   }
   cache.remove(fk);
+  if (String(u.pinHash).indexOf("v2:") !== 0) writeUser_({ username: u.username }, pin);   // upgrade an old-style hash
+  log_(u.username, "signed in", "");
   var token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, "");
   var nowD = new Date();
   write_({ op: "insert", sheet: "Sessions", rows: [{ tokenHash: hash_(token), username: u.username, created: nowD.toISOString(),
@@ -282,10 +341,11 @@ function auth_(token, action) {
 
 function changePin_(body, user) {
   var oldPin = cleanPin_(body.oldPin), newPin = cleanPin_(body.newPin);
-  if (user.pinHash !== hash_(user.salt + ":" + oldPin)) throw fail_("Your current PIN is wrong.");
+  if (!pinMatches_(user, oldPin)) { log_(user.username, "PIN change failed", "wrong current PIN"); throw fail_("Your current PIN is wrong."); }
   checkPinRules_(newPin, user.role);
   if (newPin === oldPin) throw fail_("Choose a different PIN from the current one.");
   writeUser_({ username: user.username, mustChange: "no" }, newPin);
+  log_(user.username, "PIN changed", "");
   return { ok: true, user: publicUser_(Object.assign({}, user, { mustChange: "no" })) };
 }
 
@@ -315,6 +375,7 @@ function users_(body, me) {
       writeUser_({ username: name, name: String(u.name).trim(), role: u.role, active: active, mustChange: promoted ? "yes" : undefined }, promoted ? cleanPin_(body.pin) : null);
       if (active === "no" || u.role !== cur.role) endSessions_(name);
     }
+    log_(me.username, cur ? "login changed" : "login created", name + " · " + u.role + (active === "no" ? " · switched off" : ""));
     return { ok: true, users: publicUsers_() };
   }
   if (body.cmd === "resetPin") {
@@ -324,6 +385,7 @@ function users_(body, me) {
     writeUser_({ username: target.username, mustChange: "yes" }, cleanPin_(body.pin));
     endSessions_(target.username);
     CacheService.getScriptCache().remove("fail_" + target.username);
+    log_(me.username, "PIN reset", target.username);
     return { ok: true, users: publicUsers_() };
   }
   throw fail_("Unknown request.");
@@ -545,7 +607,8 @@ function checkBalances_(incoming) {
 function safe_(v) {
   if (v === undefined || v === null) return "";
   var s = String(v);
-  return /^[=+@]/.test(s) || /^-[^0-9.]/.test(s) ? "'" + s : s;
+  if (s.length > MAX_TEXT) s = s.slice(0, MAX_TEXT);
+  return /^[=+@\t\r]/.test(s) || /^-[^0-9.]/.test(s) ? "'" + s : s;
 }
 function toRow_(cols, obj) { return cols.map(function (c) { return safe_(obj[c]); }); }
 

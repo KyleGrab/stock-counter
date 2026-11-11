@@ -16,6 +16,7 @@ function makeGas() {
       getLastRow: () => rows.length,
       setFrozenRows() {},
       deleteRow(r) { rows.splice(r - 1, 1); },
+      deleteRows(r, n) { rows.splice(r - 1, n); },
       getRange(r, c, nr = 1, nc = 1) {
         return {
           setNumberFormat() { return this; },
@@ -46,6 +47,7 @@ function makeGas() {
     Utilities: {
       getUuid: () => crypto.randomUUID(),
       DigestAlgorithm: { SHA_256: "sha256" }, Charset: { UTF_8: "utf8" },
+      computeHmacSha256Signature: (value, key) => Array.from(crypto.createHmac("sha256", String(key)).update(String(value), "utf8").digest()).map(b => (b > 127 ? b - 256 : b)),
       computeDigest: (alg, text) => Array.from(crypto.createHash(alg).update(String(text), "utf8").digest()).map(b => (b > 127 ? b - 256 : b))
     },
     LockService: { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
@@ -58,6 +60,6 @@ function makeGas() {
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "Code.gs"), "utf8"), ctx);
   const adminPin = ctx.setup();
   const post = body => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(body) } }).body);
-  return { ctx, sheets, cache, adminPin, post, get: () => ctx.doGet({ parameter: {} }).body };
+  return { ctx, sheets, props, cache, adminPin, post, get: () => ctx.doGet({ parameter: {} }).body };
 }
 module.exports = { makeGas };

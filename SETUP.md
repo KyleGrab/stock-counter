@@ -11,7 +11,7 @@ A free stock app for the phone. Every metre of cable that leaves the store is ti
 
 | File | What it is | Where it goes |
 |---|---|---|
-| `index.html`, `app.js`, `core.js`, `sw.js`, `manifest.json`, `icon.svg` | The phone app | GitHub (Part A) |
+| `index.html`, `app.js`, `core.js`, `sw.js`, `manifest.json`, `icon.svg`, `vendor/` | The phone app (`vendor/` holds the scanner and QR libraries, kept here so the app loads no code from other websites) | GitHub (Part A) |
 | `Code.gs` | The link to the Google Sheet | Google Apps Script (Part B) |
 | `tests/`, `.github/` | Automatic checks that run on every change | Already on GitHub |
 
@@ -160,6 +160,38 @@ While building and testing, the sign-in page has:
 
 **Before staff use the app:** set `DEV_QUICK_SIGNIN = false` at the top of `app.js` (or ask Claude to remove it). Anyone holding a remembered device could otherwise sign in as that person.
 
+## Security checklist (all free, about 30 minutes, once)
+
+**How the app is already protected (built in):**
+- **No business data on GitHub.** GitHub only holds the app's code. Stock, costs, invoices and logins live only in the Google Sheet. The repository is public, so never commit a Sheet link, PIN, invoice or export to it.
+- **The Sheet checks every request itself**, so a tampered phone can't skip a rule: sign-in required, role checks, no negative stock, movements can't be edited or deleted, and size limits per save.
+- **PINs:** stored as keyed hashes. The key is in Apps Script **Project Settings → Script Properties** (`PIN_PEPPER`), not in the Sheet, so a leaked or downloaded copy of the Sheet doesn't reveal PINs. 5 wrong PINs locks a login for 15 minutes. 30 wrong PINs across all logins pauses new sign-ins for 15 minutes (phones already signed in keep working; **Set admin PIN…** clears it).
+- **Audit log:** a hidden **Log** tab records sign-ins, failed sign-ins, PIN changes and login changes. It is never sent to a phone. Unhide it to look (right-click the tab bar → the tab list).
+- **The app page** has a Content Security Policy: it only runs its own code, only talks to Google Apps Script, and refuses injected scripts. Text people type is always shown as text, never run (tested).
+- **Never delete `PIN_PEPPER`.** If it's lost, every PIN stops working: use **Stock Counter → Set admin PIN…**, then reset everyone else's PIN in **Admin → Logins**. The same applies if you make a copy of the spreadsheet.
+
+**Google (do these on the Google account that owns the Sheet):**
+1. **2-Step Verification on**, ideally with a passkey or the phone prompt (myaccount.google.com → Security). This is the single most important step: whoever controls this Google account controls all the stock data.
+2. Run **Security Checkup** (myaccount.google.com/security-checkup) and fix anything it flags. Remove old devices and third-party apps you don't recognise. Keep the "Stock Counter" script.
+3. **Don't share the Sheet** with staff. Staff use the app; they never need the Sheet. If the owner or bookkeeper must see it, share as **Viewer**, and in **Share → ⚙** untick **Viewers and commenters can see the option to download, print, and copy**.
+4. **Protect the core tabs** from accidental edits: right-click **Moves** → **Protect sheet** → **Only you**. Do the same for **Users**, **Sessions** and **Log**. (The app still writes, because the script runs as you.)
+5. **Deployment:** keep **Execute as: Me** and **Who has access: Anyone**. "Anyone" is required for phones to reach it; the PIN sign-in is what keeps people out. Treat the `/exec` link as private: don't post it anywhere public.
+6. **Backups:** monthly **File → Download → Excel**, stored somewhere private (not GitHub). Version history covers mistakes in between.
+7. Optional, strongest: Google's **Advanced Protection Program** (free, needs two passkeys or security keys) if the owner's account is a likely target.
+
+**GitHub (Settings of the `stock-counter` repository, and your account):**
+1. **2FA on your GitHub account** (Settings → Password and authentication), preferably a passkey or authenticator app. Save the recovery codes offline.
+2. **Settings → Advanced Security** (or "Code security"): turn on **Secret scanning**, **Push protection**, **Dependabot alerts** and **Private vulnerability reporting**. All free on public repositories. Push protection blocks a commit that contains a password or key.
+3. **Settings → Rules → Rulesets → New branch ruleset** for `main`: enable **Restrict deletions** and **Block force pushes**. (Optional: **Require status checks** = the "tests" workflow, so a change that breaks the tests can't go live.)
+4. **Settings → Pages:** **Enforce HTTPS** ticked.
+5. **Settings → Applications** (your account): the Claude GitHub app should have access to **only** the `stock-counter` repository.
+6. Review **Settings → Security log** (your account) now and then for sign-ins you don't recognise.
+
+**Phones:**
+- Screen lock on every phone. Turn off one-tap sign-in before go-live (above). A lost phone: **Admin → Logins → switch that login off** (ends its sign-in at once), then switch back on with a new PIN.
+
+**Firewall?** Not needed and not available for free here: there is no server of yours to put behind one. GitHub Pages and Google Apps Script run on GitHub's and Google's own protected infrastructure. The "firewall" for this app is the Sheet's own checks above (sign-in, roles, wrong-PIN limits, size limits). A Cloudflare web firewall would need your own domain name (a yearly cost) and still couldn't sit in front of Google Apps Script, so it adds little.
+
 ## If something goes wrong
 
 | Problem | Fix |
@@ -172,6 +204,7 @@ While building and testing, the sign-in page has:
 | "Wrong username or PIN" for admin | **Stock Counter → Check admin login**, then **Set admin PIN…** and type the new PIN on the phone (don't copy-paste). |
 | "Changes from another person waiting" | Someone saved work offline and signed out. They must sign in on that phone so the record shows who did it. |
 | "No connection" | No signal. Nothing was saved. Try again when there's signal. |
+| "New sign-ins are paused" | Someone (or something) typed 30 wrong PINs. Wait 15 minutes, or **Stock Counter → Set admin PIN…** to clear it. Then check the hidden **Log** tab to see which usernames were tried. |
 | Changed `Code.gs` later | Paste the new code, **save**, then **Deploy → Manage deployments → ✏ Edit → Version: New version → Deploy.** The link stays the same. The phone only uses the new code after this step. |
 | Wrong number saved | Movements can't be edited (that's the audit trail). Correct it with a count or a return. |
 

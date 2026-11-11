@@ -1,14 +1,13 @@
 /*
  * Lets the app open with no signal.
  * App files: network first, so a new version shows up on the next open; the saved copy is
- * only used when there's no signal. Libraries: saved copy first (they never change).
+ * only used when there's no signal. Fonts: saved copy first (they never change). The scanner libraries live in vendor/.
  * Requests to the Google Sheet are never cached.
  */
-var CACHE = "stock-counter-v9";
+var CACHE = "stock-counter-v10";
 var SHELL = [
   "./", "index.html", "app.js", "core.js", "manifest.json", "icon.svg",
-  "https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js",
-  "https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"
+  "vendor/html5-qrcode.min.js", "vendor/qrcode-generator.js"
 ];
 
 self.addEventListener("install", function (e) {

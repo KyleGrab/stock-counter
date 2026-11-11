@@ -204,3 +204,53 @@ console.log("backend roles: all tests passed");
   assert.ok(post({ action: "login", username: "admin", pin: "640291" }).ok);
   console.log("backend v1.4 admin PIN: all tests passed");
 }
+
+// --- v1.5 sheet: keyed PIN hashes, old-hash upgrade, system-wide limit, size limits, private log ---
+{
+  const { ctx, post, sheets, props, cache } = makeGas();
+  ctx.setAdminPin_("482915", "482915");
+  const users = () => sheets.Users.rows.slice(1);
+  const adminRow = () => users().find(r => r[0] === "admin");
+  const pinHashCol = 6, saltCol = 5;
+  assert.ok(String(adminRow()[pinHashCol]).startsWith("v2:"), "new hashes are keyed (v2)");
+  assert.ok(props.PIN_PEPPER && props.PIN_PEPPER.length >= 32, "the key lives in Script Properties");
+  const everyCell = Object.values(sheets).flatMap(s => s.rows.flat()).map(String);
+  assert.ok(!everyCell.some(c => c.includes(props.PIN_PEPPER)), "the key is never written to the Sheet");
+  // a hash made without the key no longer matches the PIN: a leaked Sheet alone isn't enough
+  const crypto = require("crypto");
+  const unkeyed = crypto.createHash("sha256").update(adminRow()[saltCol] + ":482915").digest("hex");
+  assert.notStrictEqual(adminRow()[pinHashCol], unkeyed);
+  // old v1 hash (from Sheet version 1.4) still signs in, and is upgraded on the way
+  const salt = "old-salt";
+  adminRow()[saltCol] = salt; adminRow()[pinHashCol] = crypto.createHash("sha256").update(salt + ":482915").digest("hex");
+  const r = post({ action: "login", username: "admin", pin: "482915" });
+  assert.ok(r.ok, r.error);
+  assert.ok(String(adminRow()[pinHashCol]).startsWith("v2:"), "old hash upgraded after sign-in");
+  assert.ok(post({ action: "login", username: "admin", pin: "482915" }).ok, "still works after upgrade");
+  const T = r.token;
+  // size limits
+  assert.ok(/too large/.test(post({ token: T, ops: [], pad: "x".repeat(1000001) }).error), "huge request refused");
+  assert.ok(/Too many changes/.test(post({ token: T, ops: Array.from({ length: 301 }, () => ({ op: "upsert", sheet: "Vans", rows: [] })) }).error));
+  assert.ok(/Too many rows/.test(post({ token: T, ops: [{ op: "upsert", sheet: "Items", rows: Array.from({ length: 3001 }, (_, i) => ({ sku: "S" + i })) }] }).error));
+  assert.ok(post({ token: T, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "LONG", name: "n".repeat(5000) }, { sku: "TAB", name: "\t=1+1" }] }] }).ok);
+  const items = post({ token: T }).data.Items;
+  assert.strictEqual(items.find(i => i.sku === "LONG").name.length, 2000, "long text trimmed");
+  assert.ok(items.find(i => i.sku === "TAB").name.startsWith("'"), "tab-formula stored as text");
+  // private log: written, never sent to phones
+  assert.strictEqual(post({ token: T }).data.Log, undefined, "log never sent to the phone");
+  assert.ok(/Unknown tab/.test(post({ token: T, ops: [{ op: "upsert", sheet: "Log", rows: [{ ts: "x" }] }] }).error), "log can't be written from a phone");
+  const events = sheets.Log.rows.slice(1).map(r => r[2]);
+  assert.ok(events.includes("admin PIN set") && events.includes("signed in"));
+  // system-wide limit: many wrong guesses across made-up usernames pause new sign-ins
+  for (let i = 0; i < 30; i++) post({ action: "login", username: "guess" + i, pin: "111222" });
+  assert.ok(/paused/.test(post({ action: "login", username: "admin", pin: "482915" }).error), "new sign-ins paused");
+  assert.ok(post({ token: T }).ok, "phones already signed in keep working");
+  assert.ok(/PAUSED/.test(ctx.adminStatus_()));
+  ctx.setAdminPin_("482915", "482915");
+  assert.ok(post({ action: "login", username: "admin", pin: "482915" }).ok, "Set admin PIN… clears the pause");
+  assert.ok(sheets.Log.rows.slice(1).some(r => r[2] === "sign-in failed" && r[3] === "no such login"));
+  // log trims itself
+  for (let i = 0; i < 1150; i++) ctx.log_("x", "test", "");
+  assert.ok(sheets.Log.rows.length - 1 <= 1101, "log keeps only the latest rows");
+  console.log("backend v1.5 security: all tests passed");
+}

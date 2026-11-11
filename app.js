@@ -23,7 +23,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.10";
+var APP_VERSION = "1.11";
 /*
  * DEV PHASE ONLY. One-tap sign-in buttons. Set to false to remove them everywhere.
  *  - Demo: a button per demo login (demo data stays on the phone).
@@ -1713,8 +1713,10 @@ function printSheet(title, cells, cols) {
     (cols === 1 ? ".c{flex-direction:column;padding:10mm;font-size:16pt}.c img{width:90mm;height:90mm}" : ".c{height:33mm}.c img{width:28mm;height:28mm}") +
     "img{image-rendering:pixelated}b{font-size:1.25em;font-family:monospace}</style></head><body><div class=\"g\">" +
     cells.map(function (c) { return '<div class="c"><img src="' + c.qr + '"><div><b>' + esc(c.title) + "</b><br>" + esc(c.line1) + "<br><small>" + esc(c.line2 || "") + "</small></div></div>"; }).join("") +
-    "</div><script>window.onload=function(){setTimeout(function(){window.print()},300)}<\/script></body></html>";
+    "</div></body></html>";
   w.document.open(); w.document.write(html); w.document.close();
+  // No script inside the print page (the security policy blocks inline scripts); print from here.
+  setTimeout(function () { try { w.focus(); w.print(); } catch (e) {} }, 400);
 }
 
 /* ===================== scanning ===================== */
@@ -1738,7 +1740,12 @@ function startCam(title) {
   $("#camBox").scrollIntoView({ behavior: "smooth", block: "start" });
 }
 function stopCam() {
-  if (cam) { var c = cam; cam = null; c.stop().then(function () { c.clear(); }).catch(function () {}); }
+  if (cam) {
+    var c = cam; cam = null;
+    // stop() throws straight away (not a failed promise) if the camera never started, e.g. permission denied.
+    try { c.stop().then(function () { c.clear(); }).catch(function () {}); }
+    catch (e) { try { c.clear(); } catch (e2) {} }
+  }
   $("#camBox").hidden = true;
 }
 function onScan(text) {
