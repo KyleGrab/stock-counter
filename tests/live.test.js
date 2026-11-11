@@ -15,7 +15,7 @@ const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", c => (body += c));
     req.on("end", () => {
-      const out = req.method === "POST" ? gas.ctx.doPost({ postData: { contents: body } }).body : gas.ctx.doGet({ parameter: {} }).body;
+      const out = req.method === "POST" ? gas.ctx.doPost({ postData: { contents: body } }).body : JSON.stringify({ ok: true });
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(out);
     });
@@ -61,10 +61,10 @@ assert.ok(seed.ok, seed.error);
   // admin creates a storeman login from the office; the storeman signs in on the phone
   assert.ok(gas.post({ action: "users", token: key, cmd: "save", isNew: true, user: { username: "sipho", name: "Sipho M", role: "storeman" }, pin: "5832" }).ok);
   await page.goto("http://localhost:8766/");
-  await page.fill("#lg_user", "sipho"); await page.fill("#lg_pin", "5832");
+  await page.fill("#lg_user", "sipho"); await page.fill("#lg_pin", " 58 32 ");
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page.waitForSelector("text=Choose your PIN");
-  await page.fill("#cp_old", "5832"); await page.fill("#cp_new", "7140"); await page.fill("#cp_new2", "7140");
+  assert.strictEqual(await page.locator("#cp_old").count(), 0); await page.fill("#cp_new", "7140"); await page.fill("#cp_new2", "7140");
   await page.getByRole("button", { name: "Save my PIN" }).click();
   await page.waitForSelector("text=+ New job");
 

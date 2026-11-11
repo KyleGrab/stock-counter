@@ -9,7 +9,7 @@ assert.strictEqual(sheets.Users.rows[1][0], "admin");
 assert.ok(!sheets.Users.rows[1].includes(adminPin), "PIN is never stored in readable form");
 
 const hello = get();
-assert.strictEqual(hello.ok, true); assert.strictEqual(hello.data, undefined, "GET gives no data");
+assert.ok(/connection link/.test(hello) && !/pinHash|salt/.test(hello), "GET shows a friendly page and no data");
 
 assert.strictEqual(post({ action: "sync" }).signIn, true, "no token -> sign in");
 assert.strictEqual(post({ action: "sync", token: "made-up" }).signIn, true);
@@ -181,4 +181,26 @@ console.log("backend roles: all tests passed");
   post({ token: TS2, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "c10", place: "WH", status: "pending", lines: "[]" }] }] });
   assert.ok(post({ token: TM, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "c10", status: "approved" }], expect: { field: "status", values: ["pending"] } }] }).ok, "manager approves a User's count");
   console.log("backend inventory: all tests passed");
+}
+
+// --- v1.4 sheet: admin PIN from the spreadsheet menu, spaces in PINs ---
+{
+  const { ctx, post, cache } = makeGas();
+  assert.ok(/don't match/.test((() => { try { ctx.setAdminPin_("482915", "482916"); } catch (e) { return e.message; } })()));
+  assert.ok(/simple run/.test((() => { try { ctx.setAdminPin_("123456", "123456"); } catch (e) { return e.message; } })()));
+  for (let i = 0; i < 5; i++) post({ action: "login", username: "admin", pin: "000000" });
+  assert.ok(/locked/.test(post({ action: "login", username: "admin", pin: "000000" }).error));
+  assert.ok(/LOCKED/.test(ctx.adminStatus_()));
+  ctx.setAdminPin_(" 482 915", "482915 ");
+  const r1 = post({ action: "login", username: "admin", pin: "482915" });
+  assert.ok(r1.ok, r1.error); assert.strictEqual(r1.user.mustChange, false, "PIN set from the menu needs no temporary step, and lockout is cleared");
+  assert.ok(post({ action: "login", username: "admin", pin: " 482 915 " }).ok, "spaces in a typed PIN are ignored");
+  assert.ok(/Switched on: yes/.test(ctx.adminStatus_()) && /Must choose own PIN at next sign-in: no/.test(ctx.adminStatus_()));
+  // temporary PIN flow still works, with spaces
+  const tmp = ctx.resetAdmin();
+  const r2 = post({ action: "login", username: "admin", pin: tmp + " " });
+  assert.ok(r2.ok && r2.user.mustChange);
+  assert.ok(post({ action: "changePin", token: r2.token, oldPin: " " + tmp, newPin: "640 291" }).ok);
+  assert.ok(post({ action: "login", username: "admin", pin: "640291" }).ok);
+  console.log("backend v1.4 admin PIN: all tests passed");
 }

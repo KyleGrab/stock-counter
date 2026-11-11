@@ -55,8 +55,11 @@ A free stock app for the phone. Every metre of cable that leaves the store is ti
    - Google asks for permission: **Review permissions** → choose the business account.
    - You'll see *"Google hasn't verified this app"*. That's normal for a script you wrote yourself. Click **Advanced** → **Go to Stock Counter (unsafe)** → **Allow**.
    - It only reads and writes this one Sheet.
-5. The **Execution log** at the bottom shows: `First login -> username: admin   PIN: ......`. **Write the PIN down.** It's a temporary PIN; you'll choose your own the first time you sign in.
-   Locked out later? Choose `resetAdmin` in the dropdown and click **Run** to get a new temporary admin PIN.
+5. **Choose the admin PIN (easiest way):** go back to the spreadsheet tab and **reload** it. A new menu **Stock Counter** appears (top, next to Help). Click **Stock Counter → Set admin PIN…**, type a 6-digit PIN of your choice, then type it again. That's your admin PIN; no temporary PIN needed.
+   - The first time, Google asks for permission again (same steps as above).
+   - **Stock Counter → Check admin login** shows whether admin is switched on, locked out, or still needs its own PIN.
+   - Locked out or forgot it later? Just use **Set admin PIN…** again. It also clears a lockout.
+   - (setup also writes a temporary PIN to the Execution log; you can ignore it if you use the menu.)
 6. Click **Deploy** (top right) → **New deployment**.
    - Click the gear ⚙ next to *Select type* → **Web app**.
    - *Description*: `Stock Counter`
@@ -78,8 +81,7 @@ Back in the Sheet you'll see new tabs: Items, Jobs, Lines, Moves, Labels, Vans, 
 
 1. Open the app → **Connect our Google Sheet**.
 2. Paste the **Web app link** (only needed once per device).
-3. Sign in: username `admin`, and the temporary PIN from Part B.
-4. Choose your own 6-digit PIN. Only you should know it.
+3. Sign in: username `admin`, and the PIN you set with **Stock Counter → Set admin PIN…** (Part B, step 5).
 
 The app is now empty and ready for real stock.
 
@@ -157,10 +159,11 @@ Quote accepted → New job → Kit the crate → Van collects → Crate back →
 | "Camera blocked" (iPhone) | **Settings → Safari → Camera → Allow**, then reopen the app. |
 | Serial barcode won't scan (iPhone) | Hold steady, fill the screen with the barcode, or type it in the box. |
 | Forgot my PIN | Ask an admin: **Admin → Logins → Reset PIN**. |
-| Admin locked out | In Apps Script, run `resetAdmin` for a new temporary admin PIN. |
+| Admin locked out or PIN forgotten | In the spreadsheet: **Stock Counter → Set admin PIN…** |
+| "Wrong username or PIN" for admin | **Stock Counter → Check admin login**, then **Set admin PIN…** and type the new PIN on the phone (don't copy-paste). |
 | "Changes from another person waiting" | Someone saved work offline and signed out. They must sign in on that phone so the record shows who did it. |
 | "No connection" | No signal. Nothing was saved. Try again when there's signal. |
-| Changed `Code.gs` later | **Deploy → Manage deployments → ✏ Edit → Version: New version → Deploy.** The link stays the same. |
+| Changed `Code.gs` later | Paste the new code, **save**, then **Deploy → Manage deployments → ✏ Edit → Version: New version → Deploy.** The link stays the same. The phone only uses the new code after this step. |
 | Wrong number saved | Movements can't be edited (that's the audit trail). Correct it with a count or a return. |
 
 **Backups:** the Google Sheet keeps its own history (File → Version history). Download a copy monthly: File → Download → Excel.

@@ -51,12 +51,13 @@ function makeGas() {
     LockService: { getScriptLock: () => ({ waitLock() {}, releaseLock() {} }) },
     Logger: { log() {} },
     ContentService: { MimeType: { JSON: "json" }, createTextOutput: s => ({ setMimeType: () => ({ body: s }) }) },
+    HtmlService: { createHtmlOutput: h => ({ body: h, setTitle() { return this; } }) },
     Date, JSON, Math, Object, String, Number
   };
   vm.createContext(ctx);
   vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "Code.gs"), "utf8"), ctx);
   const adminPin = ctx.setup();
   const post = body => JSON.parse(ctx.doPost({ postData: { contents: JSON.stringify(body) } }).body);
-  return { ctx, sheets, cache, adminPin, post, get: () => JSON.parse(ctx.doGet({ parameter: {} }).body) };
+  return { ctx, sheets, cache, adminPin, post, get: () => ctx.doGet({ parameter: {} }).body };
 }
 module.exports = { makeGas };

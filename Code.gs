@@ -23,7 +23,7 @@
  *  - Text that looks like a spreadsheet formula is stored as plain text.
  */
 
-var VERSION = "1.3";
+var VERSION = "1.4";
 
 var SHEETS = {
   Items:    { key: "sku",  cols: ["sku", "name", "uom", "track", "cost", "reorder", "allowancePct"] },
@@ -63,7 +63,7 @@ function setup() {
   if (rows_("Users", 0).length) { Logger.log("Setup checked. Users already exist."); return null; }
   var pin = randomPin_(6);
   writeUser_({ username: "admin", name: "Admin", role: "admin", active: "yes", mustChange: "yes", created: new Date().toISOString() }, pin);
-  Logger.log("Setup done. First login -> username: admin   PIN: " + pin + "   (you'll be asked to choose your own PIN)");
+  Logger.log("Setup done. First login -> username: admin   PIN: " + pin + "   (you'll be asked to choose your own PIN). Easier: reload the spreadsheet and use the menu Stock Counter -> Set admin PIN… to choose your own.");
   return pin;
 }
 
@@ -77,11 +77,77 @@ function resetAdmin() {
   return pin;
 }
 
+/* ---------------- spreadsheet menu ---------------- */
+
+/** Adds a "Stock Counter" menu to the spreadsheet. Runs by itself when the spreadsheet opens. */
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu("Stock Counter")
+    .addItem("Set admin PIN…", "menuSetAdminPin")
+    .addItem("Check admin login", "menuCheckAdmin")
+    .addToUi();
+}
+
+/** Menu: type a PIN of your choice in a pop-up (twice). No log, nothing to copy. */
+function menuSetAdminPin() {
+  var ui = SpreadsheetApp.getUi();
+  var a = ui.prompt("Set admin PIN", "Type a new PIN for the 'admin' login (6 to 8 digits, not 123456 or all the same digit):", ui.ButtonSet.OK_CANCEL);
+  if (a.getSelectedButton() !== ui.Button.OK) return;
+  var b = ui.prompt("Set admin PIN", "Type the same PIN again:", ui.ButtonSet.OK_CANCEL);
+  if (b.getSelectedButton() !== ui.Button.OK) return;
+  try {
+    var msg = setAdminPin_(a.getResponseText(), b.getResponseText());
+    ui.alert("Done", msg, ui.ButtonSet.OK);
+  } catch (err) {
+    ui.alert("PIN not changed", String(err && err.message || err), ui.ButtonSet.OK);
+  }
+}
+
+/** Sets the admin PIN directly (no temporary PIN), switches the login on, clears any lockout. */
+function setAdminPin_(pin, again) {
+  pin = cleanPin_(pin);
+  if (pin !== cleanPin_(again)) throw fail_("The two PINs don't match. Nothing was changed.");
+  checkPinRules_(pin, "admin");
+  if (!rows_("Users", 0).length && !SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Users")) throw fail_("Run setup first.");
+  var cur = findUser_("admin");
+  writeUser_({ username: "admin", name: cur ? cur.name : "Admin", role: "admin", active: "yes", mustChange: "no", created: cur ? undefined : new Date().toISOString() }, pin);
+  endSessions_("admin");
+  CacheService.getScriptCache().remove("fail_admin");
+  return "The 'admin' login now uses the PIN you typed. Sign in on the phone with username admin and that PIN.";
+}
+
+/** Menu: shows the state of the admin login without revealing anything secret. */
+function menuCheckAdmin() {
+  SpreadsheetApp.getUi().alert("Admin login", adminStatus_(), SpreadsheetApp.getUi().ButtonSet.OK);
+}
+function adminStatus_() {
+  var u = findUser_("admin");
+  if (!u) return "There is no 'admin' login. Use Stock Counter → Set admin PIN… to create it.";
+  var tries = Number(CacheService.getScriptCache().get("fail_admin") || 0);
+  var admins = rows_("Users", 0).filter(function (x) { return x.role === "admin" && x.active === "yes"; }).map(function (x) { return x.username; });
+  var sessions = rows_("Sessions", 0).filter(function (x) { return x.username === "admin" && x.expires > new Date().toISOString(); }).length;
+  return [
+    "Username: admin",
+    "Switched on: " + (u.active === "yes" ? "yes" : "NO (switched off)"),
+    "PIN set: " + (u.pinHash ? "yes" : "NO"),
+    "Must choose own PIN at next sign-in: " + (u.mustChange === "yes" ? "yes" : "no"),
+    "Wrong PIN tries just now: " + tries + (tries >= MAX_TRIES ? " (LOCKED for up to " + LOCK_MINUTES + " minutes; Set admin PIN… unlocks it)" : ""),
+    "Signed in on: " + sessions + " device(s)",
+    "Last sign-in: " + (u.lastLogin || "never"),
+    "Active admin logins: " + admins.join(", ")
+  ].join("\n");
+}
+
 /* ---------------- web endpoints ---------------- */
 
-/** Opening the link in a browser only says hello. No data is ever sent over GET. */
+/** Opening the link in a browser shows a short page. No data is ever sent over GET. */
 function doGet() {
-  return json_({ ok: true, app: "Stock Counter", version: VERSION });
+  return HtmlService.createHtmlOutput(
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<div style="font-family:system-ui,sans-serif;max-width:480px;margin:40px auto;padding:0 16px;line-height:1.5">' +
+    "<h2>Stock Counter connection link</h2>" +
+    "<p>This link connects the Stock Counter app to this Google Sheet. It is working (version " + VERSION + ").</p>" +
+    "<p>Don't open it in a browser to use the app. Instead, open the app and paste this link into <b>Google Sheet web app link</b> on the sign-in page.</p></div>"
+  ).setTitle("Stock Counter connection");
 }
 
 /**
@@ -150,6 +216,7 @@ function randomPin_(len) {
   for (var i = 0; pin.length < len; i++) pin += String(parseInt(hex.charAt(i % hex.length), 16) % 10);
   try { checkPinRules_(pin, "admin"); return pin; } catch (e) { return randomPin_(len); }
 }
+function cleanPin_(p) { return String(p == null ? "" : p).replace(/\s+/g, ""); }
 function cleanName_(u) { return String(u || "").trim().toLowerCase(); }
 function publicUser_(u) { return { username: u.username, name: u.name, role: u.role, mustChange: u.mustChange === "yes" }; }
 function publicUsers_() {
@@ -184,7 +251,7 @@ function login_(body) {
   var tries = Number(cache.get(fk) || 0);
   if (tries >= MAX_TRIES) throw fail_("Too many wrong PINs. This login is locked for " + LOCK_MINUTES + " minutes, or an admin can reset the PIN.");
   var u = findUser_(name);
-  var ok = u && u.active === "yes" && u.pinHash === hash_(u.salt + ":" + String(body.pin || ""));
+  var ok = u && u.active === "yes" && u.pinHash === hash_(u.salt + ":" + cleanPin_(body.pin));
   if (!ok) {
     cache.put(fk, String(tries + 1), LOCK_MINUTES * 60);
     var left = MAX_TRIES - tries - 1;
@@ -214,10 +281,11 @@ function auth_(token, action) {
 }
 
 function changePin_(body, user) {
-  if (user.pinHash !== hash_(user.salt + ":" + String(body.oldPin || ""))) throw fail_("Your current PIN is wrong.");
-  checkPinRules_(String(body.newPin || ""), user.role);
-  if (String(body.newPin) === String(body.oldPin)) throw fail_("Choose a different PIN from the current one.");
-  writeUser_({ username: user.username, mustChange: "no" }, String(body.newPin));
+  var oldPin = cleanPin_(body.oldPin), newPin = cleanPin_(body.newPin);
+  if (user.pinHash !== hash_(user.salt + ":" + oldPin)) throw fail_("Your current PIN is wrong.");
+  checkPinRules_(newPin, user.role);
+  if (newPin === oldPin) throw fail_("Choose a different PIN from the current one.");
+  writeUser_({ username: user.username, mustChange: "no" }, newPin);
   return { ok: true, user: publicUser_(Object.assign({}, user, { mustChange: "no" })) };
 }
 
@@ -239,12 +307,12 @@ function users_(body, me) {
     if (activeAdmins(after) < 1) throw fail_("There must always be at least one active admin.");
     if (name === me.username && (active === "no" || u.role !== "admin")) throw fail_("You can't switch off or demote your own admin login.");
     if (!cur) {
-      checkPinRules_(String(body.pin || ""), u.role);
-      writeUser_({ username: name, name: String(u.name).trim(), role: u.role, active: active, mustChange: "yes", created: new Date().toISOString() }, String(body.pin));
+      checkPinRules_(cleanPin_(body.pin), u.role);
+      writeUser_({ username: name, name: String(u.name).trim(), role: u.role, active: active, mustChange: "yes", created: new Date().toISOString() }, cleanPin_(body.pin));
     } else {
       var promoted = isManagerRole_(u.role) && !isManagerRole_(cur.role);
-      if (promoted) checkPinRules_(String(body.pin || ""), u.role);   // managers and admins need a 6+ digit PIN
-      writeUser_({ username: name, name: String(u.name).trim(), role: u.role, active: active, mustChange: promoted ? "yes" : undefined }, promoted ? String(body.pin) : null);
+      if (promoted) checkPinRules_(cleanPin_(body.pin), u.role);   // managers and admins need a 6+ digit PIN
+      writeUser_({ username: name, name: String(u.name).trim(), role: u.role, active: active, mustChange: promoted ? "yes" : undefined }, promoted ? cleanPin_(body.pin) : null);
       if (active === "no" || u.role !== cur.role) endSessions_(name);
     }
     return { ok: true, users: publicUsers_() };
@@ -252,8 +320,8 @@ function users_(body, me) {
   if (body.cmd === "resetPin") {
     var target = all.filter(function (x) { return x.username === cleanName_(body.username); })[0];
     if (!target) throw fail_("That login no longer exists.");
-    checkPinRules_(String(body.pin || ""), target.role);
-    writeUser_({ username: target.username, mustChange: "yes" }, String(body.pin));
+    checkPinRules_(cleanPin_(body.pin), target.role);
+    writeUser_({ username: target.username, mustChange: "yes" }, cleanPin_(body.pin));
     endSessions_(target.username);
     CacheService.getScriptCache().remove("fail_" + target.username);
     return { ok: true, users: publicUsers_() };

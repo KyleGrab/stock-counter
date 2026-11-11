@@ -23,7 +23,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.8.1";
+var APP_VERSION = "1.9";
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit", "Counts"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
@@ -139,7 +139,7 @@ var demo = {
         var users = self.users(), sessions = LS.get("sc_demo_sessions", {}) || {};
         if (action === "login") {
           var u = users.find(function (x) { return x.username === String(body.username || "").trim().toLowerCase(); });
-          if (!u || u.pin !== String(body.pin)) throw demoErr("Wrong username or PIN.");
+          if (!u || u.pin !== cleanPin(body.pin)) throw demoErr("Wrong username or PIN.");
           if (u.active !== "yes") throw demoErr("This login has been switched off. Ask an admin.");
           var t = uid() + uid();
           sessions[t] = u.username; LS.set("sc_demo_sessions", sessions);
@@ -151,7 +151,7 @@ var demo = {
         if (me.mustChange === "yes" && action !== "changePin" && action !== "logout") throw demoErr("Choose your own PIN first.", true);
         if (action === "logout") { delete sessions[body.token]; LS.set("sc_demo_sessions", sessions); return resolve({ ok: true }); }
         if (action === "changePin") {
-          if (me.pin !== String(body.oldPin)) throw demoErr("Your current PIN is wrong.");
+          if (me.pin !== cleanPin(body.oldPin)) throw demoErr("Your current PIN is wrong.");
           var pp = pinProblem(body.newPin, me.role); if (pp) throw demoErr(pp);
           me.pin = String(body.newPin); me.mustChange = "no"; LS.set("sc_demo_users", users);
           return resolve({ ok: true, user: self.publicUser(me) });
@@ -1204,8 +1204,8 @@ function vLogin() {
 function vChangePinFirst() {
   var f = S.f.cp || (S.f.cp = {});
   return '<section class="panel login"><div class="eyebrow">Welcome, ' + esc(cfg.user.name) + "</div><h2>Choose your PIN</h2>" +
-    '<p class="small">You signed in with a temporary PIN. Choose your own now. Only you should know it.' + (isAdmin() ? " Managers and admins need 6 to 8 digits." : " Use 4 to 8 digits.") + "</p>" +
-    '<label class="f">Temporary PIN<input id="cp_old" type="password" inputmode="numeric" autocomplete="current-password" data-bind="cp.old"></label>' +
+    '<p class="small">You signed in with a temporary PIN. Choose your own now; only you should know it. Write it down somewhere safe the first time.' + (isAdmin() ? " Managers and admins need 6 to 8 digits." : " Use 4 to 8 digits.") + "</p>" +
+    (f.known ? "" : '<label class="f">Temporary PIN<input id="cp_old" type="password" inputmode="numeric" autocomplete="current-password" data-bind="cp.old"></label>') +
     '<label class="f">New PIN<input id="cp_new" type="password" inputmode="numeric" autocomplete="new-password" data-bind="cp.new1"></label>' +
     '<label class="f">New PIN again<input id="cp_new2" type="password" inputmode="numeric" autocomplete="new-password" data-bind="cp.new2"></label>' +
     msgHtml() + '<button class="btn wide" data-action="firstPin"' + (S.busy ? " disabled" : "") + ">Save my PIN</button>" +
@@ -1456,9 +1456,10 @@ var A = {
     if (!username || !f.pin) return flash("err", "Enter your username and PIN.");
     if (Q.length && Q[0].user && Q[0].user !== username) return flash("err", Q.length + " change(s) by " + Q[0].user + " are still waiting to sync on this phone. " + Q[0].user + " must sign in first, so the record shows who did them.");
     S.busy = true; S.msg = null; render();
-    api.call("login", { username: username, pin: String(f.pin) }).then(function (res) {
+    var typedPin = cleanPin(f.pin);
+    api.call("login", { username: username, pin: typedPin }).then(function (res) {
       cfg.token = res.token; cfg.user = res.user; saveCfg();
-      S.f = {}; S.loginMsg = null; S.loading = !res.user.mustChange; S.tab = "jobs";
+      S.f = res.user.mustChange ? { cp: { old: typedPin, known: true } } : {}; S.loginMsg = null; S.loading = !res.user.mustChange; S.tab = "jobs";
       if (!res.user.mustChange) reload().then(openPendingCode);
     }).catch(function (e) {
       if (cfg.mode === "live" && e.net && !SD.Items.length) cfg.url = "";   // first connection failed: let them fix the link
@@ -1647,13 +1648,16 @@ var A = {
   openJobFrom: function (b) { S.tab = "jobs"; S.sub = null; S.item = null; S.job = b.dataset.job; S.f = {}; S.msg = null; render(); window.scrollTo(0, 0); }
 };
 
+function cleanPin(p) { return String(p == null ? "" : p).replace(/\s+/g, ""); }
 function changePinFrom(grp) {
   var f = S.f[grp] || {};
-  if (!f.old) return flash("err", "Enter your current PIN.");
-  var pp = pinProblem(f.new1, role()); if (pp) return flash("err", pp);
-  if (f.new1 !== f.new2) return flash("err", "The two new PINs don't match.");
+  var oldPin = cleanPin(f.old), n1 = cleanPin(f.new1), n2 = cleanPin(f.new2);
+  if (!oldPin) return flash("err", "Enter your current PIN.");
+  var pp = pinProblem(n1, role()); if (pp) return flash("err", pp);
+  if (n1 !== n2) return flash("err", "The two new PINs don't match.");
+  if (n1 === oldPin) return flash("err", "Choose a different PIN from the current one.");
   S.busy = true; S.msg = null; render();
-  api.call("changePin", { oldPin: String(f.old), newPin: String(f.new1) }).then(function (res) {
+  api.call("changePin", { oldPin: oldPin, newPin: n1 }).then(function (res) {
     var first = cfg.user.mustChange;
     cfg.user = res.user; saveCfg(); S.f[grp] = {};
     S.msg = { k: "ok", t: "PIN changed." };

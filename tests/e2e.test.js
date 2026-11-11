@@ -175,7 +175,7 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page.waitForSelector("text=Choose your PIN");
   assert.ok(await page.locator("nav.tabs").isHidden(), "no app until PIN chosen");
-  await page.fill("#cp_old", "5281"); await page.fill("#cp_new", "1234"); await page.fill("#cp_new2", "1234");
+  assert.strictEqual(await page.locator("#cp_old").count(), 0, "temporary PIN not asked twice"); await page.fill("#cp_new", "1234"); await page.fill("#cp_new2", "1234");
   await page.getByRole("button", { name: "Save my PIN" }).click();
   await page.waitForSelector("text=simple run");
   await page.fill("#cp_new", "7319"); await page.fill("#cp_new2", "7319");
