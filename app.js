@@ -23,7 +23,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.8";
+var APP_VERSION = "1.8.1";
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit", "Counts"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
@@ -273,7 +273,12 @@ function post(url, body) {
     .then(function (res) { return res.text(); }, function () { throw netError(); })
     .then(function (t) {
       var j;
-      try { j = JSON.parse(t); } catch (e) { var er = new Error("The Google Sheet didn't answer properly. Check the web app link."); er.net = true; throw er; }
+      try { j = JSON.parse(t); } catch (e) {
+        // An HTML page instead of data usually means Google wants a sign-in: the deployment isn't open to "Anyone".
+        var html = /^\s*</.test(t);
+        var er = new Error(html ? "Google asked for a sign-in instead of answering. In Apps Script: Deploy → Manage deployments → ✏️ Edit → Who has access: Anyone → Version: New version → Deploy." : "The Google Sheet didn't answer properly. Check the web app link.");
+        er.net = true; er.access = html; throw er;
+      }
       if (!j.ok) { var e2 = new Error(j.error || "Refused."); e2.signIn = !!j.signIn; throw e2; }
       return j;
     });
@@ -1458,7 +1463,7 @@ var A = {
     }).catch(function (e) {
       if (cfg.mode === "live" && e.net && !SD.Items.length) cfg.url = "";   // first connection failed: let them fix the link
       S.f.lg.pin = "";
-      S.msg = { k: "err", t: e.net ? "Couldn't reach the Google Sheet. Check the link, that the deployment allows Anyone, and that you have signal." : e.message };
+      S.msg = { k: "err", t: e.access ? e.message : e.net ? "Couldn't reach the Google Sheet. Check: (1) the link ends in /exec, (2) in Apps Script, Deploy → Manage deployments → Who has access is \"Anyone\" (not \"Anyone with Google account\"), (3) you have signal." : e.message };
     }).then(function () { S.busy = false; saveCfg(); render(); });
   },
   firstPin: function () { changePinFrom("cp"); },
