@@ -23,7 +23,14 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.9";
+var APP_VERSION = "1.10";
+/*
+ * DEV PHASE ONLY. One-tap sign-in buttons. Set to false to remove them everywhere.
+ *  - Demo: a button per demo login (demo data stays on the phone).
+ *  - Real Sheet: "Remember me on this device" keeps that person's PIN on THIS device only
+ *    (never in the code or on GitHub), then shows a one-tap sign-in button.
+ */
+var DEV_QUICK_SIGNIN = true;
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit", "Counts"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
@@ -483,7 +490,7 @@ function updateToolbar(ready) {
   $("#navFwd").disabled = NAV.idx >= NAV.max;
   $("#navHome").hidden = !(cfg.token && cfg.user);
   if (!(cfg.token && cfg.user)) $("#homeConfirm").hidden = true;
-  $("#ver").textContent = "v" + APP_VERSION;
+  $("#ver").textContent = "v" + APP_VERSION + (DEV_QUICK_SIGNIN ? " · DEV" : "");
 }
 
 function render() {
@@ -1164,6 +1171,7 @@ function vAccount() {
   return backMore() + "<h2>My account</h2>" + msgHtml() +
     '<section class="panel"><div class="spread"><div><h3>' + esc(u.name) + '</h3><div class="small muted"><span class="mono">' + esc(u.username) + "</span> · " + ROLE_LABEL[u.role] + "</div></div>" +
     '<button class="btn ghost small" data-action="logout">Sign out</button></div>' +
+    (quickSaved() ? '<div class="msg info small">Quick sign-in (dev) is on for this device. <button class="linkbtn" data-action="quickOff">Turn it off</button></div>' : "") +
     (S.f.confirmLogout ? '<div class="msg warn">' + Q.length + " change(s) haven't reached the Sheet yet. They'll be sent next time <b>you</b> sign in on this phone. Tap Sign out again to continue.</div>" : "") + "</section>" +
     '<section class="panel"><h3>Change my PIN</h3><div class="row">' +
     '<label class="f">Current PIN<input id="ac_old" type="password" inputmode="numeric" autocomplete="current-password" data-bind="ac.old"></label>' +
@@ -1185,6 +1193,19 @@ function vAccount() {
 }
 
 /* ---- Sign in ---- */
+function quickButtons() {
+  if (!DEV_QUICK_SIGNIN) return "";
+  if (cfg.mode === "demo") {
+    return '<div class="quick"><div class="eyebrow">Dev: one-tap sign-in (demo)</div><div class="row">' + DEMO_USERS.map(function (u) {
+      return '<button class="btn ghost small" data-action="quickLogin" data-u="' + esc(u.username) + '" data-p="' + esc(u.pin) + '"' + (S.busy ? " disabled" : "") + ">⚡ " + esc(ROLE_LABEL[u.role]) + "</button>";
+    }).join("") + "</div></div>";
+  }
+  var qs = quickSaved();
+  if (!qs) return "";
+  return '<div class="quick"><div class="eyebrow">Dev: one-tap sign-in (this device only)</div>' +
+    '<button class="btn wide" data-action="quickLogin"' + (S.busy ? " disabled" : "") + ">⚡ Sign in as " + esc(qs.name || qs.username) + "</button>" +
+    '<button class="linkbtn small muted" data-action="quickOff">Turn off quick sign-in on this device</button></div>';
+}
 function vLogin() {
   var f = S.f.lg || (S.f.lg = { url: cfg.url || "" });
   var needUrl = cfg.mode === "live" && !cfg.url;
@@ -1193,7 +1214,8 @@ function vLogin() {
     (needUrl ? '<label class="f">Google Sheet web app link<input id="lg_url" data-bind="lg.url" value="' + esc(f.url) + '" placeholder="https://script.google.com/macros/s/…/exec"></label><p class="tiny muted">From Part B of the setup guide. Only needed once on this device.</p>' : "") +
     '<label class="f">Username<input id="lg_user" autocapitalize="off" autocomplete="username" spellcheck="false" data-bind="lg.username" value="' + esc(f.username || "") + '"></label>' +
     '<label class="f">PIN<input id="lg_pin" type="password" inputmode="numeric" autocomplete="current-password" data-bind="lg.pin" value="' + esc(f.pin || "") + '"></label>' +
-    msgHtml() + '<button class="btn wide" data-action="login"' + (S.busy ? " disabled" : "") + ">Sign in</button>" +
+    (DEV_QUICK_SIGNIN && cfg.mode === "live" ? '<label class="chk"><input type="checkbox" id="lg_remember" data-bind="lg.remember"' + (f.remember ? " checked" : "") + "> Remember me on this device for one-tap sign-in (dev phase)</label>" : "") +
+    msgHtml() + '<button class="btn wide" data-action="login"' + (S.busy ? " disabled" : "") + ">Sign in</button>" + quickButtons() +
     (Q.length && Q[0].user ? '<p class="tiny muted">' + Q.length + " change(s) from <b>" + esc(Q[0].user) + "</b> are waiting on this phone. They'll sync when " + esc(Q[0].user) + " signs in.</p>" : "") +
     (cfg.mode === "demo" ? '<div class="msg info small">Demo logins (any of these):<br><span class="mono">admin</span> PIN <span class="mono">246810</span> (Senior Admin)<br><span class="mono">lebo</span> PIN <span class="mono">580214</span> (Warehouse Manager)<br><span class="mono">sipho</span> PIN <span class="mono">1357</span> (User)<br><span class="mono">owner</span> PIN <span class="mono">8642</span> (Viewer)</div>' : "") +
     (cfg.mode === "demo" ? '<button class="linkbtn small muted" data-action="resetDemoLogins">Can\'t sign in? Reset demo logins</button>' : "") +
@@ -1446,6 +1468,13 @@ var A = {
     if (Q.length) return flash("err", Q.length + " change(s) are still waiting to reach the current Sheet. Let them sync first.");
     switchMode("live"); cfg.url = ""; saveCfg(); S.f = {}; S.msg = null; render();
   },
+  quickLogin: function (b) {
+    var u = b.dataset.u, pin = b.dataset.p;
+    if (cfg.mode === "live") { var qs = quickSaved(); if (!qs) return render(); u = qs.username; pin = qs.pin; }
+    S.f.lg = { username: u, pin: pin, quick: true, remember: cfg.mode === "live" };
+    A.login();
+  },
+  quickOff: function () { quickForget(); S.msg = { k: "ok", t: "Quick sign-in turned off on this device." }; render(); },
   login: function () {
     var f = S.f.lg || {}, username = String(f.username || "").trim().toLowerCase();
     if (cfg.mode === "live" && !cfg.url) {
@@ -1459,10 +1488,12 @@ var A = {
     var typedPin = cleanPin(f.pin);
     api.call("login", { username: username, pin: typedPin }).then(function (res) {
       cfg.token = res.token; cfg.user = res.user; saveCfg();
+      if (DEV_QUICK_SIGNIN && cfg.mode === "live" && f.remember) LS.set("sc_quick", { url: cfg.url, username: res.user.username, name: res.user.name, pin: typedPin });
       S.f = res.user.mustChange ? { cp: { old: typedPin, known: true } } : {}; S.loginMsg = null; S.loading = !res.user.mustChange; S.tab = "jobs";
       if (!res.user.mustChange) reload().then(openPendingCode);
     }).catch(function (e) {
       if (cfg.mode === "live" && e.net && !SD.Items.length) cfg.url = "";   // first connection failed: let them fix the link
+      if (f.quick && !e.net) { quickForget(); e.message = "Quick sign-in failed (the PIN was probably changed), so it's been turned off. Sign in normally and tick Remember me again."; }
       S.f.lg.pin = "";
       S.msg = { k: "err", t: e.access ? e.message : e.net ? "Couldn't reach the Google Sheet. Check: (1) the link ends in /exec, (2) in Apps Script, Deploy → Manage deployments → Who has access is \"Anyone\" (not \"Anyone with Google account\"), (3) you have signal." : e.message };
     }).then(function () { S.busy = false; saveCfg(); render(); });
@@ -1648,6 +1679,12 @@ var A = {
   openJobFrom: function (b) { S.tab = "jobs"; S.sub = null; S.item = null; S.job = b.dataset.job; S.f = {}; S.msg = null; render(); window.scrollTo(0, 0); }
 };
 
+function quickSaved() {
+  if (!DEV_QUICK_SIGNIN || cfg.mode !== "live") return null;
+  var q2 = LS.get("sc_quick", null);
+  return q2 && q2.url === cfg.url && q2.username && q2.pin ? q2 : null;
+}
+function quickForget() { LS.set("sc_quick", null); }
 function cleanPin(p) { return String(p == null ? "" : p).replace(/\s+/g, ""); }
 function changePinFrom(grp) {
   var f = S.f[grp] || {};
@@ -1660,6 +1697,8 @@ function changePinFrom(grp) {
   api.call("changePin", { oldPin: oldPin, newPin: n1 }).then(function (res) {
     var first = cfg.user.mustChange;
     cfg.user = res.user; saveCfg(); S.f[grp] = {};
+    var qs = LS.get("sc_quick", null);
+    if (qs && qs.url === cfg.url && qs.username === cfg.user.username) { qs.pin = n1; LS.set("sc_quick", qs); }
     S.msg = { k: "ok", t: "PIN changed." };
     if (first) { S.loading = true; reload().then(openPendingCode); }
   }).catch(function (e) { S.msg = { k: "err", t: e.net ? "Changing your PIN needs signal." : e.message }; })

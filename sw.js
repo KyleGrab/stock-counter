@@ -4,7 +4,7 @@
  * only used when there's no signal. Libraries: saved copy first (they never change).
  * Requests to the Google Sheet are never cached.
  */
-var CACHE = "stock-counter-v8";
+var CACHE = "stock-counter-v9";
 var SHELL = [
   "./", "index.html", "app.js", "core.js", "manifest.json", "icon.svg",
   "https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js",

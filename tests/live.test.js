@@ -168,6 +168,23 @@ assert.ok(seed.ok, seed.error);
   await page.waitForFunction(() => document.getElementById("statusText").textContent.startsWith("Up to date"));
   assert.ok(movesSent > 0, "phone only asks for movements it doesn't have");
 
+  // dev quick sign-in on the real Sheet: remember me -> one tap; PIN change keeps it working; wrong PIN turns it off
+  await page.locator("#navHome").click(); await page.getByRole("button", { name: "Sign out", exact: true }).first().click();
+  assert.strictEqual(await page.getByRole("button", { name: /Sign in as/ }).count(), 0, "no quick button until remembered");
+  await page.fill("#lg_user", "admin"); await page.fill("#lg_pin", ADMIN_PIN); await page.check("#lg_remember");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.getByRole("button", { name: "+ New job" }).waitFor();
+  await page.locator("#navHome").click(); await page.getByRole("button", { name: "Sign out", exact: true }).first().click();
+  await page.getByRole("button", { name: /⚡ Sign in as Admin/ }).click();
+  await page.getByRole("button", { name: "+ New job" }).waitFor();
+  // PIN changed elsewhere -> quick sign-in fails once and switches itself off
+  gas.ctx.setAdminPin_("731946", "731946");
+  await page.reload(); await page.waitForSelector("#lg_user");
+  await page.getByRole("button", { name: /⚡ Sign in as Admin/ }).click();
+  await page.waitForSelector("text=Quick sign-in failed");
+  assert.strictEqual(await page.getByRole("button", { name: /Sign in as/ }).count(), 0);
+  assert.ok(!(await page.evaluate(() => JSON.stringify(localStorage))).includes(ADMIN_PIN), "old PIN removed from the device");
+
   assert.deepStrictEqual(errors, [], "no script errors, no key in URLs");
   console.log("live: all checks passed");
   await browser.close(); server.close();

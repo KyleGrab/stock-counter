@@ -329,6 +329,16 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: "+ New job" }).waitFor();
   assert.ok((await page.evaluate(() => D.Items.length)) > 5);
 
+  // dev one-tap sign-in (demo): a button per role
+  await page.locator("#navHome").click(); await page.getByRole("button", { name: "Sign out", exact: true }).first().click();
+  await page.getByRole("button", { name: "⚡ Warehouse Manager" }).click();
+  await page.getByRole("button", { name: "+ New job" }).waitFor();
+  assert.ok((await page.locator("#who").innerText()).includes("Warehouse Manager"));
+  assert.ok((await page.locator("#ver").innerText()).includes("DEV"));
+  await page.locator("#navHome").click(); await page.getByRole("button", { name: "Sign out", exact: true }).first().click();
+  await page.getByRole("button", { name: "⚡ Senior Admin" }).click();
+  await page.getByRole("button", { name: "+ New job" }).waitFor();
+
   // dark mode renders
   await page.emulateMedia({ colorScheme: "dark" });
   await page.locator("nav button[data-tab=jobs]").click();

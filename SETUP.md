@@ -151,6 +151,15 @@ Quote accepted → New job → Kit the crate → Van collects → Crate back →
 
 ---
 
+## Dev phase: one-tap sign-in (remove before go-live)
+
+While building and testing, the sign-in page has:
+- **Demo:** ⚡ buttons for each role (Senior Admin, Warehouse Manager, User, Viewer).
+- **Real Sheet:** tick **Remember me on this device** once; afterwards **⚡ Sign in as …** signs in with one tap. The PIN is kept only on that device, never in the code. Turn it off in **My account**, or it switches itself off if the PIN changes.
+- The version shows **DEV** while this is on.
+
+**Before staff use the app:** set `DEV_QUICK_SIGNIN = false` at the top of `app.js` (or ask Claude to remove it). Anyone holding a remembered device could otherwise sign in as that person.
+
 ## If something goes wrong
 
 | Problem | Fix |
