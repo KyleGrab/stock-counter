@@ -22,7 +22,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.6";
+var APP_VERSION = "1.7";
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit", "Counts"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
@@ -496,6 +496,9 @@ function render() {
   });
   if (!canWork() && (S.tab === "scan" || S.tab === "counts")) S.tab = "jobs";
   $("#demoBar").hidden = cfg.mode !== "demo";
+  if (cfg.mode === "demo") $("#demoBar").innerHTML = demoKind() === "empty"
+    ? "Test mode: your own data, saved only on this phone. When you're ready, a Senior Admin connects the real Google Sheet in <b>Admin → My account</b>."
+    : "Demo mode: made-up example stock and jobs, saved only on this phone. A Senior Admin can <b>Start empty</b> or connect the real Google Sheet in <b>Admin → My account</b>.";
   syncStatus();
   var v = $("#view");
   var html;
@@ -993,6 +996,8 @@ function vImport() {
       "Use for day-one opening stock or a big delivery. The quantities are added to the store at the landed cost you give (moving average).") + "</p>" +
     '<p class="tiny muted">Paste from Excel or a supplier invoice <b>with a header row</b> and the columns are found by name: <b>Item code, Quantity</b>, Description, Unit price or Total (excl. VAT), Unit (m or ea). If there\'s a line total, cost = total ÷ quantity, so it matches the invoice to the cent. Without a header, the order is: code, quantity, cost, name, unit.</p>' +
     '<p class="tiny muted">Supplier codes with spaces or slashes are fine: <span class="mono">ABC BOX 4X4</span> is stored as <span class="mono">ABC-BOX-4X4</span>. New items are created automatically. Stock is costed <b>excluding VAT</b> (VAT-registered, 15%). If your price or total column is labelled <i>incl VAT</i>, the 15% is taken off automatically and marked in the preview. Units: <b>m</b> metres (default for lengths), <b>in</b> inches, <b>ea</b> units.</p>' +
+    '<div class="row"><label class="btn ghost small filebtn">Choose file (CSV or text)<input type="file" id="imp_file" accept=".csv,.tsv,.txt,text/csv,text/plain" hidden></label>' +
+    '<span class="tiny muted">or paste the lines below</span></div>' +
     '<label class="f">Paste here<textarea id="imp_text" rows="7" class="mono" data-bind="imp.text" placeholder="PV6-RED&#9;450&#9;18.90&#10;MC4&#9;120&#9;28&#10;BRK-32A&#9;12&#9;95&#9;Breaker 32 A&#9;ea">' + esc(f.text || "") + "</textarea></label>" +
     (f.mode === "receive" ? '<label class="f">Supplier and invoice number (required)<input id="imp_ref" data-bind="imp.ref" value="' + esc(f.ref || "") + '" placeholder="e.g. Supplier name INV123456, or Opening stock 1 Dec 2026"></label>' : "") +
     '<button class="btn ghost" data-action="previewImport">Preview</button>' + table + "</section>";
@@ -1137,7 +1142,12 @@ function vAccount() {
       '<label class="f">Google Sheet web app link<input id="ac_url" data-bind="ac.url" value="' + esc(f.url || "") + '" placeholder="https://script.google.com/macros/s/…/exec"></label>' +
       '<label class="f">This app\'s web address (for stickers)<input id="ac_site" data-bind="ac.site" value="' + esc(f.site || "") + '" placeholder="' + esc(location.origin + location.pathname) + '"></label>' +
       '<button class="btn ghost" data-action="saveConnection">Save connection</button><p class="tiny muted">Changing the Sheet link signs you out, so you can sign in to the new Sheet.</p></section>' : "") +
-    (cfg.mode === "demo" ? '<section class="panel"><h3>Demo</h3><div class="row"><button class="btn ghost" data-action="resetDemo">Reset demo data</button><button class="btn ghost" data-action="goLive">Connect our Google Sheet</button></div></section>' : "");
+    (cfg.mode === "demo" ? '<section class="panel"><h3>Data on this phone</h3>' +
+      '<p class="small muted">' + (demoKind() === "empty" ? "You're using your own test data, kept only on this phone." : "You're using made-up example data.") + "</p>" +
+      (isAdmin() ? '<div class="row"><button class="btn ghost" data-action="emptyDemo">' + (S.f.confirmEmpty ? "Tap again: delete all stock, items, jobs, stickers and counts" : "Start empty") + "</button>" +
+        '<button class="btn ghost" data-action="resetDemo">Load example data</button></div>' +
+        '<p class="tiny muted"><b>Start empty</b> deletes all stock, items, jobs, stickers and counts on this phone. Logins and vans are kept. Then add your stock under Inventory → Import / export.</p>' : "") +
+      '<button class="btn ghost" data-action="goLive">Connect our Google Sheet</button></section>' : "");
 }
 
 /* ---- Sign in ---- */
@@ -1442,7 +1452,19 @@ var A = {
     }
     flash("ok", "Saved.");
   },
+  emptyDemo: function () {
+    if (!isAdmin()) return flash("err", "Only a Senior Admin can clear the data.");
+    if (!S.f.confirmEmpty) { S.f.confirmEmpty = true; return render(); }
+    var d = LS.get("sc_demo", null) || seedDemo();
+    var empty = { Items: [], Jobs: [], Lines: [], Moves: [], Labels: [], Vans: d.Vans || [], VanKit: [], Counts: [] };
+    LS.set("sc_demo", empty); LS.set("sc_demo_batches", null); LS.set("sc_demo_kind", "empty");
+    SD = emptyData(); Q = []; persist(); rebuild();
+    S.f = {}; S.loading = true; render();
+    fullReload().then(function () { S.tab = "more"; S.sub = "inventory"; S.f = { invTab: "io", imp: { mode: "receive", text: "" } };
+      S.msg = { k: "ok", t: "All stock, items, jobs, stickers and counts cleared. Add your stock below: choose the file or paste the lines, add the supplier and invoice number, then Preview." }; render(); window.scrollTo(0, 0); });
+  },
   resetDemo: function () {
+    LS.set("sc_demo_kind", null);
     LS.set("sc_demo", null); LS.set("sc_demo_batches", null); LS.set("sc_demo_users", null); LS.set("sc_demo_sessions", null);
     switchMode("demo"); S.f = {}; S.loginMsg = "Demo data reset. Sign in with one of the demo logins."; render();
   },
@@ -1704,6 +1726,20 @@ document.addEventListener("input", function (e) {
 });
 document.addEventListener("change", function (e) {
   var t = e.target;
+  if (t.id === "imp_file" && t.files && t.files[0]) {
+    var file = t.files[0];
+    if (file.size > 2e6) { t.value = ""; return flash("err", "That file is too big. Save just the stock lines as a CSV."); }
+    var rd = new FileReader();
+    rd.onload = function () {
+      S.f.imp.text = String(rd.result || "").replace(/^\ufeff/, "");
+      if (!S.f.imp.ref && /INV\w+/i.test(file.name)) S.f.imp.ref = file.name.replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ");
+      A.previewImport();
+    };
+    rd.onerror = function () { flash("err", "Couldn't read that file."); };
+    rd.readAsText(file);
+    t.value = "";
+    return;
+  }
   if (t.dataset && t.dataset.rerender && t.tagName !== "SELECT" && t.type !== "checkbox") render();
 });
 document.addEventListener("keydown", function (e) {
@@ -1714,6 +1750,7 @@ document.addEventListener("keydown", function (e) {
 document.addEventListener("visibilitychange", function () { if (document.visibilityState === "visible" && cfg.mode === "live" && !S.busy) pull(); });
 
 /* ===================== demo data ===================== */
+function demoKind() { return LS.get("sc_demo_kind", null) === "empty" ? "empty" : "example"; }
 function seedDemo() {
   var d = { Items: [], Jobs: [], Lines: [], Moves: [], Labels: [], Vans: [], VanKit: [], Counts: [] };
   function ago(days, h) { var t = new Date(Date.now() - days * 864e5); t.setHours(h || 8, 0, 0, 0); return t.toISOString(); }

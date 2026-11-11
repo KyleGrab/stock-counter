@@ -279,6 +279,22 @@ const server = http.createServer((req, res) => {
   const opts = await page.locator("#us_role option").allInnerTexts();
   assert.deepStrictEqual(opts, ["User", "Warehouse Manager", "Senior Admin", "Viewer"]);
 
+  // Start empty + choose file (made-up data)
+  await page.locator("nav button[data-tab=more]").click();
+  await page.getByRole("button", { name: /My account/ }).click();
+  await page.getByRole("button", { name: "Start empty" }).click();
+  await page.getByRole("button", { name: /Tap again/ }).click();
+  await page.waitForSelector("text=All stock, items, jobs, stickers and counts cleared");
+  assert.deepStrictEqual(await page.evaluate(() => [D.Items.length, D.Jobs.length, D.Moves.length, D.Labels.length, D.Counts.length, D.Vans.length]), [0, 0, 0, 0, 0, 2]);
+  const tmp = require("os").tmpdir() + "/Test-Supplier-INV100.csv";
+  fs.writeFileSync(tmp, "\ufeffItem code,Description,Quantity,Total Ex Vat,Unit\nTEST A1,Test cable,50,500.00,m\nTEST B2,Test breaker,4,400.00,ea\n");
+  await page.setInputFiles("#imp_file", tmp);
+  await page.waitForSelector("text=Total value");
+  assert.strictEqual(await page.inputValue("#imp_ref"), "Test Supplier INV100");
+  await page.getByRole("button", { name: "Apply 2 line(s)" }).click();
+  await page.waitForSelector("text=Imported 2 line(s), 2 new item(s)");
+  assert.deepStrictEqual(await page.evaluate(() => [D.Items.length, C.bal(X.B, "WH", "TEST-A1"), X.items["TEST-A1"].uom, X.items["TEST-B2"].cost]), [2, 50, "m", 100]);
+
   // dark mode renders
   await page.emulateMedia({ colorScheme: "dark" });
   await page.locator("nav button[data-tab=jobs]").click();
