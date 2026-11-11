@@ -1,9 +1,10 @@
 /*
- * Lets the app open with no signal. App files and the two scanner/QR libraries are kept on the phone.
- * Each time the app opens with signal, the newest files are fetched in the background and used on
- * the next open. Requests to the Google Sheet are never cached.
+ * Lets the app open with no signal.
+ * App files: network first, so a new version shows up on the next open; the saved copy is
+ * only used when there's no signal. Libraries: saved copy first (they never change).
+ * Requests to the Google Sheet are never cached.
  */
-var CACHE = "stock-counter-v1";
+var CACHE = "stock-counter-v2";
 var SHELL = [
   "./", "index.html", "app.js", "core.js", "manifest.json", "icon.svg",
   "https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js",
@@ -12,7 +13,7 @@ var SHELL = [
 
 self.addEventListener("install", function (e) {
   e.waitUntil(caches.open(CACHE).then(function (c) {
-    return Promise.all(SHELL.map(function (u) { return c.add(u).catch(function () {}); }));
+    return Promise.all(SHELL.map(function (u) { return c.add(new Request(u, { cache: "reload" })).catch(function () {}); }));
   }).then(function () { return self.skipWaiting(); }));
 });
 
@@ -27,14 +28,19 @@ self.addEventListener("fetch", function (e) {
   if (req.method !== "GET") return;
   if (/google(usercontent)?\.com$/.test(url.hostname) && url.hostname !== "fonts.googleapis.com") return;
   var sameSite = url.origin === self.location.origin;
+  if (sameSite) {
+    var key = new Request(url.origin + url.pathname);   // ?c=GS-0001 links open the same app page
+    e.respondWith(fetch(req, { cache: "no-cache" }).then(function (res) {
+      if (res && res.ok) { var copy = res.clone(); caches.open(CACHE).then(function (c) { c.put(key, copy); }); }
+      return res;
+    }).catch(function () {
+      return caches.open(CACHE).then(function (c) { return c.match(key).then(function (hit) { return hit || c.match("./"); }); });
+    }));
+    return;
+  }
   e.respondWith(caches.open(CACHE).then(function (c) {
-    // ?c=GS-0001 links open the same app page
-    return c.match(req, { ignoreSearch: sameSite }).then(function (hit) {
-      var fresh = fetch(req).then(function (res) {
-        if (res && (res.ok || res.type === "opaque")) c.put(sameSite ? new Request(url.origin + url.pathname) : req, res.clone());
-        return res;
-      }).catch(function () { return hit; });
-      return hit || fresh;
+    return c.match(req).then(function (hit) {
+      return hit || fetch(req).then(function (res) { if (res && (res.ok || res.type === "opaque")) c.put(req, res.clone()); return res; });
     });
   }));
 });

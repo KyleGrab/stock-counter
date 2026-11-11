@@ -29,6 +29,31 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.waitForSelector("text=To kit");
   assert.ok((await page.locator("#who").innerText()).includes("Admin"));
+  // Back / Forward / Login page
+  assert.ok(await page.locator("#navBack").isDisabled(), "nothing to go back to yet");
+  await page.getByText("J-1005").click();
+  await page.waitForSelector("text=Pick the kit");
+  await page.locator("nav button[data-tab=stock]").click();
+  await page.waitForSelector("text=Stock on hand");
+  await page.locator("#navBack").click();
+  await page.waitForSelector("text=Pick the kit");
+  await page.locator("#navBack").click();
+  await page.waitForSelector("text=To kit");
+  assert.ok(await page.locator("#navBack").isDisabled());
+  await page.locator("#navFwd").click();
+  await page.waitForSelector("text=Pick the kit");
+  await page.goBack();                       // phone/browser back gesture works too
+  await page.waitForSelector("text=To kit");
+  await page.locator("#navHome").click();
+  await page.getByRole("button", { name: "Stay signed in" }).click();
+  assert.ok(await page.locator("#homeConfirm").isHidden());
+  await page.locator("#navHome").click();
+  await page.getByRole("button", { name: "Sign out", exact: true }).first().click();
+  await page.waitForSelector("#lg_user");
+  assert.ok(await page.locator("#navHome").isHidden(), "on the login page");
+  await page.fill("#lg_user", "admin"); await page.fill("#lg_pin", "246810");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.waitForSelector("text=To kit");
   assert.ok((await text()).includes("J-1005"));
   await page.screenshot({ path: out + "/1-jobs.png", fullPage: true });
 
@@ -79,7 +104,7 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: "← Jobs" }).click();
   await page.locator("nav button[data-tab=scan]").click();
   await page.locator("#camStop").click().catch(() => {});
-  await page.fill("#sc_code", "gs-0003"); await page.getByRole("button", { name: "Go" }).click();
+  await page.fill("#sc_code", "gs-0003"); await page.getByRole("button", { name: "Go", exact: true }).click();
   await page.waitForSelector("text=AC cable 4 mm² 3-core");
   await page.getByRole("radio", { name: "Extra to job" }).click();
   await page.fill("#ex_qty", "3"); await page.selectOption("#ex_job", "J-1003");
@@ -96,7 +121,7 @@ const server = http.createServer((req, res) => {
   await page.waitForSelector("text=Received 100");
 
   // Crate scan by link opens the job
-  await page.fill("#sc_code", "https://x.github.io/app/?c=J-1004"); await page.getByRole("button", { name: "Go" }).click();
+  await page.fill("#sc_code", "https://x.github.io/app/?c=J-1004"); await page.getByRole("button", { name: "Go", exact: true }).click();
   await page.waitForSelector("text=Van collects the crate");
 
   // Stock + counts + stickers render

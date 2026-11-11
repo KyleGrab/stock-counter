@@ -107,7 +107,7 @@ assert.ok(seed.ok, seed.error);
 
   // 5. Offline: issue extra MC4 to... first top up the van with 8 MC4 (queued)
   await page.locator("nav button[data-tab=scan]").click();
-  await page.fill("#sc_code", "GS-0002"); await page.getByRole("button", { name: "Go" }).click();
+  await page.fill("#sc_code", "GS-0002"); await page.getByRole("button", { name: "Go", exact: true }).click();
   await page.getByRole("radio", { name: "Van top-up" }).click();
   await page.fill("#tu_qty", "8"); await page.selectOption("#tu_van", "VAN-1");
   await page.getByRole("button", { name: "Save van top-up" }).click();

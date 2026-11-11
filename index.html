@@ -124,6 +124,16 @@ body.nonav{padding-bottom:calc(24px + env(safe-area-inset-bottom,0px))}
 .roles b{display:block;font-size:13px}
 textarea{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px 12px;width:100%;min-width:0;resize:vertical}
 textarea.mono{font-family:var(--f-mono);font-size:13px}
+.toolbar{display:flex;align-items:center;gap:6px}
+.tsp{flex:1}
+.tbtn{display:inline-flex;align-items:center;gap:4px;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:7px 12px;min-height:40px;font-size:14px;font-weight:600}
+.tbtn svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.tbtn:disabled{opacity:.35;cursor:default}
+.tbtn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.homeConfirm{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px}
+.homeConfirm[hidden]{display:none!important}
+.ver{font-size:11px;color:var(--muted);font-weight:500;letter-spacing:0;text-transform:none;margin-left:6px;font-family:var(--f-body)}
+@media (max-width:380px){.tbtn{padding:7px 9px}}
 .hint{border-left:3px solid var(--accent);padding:4px 0 4px 10px;font-size:14px}
 @media print{body{padding:0;background:#fff}nav,header,.noprint{display:none!important}}
 </style>
@@ -131,9 +141,19 @@ textarea.mono{font-family:var(--f-mono);font-size:13px}
 <body>
 <div class="wrap">
   <header class="top">
-    <div class="brand">Stock Counter</div>
+    <div class="brand">Stock Counter<span class="ver" id="ver"></span></div>
     <div class="hdr-right"><div class="status"><span class="dot" id="dot"></span><span id="statusText">Starting…</span></div><div id="who" class="who" hidden></div></div>
   </header>
+  <div class="toolbar" id="toolbar" hidden>
+    <button class="tbtn" id="navBack" type="button" aria-label="Back"><svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>Back</button>
+    <button class="tbtn" id="navFwd" type="button" aria-label="Forward">Forward<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+    <span class="tsp"></span>
+    <button class="tbtn" id="navHome" type="button" aria-label="Go to the login page"><svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/><path d="M10 20v-6h4v6"/></svg>Login page</button>
+  </div>
+  <div class="msg warn homeConfirm" id="homeConfirm" hidden>
+    <span id="homeConfirmText">Sign out and go to the login page?</span>
+    <span class="row"><button class="btn small" id="homeYes" type="button">Sign out</button><button class="btn ghost small" id="homeNo" type="button">Stay signed in</button></span>
+  </div>
   <div class="demo" id="demoBar" hidden>Demo mode: made-up stock and jobs, saved only on this phone. Sign in as admin and use <b>Admin → My account</b> to connect the real Google Sheet.</div>
   <section class="panel" id="camBox" hidden>
     <div id="camTitle" class="eyebrow">Point the camera at the sticker</div>

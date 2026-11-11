@@ -22,7 +22,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.3";
+var APP_VERSION = "1.4";
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit", "Counts"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
@@ -120,7 +120,16 @@ var DEMO_USERS = [
 ];
 function demoErr(msg, signIn) { var e = new Error(msg); e.signIn = !!signIn; return e; }
 var demo = {
-  users: function () { return LS.get("sc_demo_users", null) || JSON.parse(JSON.stringify(DEMO_USERS)); },
+  users: function () {
+    var list = LS.get("sc_demo_users", null) || JSON.parse(JSON.stringify(DEMO_USERS));
+    // demo data from an older version: add missing demo logins and update their labels
+    DEMO_USERS.forEach(function (d) {
+      var u = list.find(function (x) { return x.username === d.username; });
+      if (!u) list.push(JSON.parse(JSON.stringify(d)));
+      else if (u.role === d.role) u.name = d.name;
+    });
+    return list;
+  },
   publicUser: function (u) { return { username: u.username, name: u.name, role: u.role, mustChange: u.mustChange === "yes" }; },
   call: function (action, body) {
     var self = this;
@@ -435,9 +444,43 @@ window.addEventListener("online", flush);
 setInterval(function () { if (Q.length) flush(); }, 30000);
 
 /* ===================== render ===================== */
+/*
+ * Back / Forward: every screen change is recorded in the browser history, so the
+ * header buttons, the phone's own back gesture and the browser buttons all work.
+ */
+var NAV = { idx: 0, max: 0, key: null, restoring: false };
+function viewKey() { return JSON.stringify({ t: S.tab, s: S.sub || null, j: S.job || null, i: S.item || null, v: (S.f && S.f.invTab) || null }); }
+function recordNav() {
+  var key = viewKey();
+  if (key === NAV.key) return;
+  if (NAV.key === null || NAV.restoring) { NAV.key = key; try { history.replaceState({ sc: key, idx: NAV.idx }, ""); } catch (e) {} return; }
+  NAV.idx++; NAV.max = NAV.idx; NAV.key = key;
+  try { history.pushState({ sc: key, idx: NAV.idx }, ""); } catch (e) {}
+}
+window.addEventListener("popstate", function (e) {
+  if (!e.state || !e.state.sc) return;
+  var v = JSON.parse(e.state.sc);
+  stopCam(); S.scanFor = null;
+  S.tab = v.t; S.sub = v.s; S.job = v.j; S.item = v.i; S.f = v.v ? { invTab: v.v } : {}; S.msg = null;
+  NAV.idx = e.state.idx || 0; NAV.key = e.state.sc;
+  NAV.restoring = true; render(); NAV.restoring = false;
+  window.scrollTo(0, 0);
+});
+function updateToolbar(ready) {
+  $("#toolbar").hidden = !cfg.mode;
+  $("#navBack").hidden = $("#navFwd").hidden = !ready;
+  $("#navBack").disabled = NAV.idx <= 0;
+  $("#navFwd").disabled = NAV.idx >= NAV.max;
+  $("#navHome").hidden = !(cfg.token && cfg.user);
+  if (!(cfg.token && cfg.user)) $("#homeConfirm").hidden = true;
+  $("#ver").textContent = "v" + APP_VERSION;
+}
+
 function render() {
   var signedIn = !!(cfg.mode && cfg.token && cfg.user);
   var ready = signedIn && !cfg.user.mustChange;
+  if (ready && !S.loading) recordNav();
+  updateToolbar(ready);
   var nav = document.querySelector("nav.tabs");
   nav.hidden = !ready;
   document.body.classList.toggle("nonav", !ready);
@@ -1602,6 +1645,14 @@ function handleCode(raw) {
 document.addEventListener("click", function (e) {
   var b = e.target.closest("button");
   if (!b) return;
+  if (b.id === "navBack") { history.back(); return; }
+  if (b.id === "navFwd") { history.forward(); return; }
+  if (b.id === "navHome") {
+    $("#homeConfirmText").textContent = Q.length ? Q.length + " change(s) haven't reached the Sheet yet. They'll sync next time you sign in on this phone. Sign out and go to the login page?" : "Sign out and go to the login page?";
+    $("#homeConfirm").hidden = false; return;
+  }
+  if (b.id === "homeNo") { $("#homeConfirm").hidden = true; return; }
+  if (b.id === "homeYes") { $("#homeConfirm").hidden = true; S.f.confirmLogout = true; A.logout(); window.scrollTo(0, 0); return; }
   if (b.id === "camStop") { if (S.scanFor) A.doneSerials(); else stopCam(); return; }
   if (b.dataset.tab) {
     if (b.dataset.tab === "scan") { S.scanFor = null; go("scan"); startCam(); return; }
@@ -1715,7 +1766,14 @@ function seedDemo() {
 
 /* ===================== start ===================== */
 (function start() {
-  if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(function () {});
+  if ("serviceWorker" in navigator && location.protocol === "https:") {
+    var hadController = !!navigator.serviceWorker.controller, reloaded = false;
+    navigator.serviceWorker.addEventListener("controllerchange", function () {
+      // a newer version was installed: load it once, unless the person is mid-way through a form
+      if (hadController && !reloaded && !S.busy && !Q.length) { reloaded = true; location.reload(); }
+    });
+    navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then(function (reg) { reg.update(); }).catch(function () {});
+  }
   var code = new URLSearchParams(location.search).get("c");
   if (code) { S.pendingCode = code; history.replaceState(null, "", location.pathname); }
   render();
