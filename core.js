@@ -120,8 +120,8 @@
   function newAverageCost(oldQty, oldCost, inQty, inCost) {
     oldQty = Math.max(0, num(oldQty));
     var total = oldQty + num(inQty);
-    if (total <= EPS) return round2(inCost);
-    return round2((oldQty * num(oldCost) + num(inQty) * num(inCost)) / total);
+    if (total <= EPS) return round4(inCost);
+    return round4((oldQty * num(oldCost) + num(inQty) * num(inCost)) / total);
   }
 
   /** Total on hand of one item across warehouse, vans and open jobs. */
@@ -197,28 +197,80 @@
     return linesToMoves(place, countLines(place, counts, B, items), items, ts, kind);
   }
 
+  function round4(n) { return Math.round(num(n) * 10000) / 10000; }
+
   /**
-   * Rows pasted from Excel or a CSV: code, quantity, [landed cost], [name], [unit m/ea].
-   * Tabs, commas or semicolons. A header row is skipped. Spaces and "R" in money are ignored.
+   * Supplier codes often have spaces or slashes ("ABC BOX 4X4", "XY 110 KW/H").
+   * Codes become sticker and record keys, so they are stored in one safe form:
+   * capitals, and anything that isn't a letter, number, dot or underscore becomes a dash.
+   * The same rule is used when importing, adding items and typing codes, so they always match.
+   */
+  function normCode(text) {
+    return String(text || "").trim().toUpperCase().replace(/[^A-Z0-9_.\-]+/g, "-").replace(/-{2,}/g, "-").replace(/^-+|-+$/g, "");
+  }
+
+  var HEADERS = [
+    ["total", /total|line\s*value|amount/],
+    ["code", /code|sku|part|^item(\s*no\.?)?$/],
+    ["qty", /qty|quantity|count|^on\s*hand$/],
+    ["cost", /cost|price|excl|^rate$/],
+    ["name", /desc|name/],
+    ["unit", /^(unit|uom|unit of measure|units?)$/]
+  ];
+  /** Work out which column is which from a header row. Returns null if it isn't a header. */
+  function mapHeader(cells) {
+    var map = {};
+    cells.forEach(function (c, i) {
+      var t = String(c || "").trim().toLowerCase();
+      if (!t) return;
+      for (var h = 0; h < HEADERS.length; h++) {
+        var key = HEADERS[h][0];
+        if (map[key] === undefined && HEADERS[h][1].test(t)) { map[key] = i; return; }
+      }
+    });
+    return map.code !== undefined && map.qty !== undefined ? map : null;
+  }
+
+  /**
+   * Rows pasted from Excel, a CSV or a supplier invoice.
+   * With a header row, columns are found by name: Item code, Description, Quantity,
+   * Unit price / Cost, Total, Unit. Without one: code, quantity, cost, name, unit.
+   * If there's a line total but no unit cost, cost = total ÷ quantity (matches the invoice to the cent).
+   * Tabs, commas or semicolons. Spaces and "R" in money are ignored.
    */
   function parseImport(text, items) {
-    var rows = [], errors = [], seen = {};
+    var rows = [], errors = [], seen = {}, map = null, first = true;
+    var money = function (v) { return String(v == null ? "" : v).replace(/[R\s ]/gi, "").replace(/,(\d{1,2})$/, ".$1").replace(/,/g, ""); };
     String(text || "").split(/\r?\n/).forEach(function (line, i) {
       if (!line.trim()) return;
-      var cells = line.split(line.indexOf("\t") >= 0 ? "\t" : /[;,](?=(?:[^"]*"[^"]*")*[^"]*$)/).map(function (c) { return c.trim().replace(/^"|"$/g, "").trim(); });
-      var sku = String(cells[0] || "").toUpperCase();
-      var money = function (v) { return String(v || "").replace(/[R\s]/gi, "").replace(/,(\d{1,2})$/, ".$1").replace(/,/g, ""); };
-      var qtyRaw = money(cells[1]);
-      if (i === 0 && (isNaN(Number(qtyRaw)) || qtyRaw === "")) return; // header
-      if (!sku) return;
-      if (!/^[A-Z0-9][A-Z0-9_.\-]{0,40}$/.test(sku)) { errors.push("Line " + (i + 1) + ": item code '" + cells[0] + "' has spaces or odd characters."); return; }
+      // Tab (pasted from Excel) > semicolon (SA Excel CSV, where the comma is the decimal) > comma
+      var sep = line.indexOf("\t") >= 0 ? "\t" : line.indexOf(";") >= 0 ? /;(?=(?:[^"]*"[^"]*")*[^"]*$)/ : /,(?=(?:[^"]*"[^"]*")*[^"]*$)/;
+      var cells = line.split(sep).map(function (c) { return c.trim().replace(/^"|"$/g, "").trim(); });
+      if (first) {
+        first = false;
+        var hm = mapHeader(cells);
+        if (hm) { map = hm; return; }
+        if (isNaN(Number(money(cells[1]))) || money(cells[1]) === "") return; // unnamed header
+      }
+      var col = map || { code: 0, qty: 1, cost: 2, name: 3, unit: 4 };
+      var get = function (k) { return col[k] === undefined ? "" : (cells[col[k]] || ""); };
+      var raw = get("code"), sku = normCode(raw);
+      if (!sku && !money(get("qty"))) return;   // blank or notes line
+      if (/^(SUB-?TOTAL|TOTAL|VAT|TOTAL-EX-VAT|TOTAL-INCL-VAT)$/.test(sku)) return;   // invoice footer pasted with the lines
+      if (!sku) { errors.push("Line " + (i + 1) + ": no item code."); return; }
+      if (sku.length > 40) { errors.push("Line " + (i + 1) + ": item code '" + raw + "' is too long (40 characters max)."); return; }
+      var qtyRaw = money(get("qty"));
       if (qtyRaw === "" || isNaN(Number(qtyRaw)) || Number(qtyRaw) < 0) { errors.push("Line " + (i + 1) + ": quantity for " + sku + " isn't a number."); return; }
-      if (seen[sku]) { errors.push("Line " + (i + 1) + ": " + sku + " is listed twice."); return; }
+      if (seen[sku]) { errors.push("Line " + (i + 1) + ": " + sku + " is listed twice. Combine the lines."); return; }
       seen[sku] = 1;
-      var costRaw = money(cells[2]);
-      var row = { sku: sku, qty: round2(Number(qtyRaw)), cost: costRaw === "" || isNaN(Number(costRaw)) ? null : round2(Number(costRaw)),
-        name: cells[3] || "", uom: /^m(etres?|eters?)?$/i.test(cells[4] || "") ? "m" : cells[4] ? "ea" : "", line: i + 1, isNew: !(items && items[sku]) };
-      if (row.isNew && !row.name) { errors.push("Line " + (i + 1) + ": " + sku + " is a new item. Add its name in the 4th column."); return; }
+      var qty = round2(Number(qtyRaw));
+      var costRaw = money(get("cost")), totalRaw = money(get("total")), cost = null;
+      if (totalRaw !== "" && !isNaN(Number(totalRaw)) && qty > 0) cost = round4(Number(totalRaw) / qty);
+      else if (costRaw !== "" && !isNaN(Number(costRaw))) cost = round4(Number(costRaw));
+      var unitText = get("unit");
+      var row = { sku: sku, qty: qty, cost: cost, name: get("name"), uom: /^m(etres?|eters?|tr)?$/i.test(unitText) ? "m" : unitText ? "ea" : "",
+        line: i + 1, isNew: !(items && items[sku]), original: raw.trim().toUpperCase() !== sku ? raw.trim() : "" };
+      if (row.isNew && !row.name) { errors.push("Line " + (i + 1) + ": " + sku + " is a new item. Add its name (description)."); return; }
       rows.push(row);
     });
     return { rows: rows, errors: errors };
@@ -232,7 +284,7 @@
     var t = String(text || "").trim();
     var m = t.match(/[?&#]c=([^&#\s]+)/i);
     if (m) t = decodeURIComponent(m[1]);
-    return t.toUpperCase();
+    return normCode(t);
   }
 
   function nextNumber(ids, prefix, pad) {
@@ -277,7 +329,7 @@
   var Core = {
     balances: balances, bal: bal, kitDefault: kitDefault, jobSummary: jobSummary, closeJob: closeJob,
     newAverageCost: newAverageCost, onHand: onHand, losses: losses, overQuote: overQuote,
-    countMoves: countMoves, countLines: countLines, linesToMoves: linesToMoves, parseImport: parseImport, parseScan: parseScan, nextNumber: nextNumber, round2: round2,
+    countMoves: countMoves, countLines: countLines, linesToMoves: linesToMoves, parseImport: parseImport, parseScan: parseScan, normCode: normCode, round4: round4, nextNumber: nextNumber, round2: round2,
     isRealPlace: isRealPlace, checkBalances: checkBalances
   };
   if (typeof module !== "undefined" && module.exports) module.exports = Core;

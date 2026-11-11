@@ -22,7 +22,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.4";
+var APP_VERSION = "1.5";
 var TABS = ["Items", "Jobs", "Lines", "Moves", "Labels", "Vans", "VanKit", "Counts"];
 function emptyData() { var d = {}; TABS.forEach(function (t) { d[t] = []; }); return d; }
 var SD = LS.get("sc_sd", null) || emptyData();
@@ -893,6 +893,13 @@ function vInventory() {
   return backMore() + '<div class="spread"><h2>Inventory</h2><button class="btn ghost small" data-action="refreshAll"' + (S.busy ? " disabled" : "") + ">↻ Refresh from Sheet</button></div>" + tabs + (t === "take" ? "" : msgHtml()) + body;
 }
 
+function money2(v) { var x = Math.round(n(v) * 100) / 100; return (x < 0 ? "\u2212R\u00a0" : "R\u00a0") + Math.abs(x).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+// An earlier receipt with the same reference (supplier + invoice number), ignoring case and spaces.
+function findReceipt(ref) {
+  var k = String(ref || "").replace(/\s+/g, "").toLowerCase();
+  if (!k) return null;
+  return D.Moves.find(function (m) { return m.type === "receive" && String(m.ref || "").replace(/\s+/g, "").toLowerCase() === k; }) || null;
+}
 function countLinesOf(c) { try { return JSON.parse(c.lines || "[]"); } catch (e) { return []; } }
 function vApprove() {
   var list = (D.Counts || []).slice().sort(function (a, b) { return String(b.ts).localeCompare(String(a.ts)); });
@@ -951,17 +958,25 @@ function vAdjust() {
 function vImport() {
   var f = S.f.imp || (S.f.imp = { mode: "set", text: "" });
   var prev = f.preview;
-  var table = "";
+  var table = "", total = 0;
+  var recv = f.mode === "receive";
+  var dup = recv ? findReceipt(f.ref) : null;
   if (prev) {
     table = (prev.errors.length ? '<div class="msg err">' + prev.errors.map(esc).join("<br>") + "</div>" : "") +
-      (prev.rows.length ? '<div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">In store</th><th class="n">' + (f.mode === "set" ? "Counted" : "Receive") + '</th><th class="n">Change</th><th class="n">Value</th></tr></thead><tbody>' +
+      (prev.rows.length ? '<div class="tablewrap"><table class="sumt"><thead><tr><th>Item</th>' + (recv ? '<th class="n">Qty</th><th class="n">Cost each</th>' : '<th class="n">In store</th><th class="n">Counted</th><th class="n">Change</th>') + '<th class="n">Value</th></tr></thead><tbody>' +
         prev.rows.map(function (r) {
-          var sys = r.isNew ? 0 : bal("WH", r.sku), chg = f.mode === "set" ? C.round2(r.qty - sys) : r.qty;
+          var sys = r.isNew ? 0 : bal("WH", r.sku), chg = recv ? r.qty : C.round2(r.qty - sys);
           var c = r.cost != null ? r.cost : cost(r.sku);
-          return "<tr><td>" + esc(r.isNew ? r.name : nameOf(r.sku)) + '<div class="tiny muted mono">' + esc(r.sku) + (r.isNew ? ' · <span class="pill p-quoted">New item</span>' : "") + "</div></td>" +
-            '<td class="n">' + (r.isNew ? "–" : q(sys, r.sku)) + '</td><td class="n">' + r.qty + '</td><td class="n">' + (chg < 0 ? '<span class="pill p-bad">' + chg + "</span>" : chg > 0 ? "+" + chg : "✓") + '</td><td class="n">' + R(chg * c) + "</td></tr>";
-        }).join("") + "</tbody></table></div>" : "") +
-      (prev.rows.length && !prev.errors.length ? '<button class="btn wide" data-action="applyImport"' + (S.busy ? " disabled" : "") + ">Apply " + prev.rows.length + " line(s)</button>" : "") +
+          total += chg * c;
+          return "<tr><td>" + esc(r.isNew ? r.name : nameOf(r.sku)) + '<div class="tiny muted"><span class="mono">' + esc(r.sku) + "</span>" + (r.isNew ? ' · <span class="pill p-quoted">New' + (r.uom === "m" ? ", metres" : "") + "</span>" : "") + "</div></td>" +
+            (recv ? '<td class="n">' + r.qty + (r.uom === "m" ? "\u00a0m" : "") + '</td><td class="n">' + money2(c) + "</td>" :
+              '<td class="n">' + (r.isNew ? "–" : q(sys, r.sku)) + '</td><td class="n">' + r.qty + '</td><td class="n">' + (chg < 0 ? '<span class="pill p-bad">' + chg + "</span>" : chg > 0 ? "+" + chg : "✓") + "</td>") +
+            '<td class="n">' + money2(chg * c) + "</td></tr>";
+        }).join("") + '</tbody><tfoot><tr><td colspan="' + (recv ? 3 : 4) + '"><b>Total value</b></td><td class="n"><b>' + money2(total) + "</b></td></tr></tfoot></table></div>" +
+        '<p class="tiny muted">Check the total against the invoice subtotal (excl. VAT) before applying. A difference of a cent or two is supplier rounding.</p>' : "") +
+      (dup ? '<div class="msg err"><b>' + esc(f.ref) + "</b> was already received on " + esc(dtime(dup.ts)) + " by " + esc(dup.by || "someone") + ". Receiving it again doubles the stock." +
+        '<label class="chk"><input type="checkbox" id="imp_dupok" data-bind="imp.dupOk" data-check="1"' + (f.dupOk ? " checked" : "") + "> This is a separate delivery with the same reference. Receive it again.</label></div>" : "") +
+      (prev.rows.length && !prev.errors.length ? '<button class="btn wide" data-action="applyImport"' + (S.busy || (dup && !f.dupOk) ? " disabled" : "") + ">Apply " + prev.rows.length + " line(s)</button>" : "") +
       (prev.errors.length && prev.rows.length ? '<p class="tiny muted">Fix the lines above, then preview again. Nothing is changed until every line is valid.</p>' : "");
   }
   return '<section class="panel"><h3>Export</h3><p class="small muted">Download every item with its store quantity and landed cost. Open it in Excel, update the quantities, and paste it back below.</p>' +
@@ -972,9 +987,10 @@ function vImport() {
     '<button class="btn small ' + (f.mode === "receive" ? "" : "ghost") + '" role="radio" aria-checked="' + (f.mode === "receive") + '" data-action="impMode" data-m="receive">Add as received (opening stock / delivery)</button></div>' +
     '<p class="small muted">' + (f.mode === "set" ? "Use for a full stock take done on paper or in Excel. The store quantity becomes the number you give; differences are booked as count adjustments. A cost column, if given, updates the item's landed cost." :
       "Use for day-one opening stock or a big delivery. The quantities are added to the store at the landed cost you give (moving average).") + "</p>" +
-    '<p class="tiny muted">Columns, in this order: <b>Item code, Quantity</b>, Landed cost, Name, Unit (m or ea). Copy the cells from Excel and paste. A header row is fine. New item codes need a name and are created automatically.</p>' +
+    '<p class="tiny muted">Paste from Excel or a supplier invoice <b>with a header row</b> and the columns are found by name: <b>Item code, Quantity</b>, Description, Unit price or Total (excl. VAT), Unit (m or ea). If there\'s a line total, cost = total ÷ quantity, so it matches the invoice to the cent. Without a header, the order is: code, quantity, cost, name, unit.</p>' +
+    '<p class="tiny muted">Supplier codes with spaces or slashes are fine: <span class="mono">ABC BOX 4X4</span> is stored as <span class="mono">ABC-BOX-4X4</span>. New items are created automatically. If the business is VAT-registered, use prices <b>excluding VAT</b>.</p>' +
     '<label class="f">Paste here<textarea id="imp_text" rows="7" class="mono" data-bind="imp.text" placeholder="PV6-RED&#9;450&#9;18.90&#10;MC4&#9;120&#9;28&#10;BRK-32A&#9;12&#9;95&#9;Breaker 32 A&#9;ea">' + esc(f.text || "") + "</textarea></label>" +
-    (f.mode === "receive" ? '<label class="f">Reference<input id="imp_ref" data-bind="imp.ref" value="' + esc(f.ref || "") + '" placeholder="e.g. Opening stock 1 Dec 2026"></label>' : "") +
+    (f.mode === "receive" ? '<label class="f">Supplier and invoice number (required)<input id="imp_ref" data-bind="imp.ref" value="' + esc(f.ref || "") + '" placeholder="e.g. Supplier name INV123456, or Opening stock 1 Dec 2026"></label>' : "") +
     '<button class="btn ghost" data-action="previewImport">Preview</button>' + table + "</section>";
 }
 
@@ -1148,8 +1164,15 @@ function vChangePinFirst() {
 }
 
 /* ===================== actions ===================== */
+// Item codes can contain dots ("HWIRE-06.0-GRN"), so per-item fields keep the code in one piece.
+function splitBind(path) {
+  var parts = path.split(".");
+  if (/^(cnt|kit|kt)$/.test(parts[0]) && parts.length > 2) return [parts[0], parts.slice(1).join(".")];
+  if (parts[0] === "ret" && parts.length > 3) return [parts[0], parts.slice(1, -1).join("."), parts[parts.length - 1]];
+  return parts;
+}
 function bindValue(path, value) {
-  var parts = path.split("."), o = S.f;
+  var parts = splitBind(path), o = S.f;
   for (var i = 0; i < parts.length - 1; i++) { var p = parts[i]; if (o[p] == null) o[p] = /^\d+$/.test(parts[i + 1]) ? [] : {}; o = o[p]; }
   o[parts[parts.length - 1]] = value;
 }
@@ -1323,8 +1346,8 @@ var A = {
   },
   editItem: function (b) { var i = X.items[b.dataset.sku]; S.f.it = Object.assign({ editing: true }, i); S.msg = null; render(); window.scrollTo(0, 0); },
   saveItem: function () {
-    var f = S.f.it, sku = String(f.sku || "").trim().toUpperCase();
-    if (!/^[A-Z0-9][A-Z0-9_.\-]{0,40}$/.test(sku)) return flash("err", "Item code: letters, numbers and dashes only.");
+    var f = S.f.it, sku = f.editing ? f.sku : C.normCode(f.sku);
+    if (!sku || sku.length > 40) return flash("err", "Give the item a code, up to 40 characters.");
     if (!f.name) return flash("err", "Add a description.");
     if (!f.editing && (X.items[sku] || X.labels[sku] || X.jobs[sku])) return flash("err", "That code is already used.");
     var row = { sku: sku, name: f.name, uom: f.uom === "m" ? "m" : "ea", track: f.track === "serial" ? "serial" : "qty", reorder: n(f.reorder), allowancePct: f.allowancePct === "" ? "" : n(f.allowancePct) };
@@ -1468,6 +1491,10 @@ var A = {
   applyImport: function () {
     var f = S.f.imp, rows = (f.preview || {}).rows || [];
     if (!rows.length || f.preview.errors.length) return flash("err", "Preview again and fix any problems first.");
+    if (f.mode === "receive") {
+      if (!String(f.ref || "").trim()) return flash("err", "Add the supplier and invoice number, so this delivery can be traced and isn't received twice.");
+      if (findReceipt(f.ref) && !f.dupOk) return flash("err", "This invoice was already received. Tick the box if it really is a separate delivery.");
+    }
     var t = now(), itemOps = [], itemsAfter = Object.assign({}, X.items), moves = [];
     rows.forEach(function (r) {
       if (r.isNew) {
@@ -1485,7 +1512,7 @@ var A = {
       rows.forEach(function (r) {
         if (!(r.qty > 0)) return;
         var c = r.cost != null ? r.cost : n(itemsAfter[r.sku].cost);
-        var m = { ts: t, type: "receive", sku: r.sku, qty: r.qty, from: "SUPPLIER", to: "WH", unitCost: c, value: C.round2(r.qty * c), ref: f.ref || "Import " + t.slice(0, 10) };
+        var m = { ts: t, type: "receive", sku: r.sku, qty: r.qty, from: "SUPPLIER", to: "WH", unitCost: c, value: C.round2(r.qty * c), ref: String(f.ref).trim() };
         moves.push(m);
         if (!r.isNew) itemOps.push({ sku: r.sku, cost: C.newAverageCost(C.onHand(X.B, r.sku), n(X.items[r.sku].cost), r.qty, c) });
       });
@@ -1664,11 +1691,16 @@ document.addEventListener("click", function (e) {
 document.addEventListener("input", function (e) {
   var t = e.target;
   if (!t.dataset || !t.dataset.bind) return;
+  if (t.type === "checkbox") { bindValue(t.dataset.bind, t.checked); render(); return; }
   bindValue(t.dataset.bind, t.value);
   if (t.id === "us_role" && S.f.us && pinProblem(S.f.us.pin, t.value)) S.f.us.pin = suggestPin(isMgrRole(t.value) ? 6 : 4);
   if (t.id === "cnt_flt") { render(); return; }
   if (t.tagName === "SELECT") { if (t.dataset.reset) S.f[t.dataset.reset] = {}; render(); return; }
-  if (t.dataset.live) { if (S.tab === "counts") patchCounts(); else patchReturn(); }
+  if (t.dataset.live) { if (t.id.indexOf("cnt_") === 0) patchCounts(); else patchReturn(); }
+});
+document.addEventListener("change", function (e) {
+  var t = e.target;
+  if (t.dataset && t.dataset.rerender && t.tagName !== "SELECT" && t.type !== "checkbox") render();
 });
 document.addEventListener("keydown", function (e) {
   if (e.key !== "Enter") return;

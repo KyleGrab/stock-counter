@@ -110,3 +110,24 @@ im = C.parseImport("SKU,QTY\nPV6-RED,abc\nGHOST,5\nPV6-RED,1\nbad code,1", items
 assert.strictEqual(im.errors.length, 3);
 assert.ok(/new item/.test(im.errors[0] + im.errors[1]));
 console.log("core v1.3: all tests passed");
+
+// --- v1.5 supplier invoices (made-up data) ---
+{
+  const inv = "Item Code\tDescription\tQuantity\tExcl VAT\tTotal Ex Vat\nABC BOX 4X4\tTest box\t3\t3.33\t10.00\nXY KW/H 1\tTest meter\t1\t500\t500.00\nWIRE 6 GRN\tTest wire\t100\t1.00\t100.00\tm\n\nSubtotal\t\t\t\t610.00\nVAT\t\t\t\t91.50";
+  const r = C.parseImport(inv, {});
+  assert.deepStrictEqual(r.errors, []);
+  assert.deepStrictEqual(r.rows.map(x => x.sku), ["ABC-BOX-4X4", "XY-KW-H-1", "WIRE-6-GRN"], "spaces and slashes become dashes; footer lines skipped");
+  assert.strictEqual(r.rows[0].cost, 3.3333, "cost from line total, 4 decimals, so the value matches the invoice");
+  assert.strictEqual(r.rows[0].original, "ABC BOX 4X4");
+  // semicolon CSV with comma decimals and R amounts
+  const sc = C.parseImport("Item Code;Quantity;Description;Excl VAT\nABC BOX 4X4;48;Test box;R 1 017,86", {});
+  assert.deepStrictEqual([sc.errors.length, sc.rows[0].qty, sc.rows[0].cost], [0, 48, 1017.86]);
+  // columns found by name in any order
+  const any = C.parseImport("Description,Unit,Qty,Code,Unit price\nTest wire,metres,50,W1,2.5", {});
+  assert.deepStrictEqual([any.rows[0].sku, any.rows[0].qty, any.rows[0].cost, any.rows[0].uom, any.rows[0].name], ["W1", 50, 2.5, "m", "Test wire"]);
+  // header doesn't match the rows -> clear error, nothing imported
+  assert.strictEqual(C.parseImport("Quantity;Item Code\nABC;5", {}).rows.length, 0);
+  assert.strictEqual(C.normCode("  xy 110 kw/h "), "XY-110-KW-H");
+  assert.strictEqual(C.parseScan("abc box 4x4"), "ABC-BOX-4X4");
+  console.log("core v1.5: all tests passed");
+}

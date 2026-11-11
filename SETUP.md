@@ -112,7 +112,8 @@ The app shows a **temporary PIN** once. Give it to the person face to face. They
 1. **Items** (Admin → Items, or import them in step 4): add each product. Cable = *Metres*. Panels, inverters, batteries = *Serial number*.
 2. **Vans** (Admin → Vans and van kit): add each van, then set the **van kit** (small parts only: connectors, lugs, fuses, ties).
 3. **Stickers** (Admin → Stickers): one sticker per **drum, roll, box or shelf bin**. Tap **Print sticker sheet**. Use A4 sticker paper, or plain paper and clear tape.
-4. **Opening stock, the fast way:** put your current stock in Excel with columns *Item code, Quantity, Landed cost, Name, Unit*. Then **Inventory → Import / export → Add as received**, paste, **Preview**, **Apply**. New items are created automatically.
+4. **Receiving a supplier invoice:** type or copy the invoice lines into Excel with a header row, e.g. *Item code, Description, Quantity, Total Ex Vat, Unit*. Select the cells including the header, copy, then **Inventory → Import / export → Add as received**, paste, and enter the **supplier and invoice number**. **Preview** and check that *Total value* equals the invoice subtotal excl. VAT (a cent or two is rounding). Then **Apply**. The same invoice number can't be received twice by accident.
+5. **Opening stock, the fast way:** put your current stock in Excel with columns *Item code, Quantity, Landed cost, Name, Unit*. Then **Inventory → Import / export → Add as received**, paste, **Preview**, **Apply**. New items are created automatically.
    For panels and inverters you want tracked by serial, receive them with **Scan → Receive** instead, so each serial is captured.
 
 ---

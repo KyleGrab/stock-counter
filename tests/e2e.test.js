@@ -29,6 +29,9 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.waitForSelector("text=To kit");
   assert.ok((await page.locator("#who").innerText()).includes("Admin"));
+  // codes with dots keep their typed values (bug found with real supplier codes)
+  assert.deepStrictEqual(await page.evaluate(() => { bindValue("ret.HW-06.0-G.used", "5"); bindValue("cnt.HW-06.0-G", "7"); return [S.f.ret["HW-06.0-G"].used, S.f.cnt["HW-06.0-G"]]; }), ["5", "7"]);
+  await page.evaluate(() => { S.f = {}; });
   // Back / Forward / Login page
   assert.ok(await page.locator("#navBack").isDisabled(), "nothing to go back to yet");
   await page.getByText("J-1005").click();
@@ -239,7 +242,7 @@ const server = http.createServer((req, res) => {
   assert.ok(csv.includes("Item code,Store qty,Landed cost") && csv.includes("PV6-RED"));
   await page.fill("#imp_text", "Code\tQty\tCost\tName\tUnit\nMC4\t50\t30\nBRK-32A\t12\t95\tBreaker 32 A\tea\nbad code\t1");
   await page.getByRole("button", { name: "Preview" }).click();
-  await page.waitForSelector("text=odd characters");
+  await page.waitForSelector("text=is a new item");
   assert.strictEqual(await page.getByRole("button", { name: /^Apply/ }).count(), 0, "nothing applies while a line is wrong");
   await page.fill("#imp_text", "Code\tQty\tCost\tName\tUnit\nMC4\t50\t30\nBRK-32A\t12\t95\tBreaker 32 A\tea");
   await page.getByRole("button", { name: "Preview" }).click();
@@ -250,6 +253,7 @@ const server = http.createServer((req, res) => {
   assert.deepStrictEqual(await page.evaluate(() => [C.bal(X.B, "WH", "MC4"), C.bal(X.B, "WH", "BRK-32A"), X.items["MC4"].cost, X.items["BRK-32A"].cost]), [50, 12, 30, 95]);
   // receive mode: opening stock adds on top
   await page.getByRole("radio", { name: /Add as received/ }).click();
+  await page.fill("#imp_ref", "Test supplier INV-1");
   await page.fill("#imp_text", "BRK-32A,8,105");
   await page.getByRole("button", { name: "Preview" }).click();
   await page.getByRole("button", { name: "Apply 1 line(s)" }).click();
