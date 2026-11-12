@@ -1468,7 +1468,7 @@ var A = {
     if (!by) return flash("err", "Say who collected it.");
     if (!ref) return flash("err", "Add the dispatch or invoice number, or a short note.");
     var ts = now(), moves = o.lines.map(function (l) {
-      return mv("out", l.sku, n(l.qty), "WH", to, Object.assign({ ts: ts, unitCost: cost(l.sku), installer: by, ref: ref, reason: String(o.note || "").trim() }, extra));
+      return mv("out", l.sku, C.round2(n(l.qty)), "WH", to, Object.assign({ ts: ts, unitCost: cost(l.sku), installer: by, ref: ref, reason: String(o.note || "").trim() }, extra));
     });
     stopCam();
     save([{ op: "append", sheet: "Moves", rows: moves }], "Stock out saved: " + moves.length + " line(s).", function () { S.out = null; });
@@ -1616,6 +1616,7 @@ var A = {
     S.busy = true; S.msg = null; render();
     var typedPin = cleanPin(f.pin);
     api.call("login", { username: username, pin: typedPin }).then(function (res) {
+      if (S.out && (!cfg.user || cfg.user.username !== res.user.username)) S.out = null;   // a draft never carries over to another person
       cfg.token = res.token; cfg.user = res.user; saveCfg();
       if (DEV_QUICK_SIGNIN && cfg.mode === "live" && f.remember) LS.set("sc_quick", { url: cfg.url, username: res.user.username, name: res.user.name, pin: typedPin });
       S.f = res.user.mustChange ? { cp: { old: typedPin, known: true } } : {}; S.loginMsg = null; S.loading = !res.user.mustChange; S.tab = "jobs";
