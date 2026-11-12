@@ -13,6 +13,9 @@
  *   SCRAP      unusable offcuts that came back
  *   USED       installed on a job, or used from a van kit
  *   LOSS       not returned / count shortages
+ *   OUT        taken out of the store to a customer or elsewhere (a stock-out with no van or job).
+ *              No longer in stock. NOT a real place: no balance checks, never counted as on hand.
+ *              A stock-out to a van or a job goes to VAN-x / JOB:no instead, so it shows in those columns.
  */
 (function (root) {
   "use strict";
@@ -81,6 +84,7 @@
         if (m.reverses === "return") rr.returned -= q;
         else if (m.reverses === "scrap") rr.scrap -= q;
         else if (m.reverses === "extra") { rr.issued -= q; rr.extra -= q; }
+        else if (m.reverses === "out") rr.issued -= q;
         return;
       }
       if (m.to === loc) {
@@ -139,7 +143,7 @@
   function onHand(B, sku) {
     var t = 0;
     Object.keys(B).forEach(function (loc) {
-      if (loc === "SUPPLIER" || loc === "USED" || loc === "LOSS" || loc === "SCRAP") return;
+      if (loc === "SUPPLIER" || loc === "USED" || loc === "LOSS" || loc === "SCRAP" || loc === "OUT") return;
       t += Math.max(0, bal(B, loc, sku));
     });
     return round2(t);

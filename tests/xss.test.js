@@ -49,6 +49,17 @@ const P = n => `X${n}"'><img src=x id=pwn${n} onerror="window.__pwn=${n}"><svg o
     await pg.evaluate(sub => { S.tab = "more"; S.sub = sub; S.item = null; S.job = null; S.f = {}; render(); }, sub); await visit(sub);
     if (sub === "inventory") for (const t of ["approve", "take", "adjust", "io"]) { await pg.evaluate(t => { S.f = { invTab: t }; render(); }, t); await visit("inventory " + t); }
   }
+  // stock out screen: poisoned record (reference, note, collected by, job client) and poisoned draft fields
+  await pg.evaluate(() => {
+    const P2 = n => `X${n}"'><img src=x id=pwn${n} onerror="window.__pwn=${n}"><svg onload="window.__pwn=${n}"></svg>&lt;b&gt;`;
+    const d = LS.get("sc_demo", null), ts = new Date().toISOString(), sku = d.Items[0].sku;
+    d.Moves.push({ id: "so1", ts, type: "out", sku, qty: 1, from: "WH", to: "OUT", installer: P2(950), ref: P2(951), reason: P2(952), by: P2(953), value: 1 });
+    LS.set("sc_demo", d); SD = emptyData(); Q = []; persist(); rebuild();
+    S.out = { lines: [{ sku, qty: P2(954) }], dest: "job", van: "", job: d.Jobs[0].no, by: P2(955), byAuto: false, ref: P2(956), note: P2(957), older: false, code: P2(958) };
+    S.tab = "stock"; S.sub = "out"; S.item = null; S.job = null; S.f = {}; render();
+  });
+  await visit("stock out");
+  await pg.evaluate(() => { S.out = null; S.sub = null; });
   // import preview with poisoned names/codes
   await pg.evaluate(() => { S.tab = "more"; S.sub = "inventory"; S.f = { invTab: "io", imp: { mode: "receive", text: "" } }; render(); });
   await pg.fill("#imp_text", 'Item code,Description,Quantity,Total\nNEW1,"<img src=x id=pwn900 onerror=window.__pwn=900>",1,10');
@@ -59,6 +70,6 @@ const P = n => `X${n}"'><img src=x id=pwn${n} onerror="window.__pwn=${n}"><svg o
   // sign-in page and user chip with poisoned names
   await pg.evaluate(() => { cfg.user.name = '<img src=x id=pwn902 onerror=window.__pwn=902>'; syncStatus(); }); await visit("header chip");
   assert.deepStrictEqual(errs, [], "no script errors");
-  console.log("xss: " + (views.length + jobs.length + items.length + 14) + " screens checked, nothing executed");
+  console.log("xss: " + (views.length + jobs.length + items.length + 15) + " screens checked, nothing executed");
   await b.close(); srv.close();
 })().catch(e => { console.error(e); process.exit(1); });

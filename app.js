@@ -23,7 +23,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.11";
+var APP_VERSION = "1.12";
 /*
  * DEV PHASE ONLY. One-tap sign-in buttons. Set to false to remove them everywhere.
  *  - Demo: a button per demo login (demo data stays on the phone).
@@ -749,10 +749,10 @@ function vScan() {
     '<section class="panel"><button class="btn wide" data-action="startCam">Open camera</button>' +
     '<div class="row"><label class="f">Or type a sticker, job or item code<input class="code" id="sc_code" data-bind="code" value="' + esc(f.code || "") + '" placeholder="GS-0001 or J-1003" autocomplete="off"></label>' +
     '<button class="btn ghost" data-action="lookup">Go</button></div>' + (it ? "" : msgHtml()) + "</section>";
-  if (!it) return html + '<p class="small muted">Scan a <b>crate label</b> to open its job. Scan a <b>shelf or drum sticker</b> to receive stock, issue extra to a job, or top up a van.</p>';
+  if (!it) return html + '<p class="small muted">Scan a <b>crate label</b> to open its job. Scan a <b>shelf or drum sticker</b> to receive stock, issue extra to a job, top up a van, or take stock out.</p>';
   var mode = f.mode || "receive";
   var serial = isSerial(it.sku), wh = bal("WH", it.sku);
-  var modes = { receive: "Receive", extra: "Extra to job", topup: "Van top-up" };
+  var modes = { receive: "Receive", extra: "Extra to job", topup: "Van top-up", out: "Stock out" };
   var form = '<section class="panel"><div><div class="eyebrow">' + esc(it.sku) + (f.label ? " · sticker " + esc(f.label) : "") + "</div><h3>" + esc(it.name) + "</h3>" +
     '<div class="small muted">In store: <b class="mono">' + q(wh, it.sku) + "</b></div></div>" +
     '<div class="row" role="radiogroup" aria-label="What is happening">' + Object.keys(modes).map(function (m) {
@@ -780,6 +780,7 @@ function vScan() {
 
 /* ---------- Stock ---------- */
 function vStock() {
+  if (S.sub === "out") return vStockOut();
   if (S.item && X.items[S.item]) return vItemHistory(S.item);
   var vanIds = X.vans.map(function (v) { return v.id; });
   var whVal = 0, vanVal = 0, jobVal = 0;
@@ -796,7 +797,9 @@ function vStock() {
   var seesLoss = role() === "admin" || role() === "viewer";
   var L = C.losses(D.Moves, 30);
   var low = D.Items.filter(function (it) { return n(it.reorder) > 0 && bal("WH", it.sku) < n(it.reorder); });
+  var draft = S.out && S.out.lines.length ? " (" + S.out.lines.length + " on the list)" : "";
   return "<h2>Stock</h2>" + msgHtml() +
+    '<button class="btn wide' + (canWork() ? "" : " ghost") + '" data-action="sub" data-tab2="stock" data-sub="out">' + (canWork() ? "Take stock out" + draft : "Stock out record") + "</button>" +
     '<div class="kpis">' + (seesLoss ? '<button class="kpi kpibtn" data-action="sub" data-tab2="more" data-sub="reports"><div class="l">Missing, last 30 days ›</div><div class="v ' + (L.total > 0 ? "bad" : "") + '">' + R(L.total) + "</div></button>" :
       '<div class="kpi"><div class="l">Items to order</div><div class="v' + (low.length ? " bad" : "") + '">' + low.length + "</div></div>") +
     '<div class="kpi"><div class="l">In store</div><div class="v">' + R(whVal) + '</div></div><div class="kpi"><div class="l">In vans</div><div class="v">' + R(vanVal) + "</div></div>" +
@@ -805,15 +808,85 @@ function vStock() {
     '<p class="tiny muted">Value uses the average landed cost of each item. Tap an item to see every movement' + (canManage() ? " and correct mistakes." : ".") + "</p></section>";
 }
 
+/* ---------- Stock out ---------- */
+// The draft load lives in S.out so it survives switching tabs (not page reloads).
+function outState() { return S.out || (S.out = { lines: [], dest: "", van: "", job: "", by: "", byAuto: true, ref: "", note: "", older: false }); }
+function addOutLine(sku, byScan) {
+  var o = outState(), ln = o.lines.find(function (l) { return l.sku === sku; });
+  if (ln) { if (byScan) ln.qty = String(C.round2(n(ln.qty) + 1)); return false; }
+  o.lines.push({ sku: sku, qty: byScan ? "1" : "" });
+  return true;
+}
+function skuFromCode(raw) { var c = C.parseScan(raw); return X.labels[c] ? X.labels[c].sku : X.items[c] ? c : null; }
+function outWhere(m) {
+  if (m.to === "OUT") return "Customer / other";
+  if (String(m.to).indexOf("JOB:") === 0) { var j = X.jobs[m.job || String(m.to).slice(4)]; return "Job " + String(m.to).slice(4) + (j && j.client ? " · " + j.client : ""); }
+  return vanName(m.to);
+}
+function vStockOut() {
+  var o = outState(), work = canWork(), mgr = canManage();
+  var html = '<div class="row"><button class="btn ghost small" data-action="outBack">← Stock</button></div><h2>Stock out</h2>' + (work ? "" : msgHtml());
+  if (!work) html += '<div class="msg info">View only: you can see what went out, but not record it.</div>';
+  else {
+    var sorted = D.Items.slice().sort(function (a, b) { return a.name.localeCompare(b.name); });
+    var jobs = D.Jobs.filter(function (j) { return j.status === "out" || j.status === "kitted"; });
+    var lines = o.lines.map(function (l, i) {
+      var have = bal("WH", l.sku), over = n(l.qty) > have + 1e-9;
+      return '<div class="hist"><div class="spread"><div><b>' + esc(nameOf(l.sku)) + '</b><div class="tiny muted mono">' + esc(l.sku) + "</div></div>" +
+        '<button class="btn ghost small" data-action="outRemove" data-i="' + i + '" aria-label="Remove ' + esc(nameOf(l.sku)) + '">Remove</button></div>' +
+        '<div class="row"><label class="f">Quantity' + unitHint(l.sku) + '<input class="num" id="so_qty_' + i + '" type="number" inputmode="decimal" min="0" step="any" data-out="qty" data-i="' + i + '" value="' + esc(l.qty) + '"></label>' +
+        '<div class="small muted">In store: <b class="mono">' + q(have, l.sku) + "</b>" + (over ? ' <span class="pill p-bad">Too many</span>' : "") + "</div></div>" +
+        (isSerial(l.sku) ? '<div class="tiny muted">Serial-tracked: use the job kit so the serials are recorded.</div>' : "") + "</div>";
+    }).join("");
+    html += '<section class="panel"><h3>Items going out</h3>' +
+      '<button class="btn wide" data-action="outCam">Scan items</button>' +
+      '<div class="row"><label class="f">Or type a sticker or item code<input class="code" id="so_code" data-out="code" value="' + esc(o.code || "") + '" placeholder="GS-0001" autocomplete="off"></label><button class="btn ghost" data-action="outAddCode">Add</button></div>' +
+      '<label class="f">Or choose an item<select id="so_add" data-out="add"><option value="">Choose…</option>' + sorted.map(function (it) { return '<option value="' + esc(it.sku) + '">' + esc(it.name) + "</option>"; }).join("") + "</select></label>" +
+      (lines || '<p class="small muted">No items yet. Scan or choose the items that are leaving.</p>') + "</section>" +
+      '<section class="panel"><h3>Where to</h3>' +
+      '<label class="f">Going to<select id="so_dest" data-out="dest"><option value="">Choose…</option>' + [["van", "Van"], ["job", "Job"], ["other", "Customer / other"]].map(function (d) { return '<option value="' + d[0] + '"' + (o.dest === d[0] ? " selected" : "") + ">" + d[1] + "</option>"; }).join("") + "</select></label>" +
+      (o.dest === "van" ? '<label class="f">Van<select id="so_van" data-out="van"><option value="">Choose…</option>' + X.vans.map(function (v) { return '<option value="' + esc(v.id) + '"' + (v.id === o.van ? " selected" : "") + ">" + esc(v.name) + "</option>"; }).join("") + "</select></label>" : "") +
+      (o.dest === "job" ? '<label class="f">Job<select id="so_job" data-out="job"><option value="">Choose…</option>' + jobs.map(function (j) { return '<option value="' + esc(j.no) + '"' + (j.no === o.job ? " selected" : "") + ">" + esc(j.no) + " · " + esc(j.client) + "</option>"; }).join("") + "</select></label>" : "") +
+      '<label class="f">Collected by (required)<input id="so_by" data-out="by" value="' + esc(o.by) + '" placeholder="Name of the person taking it"></label>' +
+      '<label class="f">Dispatch or invoice number, or a short note (required)<input id="so_ref" data-out="ref" value="' + esc(o.ref) + '" placeholder="e.g. DN-0001"></label>' +
+      '<label class="f">Note (optional)<input id="so_note" data-out="note" value="' + esc(o.note) + '"></label>' +
+      msgHtml() + '<button class="btn wide" data-action="outSave"' + (S.busy ? " disabled" : "") + ">Save stock out</button></section>";
+  }
+  // record
+  var since = Date.now() - 30 * 864e5, groups = {}, order = [];
+  var reversed = {}; D.Moves.forEach(function (m) { if (m.type === "reverse") reversed[m.ref] = true; });
+  D.Moves.forEach(function (m) {
+    if (m.type !== "out") return;
+    if (!o.older && new Date(m.ts).getTime() < since) return;
+    var k = m.ts + "|" + m.by;
+    if (!groups[k]) { groups[k] = { ts: m.ts, by: m.by, first: m, moves: [] }; order.push(k); }
+    groups[k].moves.push(m);
+  });
+  order.sort(function (a, b) { return new Date(groups[b].ts) - new Date(groups[a].ts); });
+  var rec = order.map(function (k) {
+    var g = groups[k], f = g.first, total = g.moves.reduce(function (s, m) { return s + n(m.value); }, 0);
+    return '<div class="hist"><div class="spread"><div><b>' + esc(dtime(g.ts)) + '</b><div class="tiny muted">by ' + esc(g.by) + (f.installer ? " · collected by " + esc(f.installer) : "") + "</div></div>" +
+      (mgr ? '<div class="right"><span class="mono">' + R(total) + "</span></div>" : "") + "</div>" +
+      '<div class="small">To: ' + esc(outWhere(f)) + "</div>" +
+      (f.ref ? '<div class="tiny muted">Ref: ' + esc(f.ref) + "</div>" : "") + (f.reason ? '<div class="tiny muted">Note: ' + esc(f.reason) + "</div>" : "") +
+      g.moves.map(function (m) {
+        return '<div class="spread"><span><span class="mono">' + q(m.qty, m.sku) + "</span> " + esc(nameOf(m.sku)) + (reversed[m.id] ? ' <span class="pill p-closed">Corrected</span>' : "") + "</span>" + (mgr ? '<span class="mono">' + R(m.value) + "</span>" : "") + "</div>";
+      }).join("") + "</div>";
+  }).join("");
+  return html + '<section class="panel"><h3>Recent stock out</h3><p class="tiny muted">' + (o.older ? "All stock out, newest first." : "Last 30 days, newest first.") + " Stock out is never edited or deleted; a manager can reverse a mistake from the item's history.</p>" +
+    (rec || '<p class="muted small">Nothing taken out' + (o.older ? "" : " in the last 30 days") + ".</p>") +
+    '<button class="btn ghost small" data-action="outOlder">' + (o.older ? "Show last 30 days only" : "Show older") + "</button></section>";
+}
+
 /* ---------- Item history & corrections ---------- */
 var MOVE_LABEL = { adjust: "Adjustment", receive: "Received", kit: "Kitted to job", extra: "Extra to job", "return": "Returned", scrap: "Scrapped", used: "Used on job",
-  missing: "Missing", topup: "Van top-up", kituse: "Van kit used", countshort: "Count short", countover: "Count over", reverse: "Correction" };
-var REVERSIBLE = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1, adjust: 1 };
-function placeName(l) { return !l ? "" : l === "WH" ? "Store" : l.indexOf("JOB:") === 0 ? l.slice(4) : l === "SUPPLIER" ? "Supplier" : l === "USED" ? "Used" : l === "LOSS" ? "Lost/found" : l === "SCRAP" ? "Scrap" : vanName(l); }
+  missing: "Missing", topup: "Van top-up", out: "Stock out", kituse: "Van kit used", countshort: "Count short", countover: "Count over", reverse: "Correction" };
+var REVERSIBLE = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1, adjust: 1, out: 1 };
+function placeName(l) { return !l ? "" : l === "WH" ? "Store" : l.indexOf("JOB:") === 0 ? l.slice(4) : l === "SUPPLIER" ? "Supplier" : l === "USED" ? "Used" : l === "LOSS" ? "Lost/found" : l === "SCRAP" ? "Scrap" : l === "OUT" ? "Customer / other" : vanName(l); }
 function canReverse(m) {
   if (!canManage() || !REVERSIBLE[m.type]) return false;
   if (D.Moves.some(function (x) { return x.type === "reverse" && x.ref === m.id; })) return false;
-  if (m.job) { var j = X.jobs[m.job]; if (!j || j.status !== "out") return false; }
+  if (m.job) { var j = X.jobs[m.job]; if (!j || !(j.status === "out" || (m.type === "out" && j.status === "kitted"))) return false; }
   return true;
 }
 function vItemHistory(sku) {
@@ -1250,7 +1323,7 @@ function bindValue(path, value) {
 
 // Changing between demo and the real Sheet starts from a clean copy on the phone.
 function switchMode(mode) {
-  cfg.mode = mode; cfg.token = ""; cfg.user = null; S.users = null; saveCfg();
+  cfg.mode = mode; cfg.token = ""; cfg.user = null; S.users = null; S.out = null; saveCfg();
   SD = emptyData(); Q = []; persist(); rebuild();
 }
 
@@ -1351,9 +1424,65 @@ var A = {
     r.value = n(m.value);
     save([{ op: "append", sheet: "Moves", rows: [r] }], "Correction recorded.", function () { S.f = {}; });
   },
+  outBack: function () { stopCam(); S.sub = null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
+  outCam: function () { startCam("Scan each item that is leaving the store"); },
+  outAddCode: function () {
+    var o = outState(), raw = o.code;
+    if (!C.parseScan(raw)) return flash("err", "Scan or type a code first.");
+    var sku = skuFromCode(raw);
+    if (!sku) return flash("err", C.parseScan(raw) + " isn't a sticker or item in the system.");
+    addOutLine(sku, true); o.code = ""; S.msg = { k: "ok", t: "Added " + nameOf(sku) + "." }; render();
+  },
+  outRemove: function (b) { outState().lines.splice(Number(b.dataset.i), 1); S.msg = null; render(); },
+  outOlder: function () { var o = outState(); o.older = !o.older; render(); },
+  outSet: function (t) {
+    var o = outState(), f = t.dataset.out, v = t.value;
+    if (f === "qty") { var ln = o.lines[Number(t.dataset.i)]; if (ln) ln.qty = v; return; }
+    if (f === "add") { if (v && X.items[v]) { if (!addOutLine(v, false)) S.msg = { k: "warn", t: nameOf(v) + " is already on the list." }; else S.msg = null; } render(); return; }
+    o[f] = v;
+    if (f === "by") o.byAuto = false;
+    if (f === "job") { var j = X.jobs[v]; if (j && o.byAuto) o.by = j.installer || ""; }
+    if (f === "dest") S.msg = null;
+    if (t.tagName === "SELECT") render();
+  },
+  outSave: function () {
+    if (!canWork()) return flash("err", "Your login can view only.");
+    var o = outState();
+    if (!o.lines.length) return flash("err", "Add at least one item to take out.");
+    for (var i = 0; i < o.lines.length; i++) {
+      var l = o.lines[i], it = X.items[l.sku], qty = C.round2(n(l.qty));
+      if (!it) return flash("err", "Remove " + l.sku + " from the list. It isn't in the system.");
+      if (isSerial(l.sku)) return flash("err", "For panels and inverters, add them to the job's quote and kit them, so the serials are recorded. Remove " + it.name + " from this list.");
+      if (!(qty > 0)) return flash("err", "Enter a quantity above zero for " + it.name + ".");
+      if (qty > bal("WH", l.sku) + 1e-9) return flash("err", "Only " + q(bal("WH", l.sku), l.sku) + " of " + it.name + " in store. Lower the quantity.");
+    }
+    var to, extra = {};
+    if (o.dest === "van") { if (!o.van) return flash("err", "Choose the van."); to = o.van; extra.van = o.van; }
+    else if (o.dest === "job") {
+      var j = X.jobs[o.job];
+      if (!j || !(j.status === "out" || j.status === "kitted")) return flash("err", "Choose an open job.");
+      to = "JOB:" + j.no; extra.job = j.no; extra.van = j.van;
+    } else if (o.dest === "other") to = "OUT";
+    else return flash("err", "Choose where the stock is going.");
+    var by = String(o.by || "").trim(), ref = String(o.ref || "").trim();
+    if (!by) return flash("err", "Say who collected it.");
+    if (!ref) return flash("err", "Add the dispatch or invoice number, or a short note.");
+    var ts = now(), moves = o.lines.map(function (l) {
+      return mv("out", l.sku, n(l.qty), "WH", to, Object.assign({ ts: ts, unitCost: cost(l.sku), installer: by, ref: ref, reason: String(o.note || "").trim() }, extra));
+    });
+    stopCam();
+    save([{ op: "append", sheet: "Moves", rows: moves }], "Stock out saved: " + moves.length + " line(s).", function () { S.out = null; });
+  },
   startCam: function () { startCam("Point the camera at a sticker or crate label"); },
   lookup: function () { handleCode(S.f.code); },
-  mode: function (b) { S.f.mode = b.dataset.mode; S.msg = null; render(); },
+  mode: function (b) {
+    if (b.dataset.mode === "out") {
+      var sku = S.f.sku; if (!sku || !canWork()) return;
+      stopCam(); addOutLine(sku, true);
+      S.tab = "stock"; S.sub = "out"; S.item = null; S.job = null; S.f = {};
+      S.msg = { k: "info", t: "Added " + nameOf(sku) + " to the stock-out list." }; render(); window.scrollTo(0, 0); return;
+    }
+    S.f.mode = b.dataset.mode; S.msg = null; render(); },
   scanSerials: function (b) {
     var sku = b.dataset.sku;
     var need = b.dataset.need ? Number(b.dataset.need) : n((S.f.kit || {})[sku]);
@@ -1505,7 +1634,7 @@ var A = {
     var t = cfg.token;
     if (t) api.call("logout", {}).catch(function () {});
     cfg.token = ""; saveCfg(); stopCam();
-    S.f = {}; S.msg = null; S.loginMsg = "Signed out."; S.tab = "jobs"; S.sub = null; S.job = null; S.item = null;
+    S.f = {}; S.out = null; S.msg = null; S.loginMsg = "Signed out."; S.tab = "jobs"; S.sub = null; S.job = null; S.item = null;
     render();
   },
   saveConnection: function () {
@@ -1756,6 +1885,13 @@ function onScan(text) {
     if (list.length >= S.scanFor.need) { A.doneSerials(); return; }
     render(); return;
   }
+  if (S.tab === "stock" && S.sub === "out") {           // stock out: keep the camera open and add a line per scan
+    var sku = skuFromCode(text);
+    if (!sku) { $("#camHint").textContent = C.parseScan(text) + " isn't a sticker or item in the system."; return; }
+    addOutLine(sku, true);
+    $("#camHint").textContent = "Added " + nameOf(sku);
+    S.msg = null; render(); return;
+  }
   stopCam();
   handleCode(text);
 }
@@ -1809,6 +1945,7 @@ document.addEventListener("click", function (e) {
 });
 document.addEventListener("input", function (e) {
   var t = e.target;
+  if (t.dataset && t.dataset.out) { A.outSet(t); return; }
   if (!t.dataset || !t.dataset.bind) return;
   if (t.type === "checkbox") { bindValue(t.dataset.bind, t.checked); render(); return; }
   bindValue(t.dataset.bind, t.value);
@@ -1844,6 +1981,7 @@ document.addEventListener("keydown", function (e) {
   if (id === "lg_pin") { e.preventDefault(); if (!S.busy) A.login(); return; }
   if (/^cp_/.test(id)) { e.preventDefault(); if (!S.busy) A.firstPin(); return; }
   if (/^ac_(old|new|new2)$/.test(id)) { e.preventDefault(); if (!S.busy) A.changePin(); return; }
+  if (id === "so_code") { e.preventDefault(); A.outAddCode(); return; }
   if (e.target.id === "sc_code") { e.preventDefault(); A.lookup(); }
   if (e.target.id === "ser_manual") { e.preventDefault(); A.addSerial(); }
 });

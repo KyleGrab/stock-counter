@@ -200,6 +200,70 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: /Missing stock report/ }).click();
   await page.waitForSelector("text=Where it sits");
   await page.screenshot({ path: out + "/8-viewer-report.png", fullPage: true });
+  // --- stock out (v1.12): User sipho takes a 2-line load out to Customer / other ---
+  await signInAs("sipho", "1357");
+  await page.locator("nav button[data-tab=stock]").click();
+  await page.getByRole("button", { name: /Take stock out/ }).click();
+  await page.waitForSelector("text=Items going out");
+  const soBefore = await page.evaluate(() => [C.bal(X.B, "WH", "PV6-RED"), C.bal(X.B, "WH", "MC4")]);
+  await page.selectOption("#so_add", "PV6-RED");
+  await page.fill("#so_code", "mc4"); await page.getByRole("button", { name: "Add", exact: true }).click();
+  assert.strictEqual(await page.locator("[id^=so_qty_]").count(), 2, "two lines");
+  await page.fill("#so_qty_0", "5"); await page.fill("#so_qty_1", "999");
+  await page.selectOption("#so_dest", "other");
+  await page.fill("#so_by", "Test Driver"); await page.fill("#so_ref", "DN-TEST-1");
+  await page.getByRole("button", { name: "Save stock out" }).click();
+  await page.waitForSelector(".msg.err");
+  assert.ok((await text()).includes("Only") && (await text()).includes("MC4"), "over-quantity blocked, item named");
+  await page.fill("#so_qty_1", "0");
+  await page.getByRole("button", { name: "Save stock out" }).click();
+  await page.waitForSelector("text=above zero");
+  await page.fill("#so_qty_1", "7");
+  // the draft survives switching tabs
+  await page.locator("nav button[data-tab=jobs]").click();
+  await page.locator("nav button[data-tab=stock]").click();
+  await page.getByRole("button", { name: /Take stock out \(2 on the list\)/ }).click();
+  assert.strictEqual(await page.inputValue("#so_qty_1"), "7");
+  await page.getByRole("button", { name: "Save stock out" }).click();
+  await page.waitForSelector("text=Stock out saved: 2 line(s).");
+  assert.deepStrictEqual(await page.evaluate(() => [C.bal(X.B, "WH", "PV6-RED"), C.bal(X.B, "WH", "MC4"), C.bal(X.B, "OUT", "MC4")]), [soBefore[0] - 5, soBefore[1] - 7, 7]);
+  assert.strictEqual(await page.locator("[id^=so_qty_]").count(), 0, "list cleared after save");
+  const rec = await text();
+  assert.ok(rec.includes("Recent stock out") && rec.includes("Customer / other") && rec.includes("DN-TEST-1") && rec.includes("Test Driver"), "record shows the load");
+  assert.ok(!/R\u00a0\d/.test(rec.split("Recent stock out")[1]), "no rand values for a User");
+  assert.deepStrictEqual(await page.evaluate(() => { const m = D.Moves.filter(x => x.type === "out"); return [m.length, m[0].ts === m[1].ts, m[0].from, m[0].to, m[0].installer, m[0].ref, m[0].value === C.round2(m[0].qty * m[0].unitCost)]; }), [2, true, "WH", "OUT", "Test Driver", "DN-TEST-1", true]);
+  // Scan tab: 4th mode adds the item to the list and opens the Stock out screen
+  await page.locator("nav button[data-tab=scan]").click();
+  await page.locator("#camStop").click().catch(() => {});
+  await page.fill("#sc_code", "gs-0001"); await page.getByRole("button", { name: "Go", exact: true }).click();
+  await page.getByRole("radio", { name: "Stock out" }).click();
+  await page.waitForSelector("text=Items going out");
+  assert.strictEqual(await page.locator("[id^=so_qty_]").count(), 1);
+  await page.getByRole("button", { name: /Remove/ }).click();
+  // viewer: sees the record, cannot save
+  await signInAs("owner", "8642");
+  await page.locator("nav button[data-tab=stock]").click();
+  await page.getByRole("button", { name: "Stock out record" }).click();
+  await page.waitForSelector("text=Recent stock out");
+  assert.strictEqual(await page.getByRole("button", { name: "Save stock out" }).count(), 0, "viewer has no save button");
+  assert.ok(!/R\u00a0\d/.test((await text()).split("Recent stock out")[1]), "no rand values for a Viewer");
+  const vErr = await page.evaluate(() => { S.out = { lines: [{ sku: "MC4", qty: "1" }], dest: "other", van: "", job: "", by: "x", ref: "y", note: "" }; A.outSave(); return S.msg && S.msg.t; });
+  assert.ok(/view only/i.test(vErr), "viewer save refused");
+  await page.evaluate(() => { S.out = null; });
+  // manager sees rand values and can reverse
+  await signInAs("lebo", "580214");
+  await page.locator("nav button[data-tab=stock]").click();
+  await page.getByRole("button", { name: /Take stock out/ }).click();
+  assert.ok(/R\u00a0\d/.test((await text()).split("Recent stock out")[1]), "manager sees rand values");
+  await page.getByRole("button", { name: "← Stock" }).click();
+  await page.getByRole("button", { name: "MC4 connector" }).first().click();
+  await page.waitForSelector("text=Movements");
+  assert.ok((await text()).includes("Stock out"), "item history labels the move");
+  await page.getByRole("button", { name: "Reverse this" }).first().click();
+  await page.fill("#rev_reason", "Wrong item");
+  await page.getByRole("button", { name: "Confirm correction" }).click();
+  await page.waitForSelector("text=Correction recorded");
+  assert.strictEqual(await page.evaluate(() => C.bal(X.B, "WH", "MC4")), soBefore[1], "reversal returns it to the store");
   // --- inventory: User submits a count, Warehouse Manager approves ---
   await signInAs("sipho", "1357");
   await page.locator("nav button[data-tab=counts]").click();

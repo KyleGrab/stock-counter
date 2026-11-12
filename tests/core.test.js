@@ -145,3 +145,22 @@ console.log("core v1.3: all tests passed");
   assert.deepStrictEqual([r.rows[0].cost, r.rows[0].uom, r.rows[0].vatRemoved], [100, "in", false]);
   console.log("core v1.6: all tests passed");
 }
+
+// --- v1.12 stock out ---
+{
+  const items2 = { "X-1": { name: "Test item", cost: 10 } };
+  const base = [{ type: "receive", sku: "X-1", qty: 10, from: "SUPPLIER", to: "WH" }];
+  const o = { type: "out", sku: "X-1", qty: 4, from: "WH", to: "OUT" };
+  assert.strictEqual(C.isRealPlace("OUT"), false, "OUT is not a real place");
+  assert.strictEqual(C.checkBalances(base, [o], items2), null, "stock out within store stock is fine");
+  assert.ok(C.checkBalances(base, [{ ...o, qty: 11 }], items2), "can't take out more than the store has");
+  const B2 = C.balances(base.concat([o]));
+  assert.strictEqual(C.bal(B2, "WH", "X-1"), 6);
+  assert.strictEqual(C.onHand(B2, "X-1"), 6, "stock sent out is no longer on hand");
+  // reversing a stock out to a job takes it off the job's issued column again
+  const jm = base.concat([{ type: "out", sku: "X-1", qty: 4, from: "WH", to: "JOB:J-9", job: "J-9" },
+                          { type: "reverse", reverses: "out", sku: "X-1", qty: 4, from: "JOB:J-9", to: "WH", job: "J-9" }]);
+  const js = C.jobSummary("J-9", [], jm, items2).find(r => r.sku === "X-1");
+  assert.deepStrictEqual([js.issued, js.outstanding], [0, 0]);
+  console.log("core v1.12: all tests passed");
+}
