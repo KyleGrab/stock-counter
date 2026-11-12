@@ -1235,7 +1235,7 @@ function vChangePinFirst() {
 }
 
 /* ===================== actions ===================== */
-// Item codes can contain dots ("HWIRE-06.0-GRN"), so per-item fields keep the code in one piece.
+// Item codes can contain dots (e.g. "ABC-06.0-X"), so per-item fields keep the code in one piece.
 function splitBind(path) {
   var parts = path.split(".");
   if (/^(cnt|kit|kt)$/.test(parts[0]) && parts.length > 2) return [parts[0], parts.slice(1).join(".")];
