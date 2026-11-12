@@ -1,2 +1,11 @@
 node_modules/
 .DS_Store
+
+# Real business data never goes in this repo (it is public).
+agent-data/
+*.csv
+*.xlsx
+*.xls
+# Audit and approval notes describe weaknesses; master copies live in the private claude.ai Project.
+docs/01-audit.md
+docs/02-approved.md

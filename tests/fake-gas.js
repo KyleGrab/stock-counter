@@ -9,17 +9,21 @@ function makeGas() {
   const sheets = {}, props = {}, cache = {};
   function Sheet(name) {
     const rows = [];
+    let maxRows = 1000;   // like a new Google Sheet tab: writing below the last row throws
     return {
       name, rows,
-      getMaxRows: () => 1000,
+      getMaxRows: () => maxRows,
+      insertRowsAfter(after, n) { maxRows += n; },
       getMaxColumns: () => 26,
       getLastRow: () => rows.length,
       setFrozenRows() {},
-      deleteRow(r) { rows.splice(r - 1, 1); },
-      deleteRows(r, n) { rows.splice(r - 1, n); },
+      deleteRow(r) { rows.splice(r - 1, 1); maxRows--; },
+      deleteRows(r, n) { rows.splice(r - 1, n); maxRows -= n; },
       getRange(r, c, nr = 1, nc = 1) {
+        if (r < 1 || c < 1 || r + nr - 1 > maxRows || c + nc - 1 > 26) throw new Error("The coordinates of the range are outside the dimensions of the sheet.");
         return {
           setNumberFormat() { return this; },
+          clearContent() { for (let i = 0; i < nr; i++) { const row = rows[r - 1 + i]; if (row) for (let j = 0; j < nc; j++) row[c - 1 + j] = ""; } return this; },
           setFontWeight() { return this; },
           getValues() {
             const out = [];

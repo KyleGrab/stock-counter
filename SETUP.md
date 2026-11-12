@@ -160,6 +160,26 @@ While building and testing, the sign-in page has:
 
 **Before staff use the app:** set `DEV_QUICK_SIGNIN = false` at the top of `app.js` (or ask Claude to remove it). Anyone holding a remembered device could otherwise sign in as that person.
 
+## Exception check (Sheet does it, no AI, free)
+
+The Sheet can check itself and list what needs attention in an **Exceptions** tab:
+
+| Rule | Severity | Means |
+|---|---|---|
+| Job on site, not closed (7+ days) | High if stock is still out there | The leak itself: stock on site never shows as missing until the job is closed |
+| Crate packed, not collected (3+ days) | Medium | Stock tied up in a crate |
+| Issued over quote / Used over quote / Issued, not on quote | Medium | Beyond quote + cable allowance + 10% |
+| Missing after job / Count shortage (last 7 days) | High | Stock written off |
+| Repeat missing stock (same installer, 2+ jobs in 30 days) | High | A pattern, not bad luck |
+| Van kit shortfall (R500+ in 7 days) | Medium | Van counts book shortfalls as "used", so they never show as missing |
+| Low stock, Count waiting for approval (2+ days) | Medium | |
+| Correction made (last 7 days) | Low | Check each reason |
+| Negative stock | High | Should never happen |
+
+- **Run it:** spreadsheet menu **Stock Counter → Check exceptions now**.
+- **Every morning:** **Stock Counter → Turn on daily exception check (6am)**. Google asks you to approve once more (the script now needs permission to run on a timer). Turn it off from the same menu.
+- Thresholds are at the top of the rules section in `Code.gs` (`RULES`). The Exceptions tab is never sent to phones.
+
 ## Security checklist (all free, about 30 minutes, once)
 
 **How the app is already protected (built in):**

@@ -28,7 +28,7 @@
  *  - Text that looks like a spreadsheet formula is stored as plain text.
  */
 
-var VERSION = "1.5";
+var VERSION = "1.6";
 
 var SHEETS = {
   Items:    { key: "sku",  cols: ["sku", "name", "uom", "track", "cost", "reorder", "allowancePct"] },
@@ -93,6 +93,10 @@ function onOpen() {
   SpreadsheetApp.getUi().createMenu("Stock Counter")
     .addItem("Set admin PIN…", "menuSetAdminPin")
     .addItem("Check admin login", "menuCheckAdmin")
+    .addSeparator()
+    .addItem("Check exceptions now", "menuCheckExceptions")
+    .addItem("Turn on daily exception check (6am)", "menuDailyOn")
+    .addItem("Turn off daily exception check", "menuDailyOff")
     .addToUi();
 }
 
@@ -258,7 +262,7 @@ function log_(username, event, detail) {
       sh.setFrozenRows(1);
       if (sh.hideSheet) sh.hideSheet();
     }
-    sh.getRange(sh.getLastRow() + 1, 1, 1, 4).setValues([[new Date().toISOString(), safe_(String(username || "").slice(0, 40)), safe_(event), safe_(String(detail || "").slice(0, 200))]]);
+    appendRows_(sh, [[new Date().toISOString(), safe_(String(username || "").slice(0, 40)), safe_(event), safe_(String(detail || "").slice(0, 200))]], 4);
     var extra = sh.getLastRow() - 1 - LOG_KEEP;
     if (extra > 100) sh.deleteRows(2, extra);
   } catch (e) { /* the log must never block a sign-in */ }
@@ -445,6 +449,172 @@ function readAll_(have) {
   return out;
 }
 
+
+/* ---------------- exception rules ----------------
+ * Fixed rules, no AI. Reads the app's tabs, writes the "Exceptions" tab (rewritten each run).
+ * The Exceptions tab is never sent to phones. Change the thresholds below to suit the business.
+ */
+var RULES = {
+  JOB_OUT_DAYS: 7,          // job on site this long and still not closed (stock out there, unexplained)
+  JOB_KITTED_DAYS: 3,       // crate packed this long and not collected
+  OVER_QUOTE_PCT: 10,       // issued (open job) or consumed (closed job) above quote by more than this
+  COUNT_PENDING_DAYS: 2,    // a submitted shelf count waiting this long for approval
+  LOOKBACK_DAYS: 7,         // window for "recent" rules (missing, van shortfalls, corrections)
+  VAN_SHORT_VALUE: 500,     // R: van kit shortfall per van in the window worth a look
+  REPEAT_JOBS: 2,           // same installer with missing stock on this many jobs...
+  REPEAT_WINDOW_DAYS: 30    // ...within this many days
+};
+var EXC_COLS = ["checked", "severity", "rule", "ref", "detail", "value", "who"];
+
+function menuCheckExceptions() {
+  var r = checkExceptions();
+  SpreadsheetApp.getActiveSpreadsheet().toast(r.high + " high, " + r.medium + " medium, " + r.low + " low. See the Exceptions tab.", "Exceptions checked", 8);
+}
+function menuDailyOn() {
+  menuDailyOff_(true);
+  ScriptApp.newTrigger("checkExceptions").timeBased().everyDays(1).atHour(6).create();
+  SpreadsheetApp.getUi().alert("Daily check is on. It runs every morning around 6am and rewrites the Exceptions tab.");
+}
+function menuDailyOff() { menuDailyOff_(false); }
+function menuDailyOff_(quiet) {
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === "checkExceptions") ScriptApp.deleteTrigger(t); });
+  if (!quiet) SpreadsheetApp.getUi().alert("Daily check is off.");
+}
+
+/** Runs every rule and rewrites the Exceptions tab. Returns counts by severity. */
+function checkExceptions(nowMs) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  var d;
+  try { d = {}; ["Items", "Jobs", "Lines", "Moves", "Counts", "Vans"].forEach(function (n) { d[n] = rows_(n, 0); }); }
+  finally { lock.releaseLock(); }
+  var out = exceptions_(d, nowMs || Date.now());
+  var ss = SpreadsheetApp.getActiveSpreadsheet(), sh = ss.getSheetByName("Exceptions") || ss.insertSheet("Exceptions");
+  var stamp = new Date(nowMs || Date.now()).toISOString();
+  var rows = out.length ? out.map(function (e) { return EXC_COLS.map(function (c) { return c === "checked" ? stamp : safe_(e[c] == null ? "" : e[c]); }); })
+    : [[stamp, "OK", "All clear", "", "No exceptions found.", "", ""]];
+  var old = sh.getLastRow();
+  if (old > 0) sh.getRange(1, 1, old, EXC_COLS.length).clearContent();
+  sh.getRange(1, 1, 1, EXC_COLS.length).setValues([EXC_COLS]).setFontWeight("bold");
+  sh.setFrozenRows(1);
+  ensureRows_(sh, rows.length + 1, EXC_COLS.length);
+  sh.getRange(2, 1, rows.length, EXC_COLS.length).setValues(rows);
+  var c = { high: 0, medium: 0, low: 0 };
+  out.forEach(function (e) { c[e.severity.toLowerCase()]++; });
+  return c;
+}
+
+/** Pure rule engine: data in, list of exceptions out (sorted High first, then by value). */
+function exceptions_(d, now) {
+  var R2 = function (n) { return Math.round(Number(n || 0) * 100) / 100; };
+  var num = function (v) { var n = Number(v); return isFinite(n) ? n : 0; };
+  var days = function (ts) { var t = new Date(ts).getTime(); return isFinite(t) ? (now - t) / 864e5 : 0; };
+  var items = {}; d.Items.forEach(function (i) { items[i.sku] = i; });
+  var cost = function (sku) { return num(items[sku] && items[sku].cost); };
+  var name = function (sku) { return (items[sku] && items[sku].name) || sku; };
+  var out = [];
+  function add(sev, rule, ref, detail, value, who) { out.push({ severity: sev, rule: rule, ref: ref, detail: detail, value: value == null ? "" : R2(value), who: who || "" }); }
+
+  // balances per place
+  var B = {};
+  d.Moves.forEach(function (m) {
+    var q = num(m.qty);
+    if (m.from) { B[m.from] = B[m.from] || {}; B[m.from][m.sku] = (B[m.from][m.sku] || 0) - q; }
+    if (m.to) { B[m.to] = B[m.to] || {}; B[m.to][m.sku] = (B[m.to][m.sku] || 0) + q; }
+  });
+  var bal = function (loc, sku) { return R2((B[loc] && B[loc][sku]) || 0); };
+
+  // 1. Integrity: no real place may be negative.
+  Object.keys(B).forEach(function (loc) {
+    if (!isRealPlace_(loc)) return;
+    Object.keys(B[loc]).forEach(function (sku) { if (bal(loc, sku) < -0.004) add("High", "Negative stock", loc, name(sku) + ": " + bal(loc, sku) + ". Should never happen; check recent corrections.", bal(loc, sku) * cost(sku)); });
+  });
+
+  // per-job issued vs quoted (same logic as the app's job summary)
+  function job_(no) {
+    var loc = "JOB:" + no, r = {};
+    var row = function (sku) { return r[sku] || (r[sku] = { quoted: 0, issued: 0, back: 0 }); };
+    d.Lines.forEach(function (l) { if (l.job === no) row(l.sku).quoted += num(l.quoted); });
+    d.Moves.forEach(function (m) {
+      var q = num(m.qty);
+      if (m.type === "reverse") { if (m.reverses === "extra" && m.from === loc) row(m.sku).issued -= q; return; }
+      if (m.to === loc) row(m.sku).issued += q;
+      else if (m.from === loc && (m.to === "WH" || m.to === "SCRAP")) row(m.sku).back += q;
+    });
+    return r;
+  }
+  function stockAt(no) { var loc = "JOB:" + no, v = 0; Object.keys(B[loc] || {}).forEach(function (sku) { if (bal(loc, sku) > 0) v += bal(loc, sku) * cost(sku); }); return R2(v); }
+
+  d.Jobs.forEach(function (j) {
+    var who = j.installer || "";
+    // 2. Jobs left open: the leak this app exists to stop. Stock on site never becomes "missing" until the job is closed.
+    if (j.status === "out" && days(j.outAt) >= RULES.JOB_OUT_DAYS)
+      add(stockAt(j.no) > 0 ? "High" : "Medium", "Job on site, not closed", j.no, (j.client || "") + " · on site " + Math.floor(days(j.outAt)) + " days. Close it: return leftovers, record what was used.", stockAt(j.no), who);
+    if (j.status === "kitted" && days(j.kittedAt) >= RULES.JOB_KITTED_DAYS)
+      add("Medium", "Crate packed, not collected", j.no, (j.client || "") + " · packed " + Math.floor(days(j.kittedAt)) + " days ago. Collect it or unpack it.", stockAt(j.no), who);
+    // 3. Over quote: open jobs on what was issued; recently closed jobs on what was consumed.
+    var open = j.status === "out" || j.status === "kitted";
+    var recentClosed = j.status === "closed" && days(j.closedAt) <= RULES.LOOKBACK_DAYS;
+    if (open || recentClosed) {
+      var r = job_(j.no);
+      Object.keys(r).forEach(function (sku) {
+        var x = r[sku], used = open ? x.issued : x.issued - x.back;
+        if (used <= 0.004) return;
+        if (x.quoted <= 0.004) { add("Medium", "Issued, not on quote", j.no, name(sku) + ": " + R2(used) + " " + (items[sku] ? items[sku].uom : "") + " with no quote line.", used * cost(sku), who); return; }
+        // Open jobs are kitted with the cable allowance on purpose, so measure them against the kit, not the bare quote.
+        var it = items[sku] || {}, isLen = it.uom === "m" || it.uom === "in";
+        var allow = open && isLen ? (it.allowancePct === "" || it.allowancePct == null ? 10 : num(it.allowancePct)) : 0;
+        var base = allow ? Math.ceil(R2(x.quoted * (1 + allow / 100)) - 1e-9) : x.quoted;
+        var limit = base + x.quoted * RULES.OVER_QUOTE_PCT / 100;
+        if (used > limit + 0.004)
+          add("Medium", open ? "Issued over quote" : "Used over quote", j.no, name(sku) + ": " + R2(used) + " vs quote " + R2(x.quoted) + (allow ? " (kit " + base + ")" : "") + ", +" + Math.round((used / x.quoted - 1) * 100) + "%.", (used - x.quoted) * cost(sku), who);
+      });
+    }
+  });
+
+  // 4. Missing stock in the window, and repeat patterns per installer.
+  var perInstaller = {};
+  d.Moves.forEach(function (m) {
+    if (m.to !== "LOSS" || m.type === "reverse") return;
+    var age = days(m.ts);
+    if (m.installer && m.job && age <= RULES.REPEAT_WINDOW_DAYS) { (perInstaller[m.installer] = perInstaller[m.installer] || {})[m.job] = true; }
+    if (age > RULES.LOOKBACK_DAYS) return;
+    add("High", m.job ? "Missing after job" : "Count shortage", m.job || m.from, name(m.sku) + ": " + R2(num(m.qty)) + " not returned or not found." + (m.reason ? " Reason: " + m.reason : ""), num(m.value), m.installer || m.by);
+  });
+  Object.keys(perInstaller).forEach(function (who) {
+    var jobs = Object.keys(perInstaller[who]);
+    if (jobs.length >= RULES.REPEAT_JOBS) add("High", "Repeat missing stock", who, "Missing stock on " + jobs.length + " jobs in " + RULES.REPEAT_WINDOW_DAYS + " days: " + jobs.join(", ") + ". A pattern, not bad luck.", null, who);
+  });
+
+  // 5. Van kit shortfalls are booked as "used", so they never show as missing. Flag large ones.
+  var vanShort = {};
+  d.Moves.forEach(function (m) { if (m.type === "kituse" && days(m.ts) <= RULES.LOOKBACK_DAYS) vanShort[m.from] = (vanShort[m.from] || 0) + num(m.value); });
+  var vanName = {}; d.Vans.forEach(function (v) { vanName[v.id] = v.name; });
+  Object.keys(vanShort).forEach(function (v) {
+    if (vanShort[v] >= RULES.VAN_SHORT_VALUE) add("Medium", "Van kit shortfall", vanName[v] || v, "Van counts found this much less than the system in " + RULES.LOOKBACK_DAYS + " days. Booked as used on jobs; check it matches the work done.", vanShort[v]);
+  });
+
+  // 6. Low stock in the store.
+  d.Items.forEach(function (i) {
+    var lvl = num(i.reorder), wh = bal("WH", i.sku);
+    if (lvl > 0 && wh < lvl) add("Medium", "Low stock", i.sku, name(i.sku) + ": " + wh + " in store, order level " + lvl + ".", (lvl - wh) * cost(i.sku));
+  });
+
+  // 7. Counts waiting for approval.
+  d.Counts.forEach(function (c) {
+    if (c.status === "pending" && days(c.ts) >= RULES.COUNT_PENDING_DAYS) add("Medium", "Count waiting for approval", c.id, "Submitted " + Math.floor(days(c.ts)) + " days ago by " + (c.by || "?") + ". Stock is not updated until approved.", num(c.value), c.by);
+  });
+
+  // 8. Corrections in the window: every one should have a good reason.
+  d.Moves.forEach(function (m) {
+    if (m.type === "reverse" && days(m.ts) <= RULES.LOOKBACK_DAYS) add("Low", "Correction made", m.job || m.sku, name(m.sku) + ": undid " + (m.reverses || "") + " of " + R2(num(m.qty)) + ". Reason: " + (m.reason || "none"), num(m.value), m.by);
+  });
+
+  var rank = { High: 0, Medium: 1, Low: 2 };
+  out.sort(function (a, b) { return rank[a.severity] - rank[b.severity] || Math.abs(num(b.value)) - Math.abs(num(a.value)); });
+  return out;
+}
+
 /* ---------------- writing ---------------- */
 
 /**
@@ -612,11 +782,30 @@ function safe_(v) {
 }
 function toRow_(cols, obj) { return cols.map(function (c) { return safe_(obj[c]); }); }
 
+/**
+ * A Sheet tab only has so many rows (1,000 by default) and writing below the last one fails.
+ * Make room first, in blocks of 500, keeping new rows as plain text like the rest.
+ */
+function ensureRows_(sh, lastRowNeeded, cols) {
+  var max = sh.getMaxRows();
+  if (lastRowNeeded <= max) return;
+  var add = Math.max(500, lastRowNeeded - max);
+  sh.insertRowsAfter(max, add);
+  sh.getRange(max + 1, 1, add, cols || sh.getMaxColumns()).setNumberFormat("@");
+}
+/** Append rows below the last used row, making room if needed. */
+function appendRows_(sh, values, cols) {
+  if (!values.length) return;
+  var start = sh.getLastRow() + 1;
+  ensureRows_(sh, start + values.length - 1, cols);
+  sh.getRange(start, 1, values.length, cols).setValues(values);
+}
+
 function write_(step) {
   var def = SHEETS[step.sheet], sh = sheet_(step.sheet), cols = def.cols, rows = step.rows || [];
 
   if (step.op === "insert") {
-    if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, cols.length).setValues(rows.map(function (r) { return toRow_(cols, r); }));
+    appendRows_(sh, rows.map(function (r) { return toRow_(cols, r); }), cols.length);
     return;
   }
 
@@ -630,7 +819,7 @@ function write_(step) {
         var range = sh.getRange(at + 2, 1, 1, cols.length), cur = range.getValues()[0];
         range.setValues([cols.map(function (c, i) { return r.hasOwnProperty(c) ? safe_(r[c]) : cur[i]; })]);
       } else {
-        sh.getRange(sh.getLastRow() + 1, 1, 1, cols.length).setValues([toRow_(cols, r)]);
+        appendRows_(sh, [toRow_(cols, r)], cols.length);
         keys.push(k);
       }
     });
@@ -643,7 +832,7 @@ function write_(step) {
       var vals = sh.getRange(2, cols.indexOf("job") + 1, last - 1, 1).getValues();
       for (var i = vals.length - 1; i >= 0; i--) if (String(vals[i][0]) === job) sh.deleteRow(i + 2);
     }
-    if (rows.length) sh.getRange(sh.getLastRow() + 1, 1, rows.length, cols.length).setValues(rows.map(function (r) { return toRow_(cols, r); }));
+    appendRows_(sh, rows.map(function (r) { return toRow_(cols, r); }), cols.length);
     return;
   }
 

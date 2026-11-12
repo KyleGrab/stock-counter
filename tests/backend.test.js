@@ -254,3 +254,92 @@ console.log("backend roles: all tests passed");
   assert.ok(sheets.Log.rows.length - 1 <= 1101, "log keeps only the latest rows");
   console.log("backend v1.5 security: all tests passed");
 }
+
+// --- v1.6 sheet: saving past row 1,000, and the exception rules ---
+{
+  const { ctx, post, sheets } = makeGas();
+  ctx.setAdminPin_("482915", "482915");
+  const T = post({ action: "login", username: "admin", pin: "482915" }).token;
+  assert.ok(post({ token: T, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV6", name: "PV cable 6mm", uom: "m", cost: 12 }] }] }).ok);
+  // 12 saves of 100 receipts = 1,200 Moves rows: past the 1,000 rows a new tab has
+  for (let b = 0; b < 12; b++) {
+    const rows = Array.from({ length: 100 }, (_, i) => ({ id: `R${b}-${i}`, ts: new Date().toISOString(), type: "receive", sku: "PV6", qty: 1, from: "SUPPLIER", to: "WH", unitCost: 12, value: 12, ref: "INV-" + b }));
+    const r = post({ token: T, ops: [{ op: "append", sheet: "Moves", rows }] });
+    assert.ok(r.ok, "save " + b + ": " + r.error);
+  }
+  assert.strictEqual(sheets.Moves.rows.length - 1, 1200, "all 1,200 movements stored");
+  const d = post({ token: T }).data;
+  assert.strictEqual(d.Moves.length, 1200);
+  assert.ok(sheets.Moves.getMaxRows() >= 1201, "the tab grew");
+  console.log("backend v1.6 row capacity: all tests passed");
+}
+{
+  const { ctx, sheets } = makeGas();
+  const DAY = 864e5, now = Date.parse("2026-11-12T08:00:00Z"), ago = n => new Date(now - n * DAY).toISOString();
+  const s = o => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v == null ? "" : String(v)]));
+  const d = {
+    Items: [{ sku: "PV6", name: "PV cable 6mm", uom: "m", cost: 12, reorder: 0, allowancePct: 10 }, { sku: "PNL", name: "Panel 550W", uom: "ea", cost: 2000, reorder: 10, allowancePct: "" }, { sku: "LUG", name: "Lug", uom: "ea", cost: 5, reorder: 0 }].map(s),
+    Vans: [{ id: "VAN-1", name: "Van 1" }].map(s),
+    Jobs: [
+      { no: "J-1", client: "A", status: "out", installer: "Sipho", outAt: ago(10) },          // left open 10 days with stock
+      { no: "J-2", client: "B", status: "out", installer: "Sipho", outAt: ago(2) },           // open 2 days, fine
+      { no: "J-3", client: "C", status: "kitted", installer: "Pieter", kittedAt: ago(5) },    // crate not collected
+      { no: "J-4", client: "D", status: "closed", installer: "Sipho", closedAt: ago(3), missingValue: 60 },
+      { no: "J-5", client: "E", status: "closed", installer: "Sipho", closedAt: ago(20), missingValue: 24 }
+    ].map(s),
+    Lines: [{ job: "J-1", sku: "PV6", quoted: 22 }, { job: "J-2", sku: "PV6", quoted: 22 }, { job: "J-3", sku: "PNL", quoted: 6 }, { job: "J-4", sku: "PV6", quoted: 20 }, { job: "J-5", sku: "PV6", quoted: 20 }].map((l, i) => s(Object.assign({ id: "L" + i }, l))),
+    Moves: [
+      { type: "receive", sku: "PV6", qty: 500, from: "SUPPLIER", to: "WH", ts: ago(30) },
+      { type: "receive", sku: "PNL", qty: 8, from: "SUPPLIER", to: "WH", ts: ago(30) },
+      { type: "kit", sku: "PV6", qty: 25, from: "WH", to: "JOB:J-1", job: "J-1", ts: ago(11) },   // 22 +10% = 24.2 -> 25: the allowance, NOT over quote
+      { type: "kit", sku: "PV6", qty: 25, from: "WH", to: "JOB:J-2", job: "J-2", ts: ago(3) },
+      { type: "extra", sku: "PV6", qty: 6, from: "WH", to: "JOB:J-2", job: "J-2", ts: ago(2) },   // 31 issued vs kit 25 + 2.2 tolerance -> over
+      { type: "extra", sku: "LUG", qty: 10, from: "WH", to: "JOB:J-2", job: "J-2", ts: ago(2) },  // not on quote (WH goes negative -> integrity rule)
+      { type: "kit", sku: "PNL", qty: 6, from: "WH", to: "JOB:J-3", job: "J-3", ts: ago(5) },
+      { type: "kit", sku: "PV6", qty: 30, from: "WH", to: "JOB:J-4", job: "J-4", ts: ago(6) },
+      { type: "used", sku: "PV6", qty: 25, from: "JOB:J-4", to: "USED", job: "J-4", ts: ago(3) },
+      { type: "missing", sku: "PV6", qty: 5, from: "JOB:J-4", to: "LOSS", job: "J-4", installer: "Sipho", value: 60, ts: ago(3) },
+      { type: "missing", sku: "PV6", qty: 2, from: "WH", to: "LOSS", job: "J-5", installer: "Sipho", value: 24, ts: ago(20) },
+      { type: "kituse", sku: "PV6", qty: 50, from: "VAN-1", to: "USED", van: "VAN-1", value: 600, ts: ago(1) },
+      { type: "reverse", reverses: "return", sku: "PV6", qty: 1, from: "WH", to: "JOB:J-1", job: "J-1", value: 12, reason: "typo", by: "lebo", ts: ago(1) }
+    ].map((m, i) => s(Object.assign({ id: "M" + i }, m))),
+    Counts: [{ id: "CNT-1", status: "pending", ts: ago(3), by: "sipho", value: -10 }, { id: "CNT-2", status: "pending", ts: ago(0.5), by: "sipho" }].map(s)
+  };
+  const ex = ctx.exceptions_(d, now);
+  const find = (rule, ref) => ex.filter(e => e.rule === rule && (ref === undefined || e.ref === ref));
+  assert.strictEqual(find("Job on site, not closed", "J-1").length, 1, "J-1 left open");
+  assert.strictEqual(find("Job on site, not closed", "J-1")[0].severity, "High", "with stock -> High");
+  assert.strictEqual(find("Job on site, not closed", "J-2").length, 0, "J-2 only 2 days");
+  assert.strictEqual(find("Crate packed, not collected", "J-3").length, 1);
+  assert.strictEqual(find("Issued over quote", "J-1").length, 0, "cable allowance is not over quote");
+  assert.strictEqual(find("Issued over quote", "J-2").length, 1, "extras beyond allowance + tolerance flagged");
+  assert.strictEqual(find("Issued, not on quote", "J-2").length, 1);
+  assert.strictEqual(find("Used over quote", "J-4").length, 1, "closed J-4 consumed 30 vs 20");
+  assert.strictEqual(find("Missing after job", "J-4").length, 1, "recent missing");
+  assert.strictEqual(find("Missing after job", "J-5").length, 0, "older than the window");
+  assert.strictEqual(find("Repeat missing stock", "Sipho").length, 1, "2 jobs in 30 days");
+  assert.strictEqual(find("Van kit shortfall", "Van 1").length, 1);
+  assert.strictEqual(find("Low stock", "PNL").length, 1);
+  assert.strictEqual(find("Count waiting for approval", "CNT-1").length, 1);
+  assert.strictEqual(find("Count waiting for approval", "CNT-2").length, 0);
+  assert.strictEqual(find("Correction made").length, 1);
+  assert.strictEqual(find("Negative stock", "WH").length, 1, "LUG issued with none received");
+  const sev = ex.map(e => e.severity), rank = { High: 0, Medium: 1, Low: 2 };
+  assert.ok(sev.every((x, i) => i === 0 || rank[sev[i - 1]] <= rank[x]), "sorted High first");
+  // writes the tab, and a clean dataset says "All clear"
+  for (const n of ["Items", "Jobs", "Lines", "Moves", "Counts", "Vans"]) {
+    d[n].forEach(r => sheets[n].rows.push(ctx.SHEETS[n].cols.map(c => r[c] || "")));
+  }
+  const c = ctx.checkExceptions(now);
+  assert.strictEqual(c.high + c.medium + c.low, ex.length);
+  assert.strictEqual(JSON.stringify(sheets.Exceptions.rows[0]), JSON.stringify(ctx.EXC_COLS));
+  assert.strictEqual(sheets.Exceptions.rows.length - 1, ex.length);
+  const g2 = makeGas(); g2.ctx.checkExceptions(now);
+  assert.strictEqual(g2.sheets.Exceptions.rows[1][2], "All clear");
+  // the Exceptions tab is never sent to phones and can't be written from one
+  g2.ctx.setAdminPin_("482915", "482915");
+  const T2 = g2.post({ action: "login", username: "admin", pin: "482915" }).token;
+  assert.strictEqual(g2.post({ token: T2 }).data.Exceptions, undefined);
+  assert.ok(/Unknown tab/.test(g2.post({ token: T2, ops: [{ op: "upsert", sheet: "Exceptions", rows: [{ checked: "x" }] }] }).error));
+  console.log("backend v1.6 exception rules: all tests passed");
+}
