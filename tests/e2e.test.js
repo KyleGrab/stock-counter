@@ -368,6 +368,90 @@ const server = http.createServer((req, res) => {
   await page.waitForSelector("text=Movements");
   assert.strictEqual(await page.getByRole("button", { name: "Reverse this" }).count(), 0, "viewer can't reverse");
   assert.strictEqual(await page.getByRole("button", { name: "Approve", exact: true }).count(), 0);
+  // --- daily log (v1.13): reads Moves and Counts, grouped by task ---
+  await signInAs("lebo", "580214");
+  await page.evaluate(() => save([{ op: "append", sheet: "Moves", rows: [mv("receive", "LUG-16", 10, "SUPPLIER", "WH", { ref: '=INV-9, "x"', unitCost: 5, reason: "Line one\nline two" })] }], "Received."));
+  await page.waitForSelector("text=Received.");
+  const openLog = async () => { await page.locator("nav button[data-tab=more]").click(); await page.getByRole("button", { name: /Daily log/ }).click(); await page.waitForSelector("#log_day"); };
+  await openLog();
+  const todaySA = await page.evaluate(() => C.saDay(now()));
+  assert.strictEqual(await page.inputValue("#log_day"), todaySA, "defaults to today in South African time");
+  assert.ok(await page.getByRole("button", { name: /Next day/ }).isDisabled(), "can't go past today");
+  const lt = () => page.locator('#logList').innerText();
+  let t = await page.locator('#logList').innerText();
+  for (const w of ["Stock out", "Received", "Correction", "by sipho", "approved by lebo", "Customer / other"]) assert.ok(t.includes(w), "log shows " + w);
+  assert.ok(/moved out of the store/.test(await text()) && /R\s?\d/.test(t), "manager sees rand values");
+  const tasksBefore = await page.evaluate(() => logTasks().length);
+  // filters
+  await page.selectOption("#log_type", "out");
+  t = await lt(); assert.ok(t.includes("Stock out") && !t.includes("Received") && !t.includes("Correction"), "type filter: Stock out only");
+  await page.selectOption("#log_type", "in");
+  t = await lt(); assert.ok(t.includes("Received") && !t.includes("Stock out"), "type filter: Stock in only");
+  await page.selectOption("#log_type", "fixes");
+  t = await lt(); assert.ok(t.includes("Correction") && !t.includes("Received"), "type filter: Corrections only");
+  await page.selectOption("#log_type", "all");
+  await page.selectOption("#log_who", "sipho");
+  assert.deepStrictEqual(await page.evaluate(() => [...new Set(logTasks().map(x => x.by))]), ["sipho"], "person filter");
+  await page.selectOption("#log_who", "");
+  assert.strictEqual(await page.evaluate(() => logTasks().length), tasksBefore);
+  // CSV for a manager: value columns, formula guard, quoting, file name
+  let [logDl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Download CSV" }).click()]);
+  assert.strictEqual(logDl.suggestedFilename(), "stock-log-" + todaySA + ".csv");
+  let logCsv = fs.readFileSync(await logDl.path(), "utf8");
+  assert.ok(logCsv.startsWith("﻿date,time,by,approved_by,task,item_code,item_name,qty,unit,from,to,job,reference,reason,unit_cost,value\r\n"), "manager CSV has value columns");
+  assert.ok(logCsv.includes('"\'=INV-9, ""x"""'), "formula guard and RFC 4180 quoting");
+  assert.ok(logCsv.includes('"Line one\nline two"'), "newline quoted");
+  assert.ok(/,Stock out,/.test(logCsv) && /,Correction,/.test(logCsv) && /,Received,/.test(logCsv));
+  // Previous / Next day
+  await page.getByRole("button", { name: /Previous day/ }).click();
+  assert.strictEqual(await page.inputValue("#log_day"), await page.evaluate(d => C.addDays(d, -1), todaySA));
+  assert.ok(!(await page.getByRole("button", { name: /Next day/ }).isDisabled()));
+  await page.fill("#log_day", "2020-01-01");
+  await page.waitForSelector("text=Nothing recorded for this day");
+  await page.fill("#log_day", "2099-01-01");
+  assert.strictEqual(await page.inputValue("#log_day"), todaySA, "a future day is pulled back to today");
+  await page.getByRole("button", { name: /Previous day/ }).click();
+  await page.getByRole("button", { name: /Next day/ }).click();
+  assert.strictEqual(await page.inputValue("#log_day"), todaySA);
+  // a manager reverses straight from the log (same reason rule as item history)
+  await page.selectOption("#log_type", "in");
+  await page.getByRole("button", { name: "Reverse this" }).first().click();
+  await page.getByRole("button", { name: "Confirm correction" }).click();
+  await page.waitForSelector("text=Give a reason for the correction.");
+  await page.fill("#rev_reason", "Typed twice");
+  await page.getByRole("button", { name: "Confirm correction" }).click();
+  await page.waitForSelector("text=Correction recorded.");
+  assert.deepStrictEqual(await page.evaluate(() => { const m = D.Moves.filter(x => x.type === "reverse" && x.reverses === "receive" && x.reason === "Typed twice"); return [m.length, m[0].by, m[0].approvedBy || ""]; }), [1, "lebo", ""], "manager reversed directly");
+  assert.ok((await text()).includes("Corrected"), "the line now shows Corrected");
+  // a User sees only their own tasks, no rand values, and CSV without value columns
+  await signInAs("sipho", "1357");
+  await openLog();
+  t = await lt();
+  assert.ok(t.includes("by sipho"), "User sees own tasks");
+  assert.deepStrictEqual(await page.evaluate(() => [...new Set(logTasks().map(x => x.by))]), ["sipho"], "User sees only own tasks");
+  assert.ok(!/(^|\n)\d\d:\d\d · [^\n]*\nby (lebo|admin)/.test(t), "no one else's task headings");
+  assert.ok(!/R\s?\d/.test(await text()) && !(await text()).includes("moved out of the store"), "no rand values for a User");
+  assert.strictEqual(await page.locator("#log_who").count(), 0, "no person filter for a User");
+  [logDl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Download CSV" }).click()]);
+  logCsv = fs.readFileSync(await logDl.path(), "utf8");
+  assert.ok(logCsv.startsWith("﻿date,time,by,approved_by,task,item_code,item_name,qty,unit,from,to,job,reference,reason\r\n"), "User CSV has no value columns");
+  assert.deepStrictEqual(logCsv.trim().split("\r\n").slice(1).filter(r => !/^[^,]*,[^,]*,sipho,/.test(r)), [], "every CSV row is the User's own");
+  // a User reverses from the log through the manager pop-up (the same path as item history)
+  await page.getByRole("button", { name: "Reverse this" }).first().click();
+  await page.fill("#rev_reason", "Wrong load");
+  await page.getByRole("button", { name: "Confirm correction" }).click();
+  await page.locator("#ovModal").waitFor({ state: "visible" });
+  await page.locator("#ovCancel").click();
+  await page.locator("#ovModal").waitFor({ state: "hidden" });
+  await page.evaluate(() => { S.f = {}; });
+  // a Viewer reads everything but cannot reverse and sees no rand values
+  await signInAs("owner", "8642");
+  await openLog();
+  t = await lt();
+  assert.ok(t.includes("by sipho") && t.includes("by lebo"), "viewer sees everyone");
+  assert.strictEqual(await page.getByRole("button", { name: "Reverse this" }).count(), 0, "viewer can't reverse");
+  assert.ok(!/R\s?\d/.test(await text()), "no rand values for a Viewer");
+  assert.strictEqual(await page.locator("#log_who").count(), 1, "viewer has the person filter");
   // --- inventory: User submits a count, Warehouse Manager approves ---
   await signInAs("sipho", "1357");
   await page.locator("nav button[data-tab=counts]").click();

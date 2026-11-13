@@ -60,6 +60,23 @@ const P = n => `X${n}"'><img src=x id=pwn${n} onerror="window.__pwn=${n}"><svg o
   });
   await visit("stock out");
   await pg.evaluate(() => { S.out = null; S.sub = null; });
+  // daily log: poisoned refs, reasons, collected-by, by, approved-by, count notes, and poisoned filter values, on today's date
+  await pg.evaluate(() => {
+    const P4 = n => `X${n}"'><img src=x id=pwn${n} onerror="window.__pwn=${n}"><svg onload="window.__pwn=${n}"></svg>&lt;b&gt;`;
+    const d = LS.get("sc_demo", null), ts = new Date().toISOString(), sku = d.Items[0].sku;
+    d.Moves.push({ id: "lg1", ts, type: "receive", sku, qty: 1, from: "SUPPLIER", to: "WH", ref: P4(980), reason: P4(981), by: P4(982), approvedBy: P4(983), value: 1 });
+    d.Moves.push({ id: "lg2", ts: new Date(Date.now() + 1000).toISOString(), type: "out", sku, qty: 1, from: "WH", to: "OUT", installer: P4(984), ref: P4(985), reason: P4(986), by: "plain", approvedBy: P4(987), value: 1 });
+    d.Counts.push({ id: "CNT-lg", place: "WH", ts, by: P4(988), status: "approved", decidedBy: P4(989), decidedAt: ts, decisionNote: P4(990), lines: JSON.stringify([{ sku, system: 5, counted: 3, diff: -2, value: -2 }]), value: -2, note: P4(991) });
+    LS.set("sc_demo", d); SD = emptyData(); Q = []; persist(); rebuild();
+    S.tab = "more"; S.sub = "log"; S.item = null; S.job = null; S.f = { rev: "lg1", revReason: P4(992) }; S.log = { day: "", type: "all", who: P4(982) }; render();
+  });
+  assert.ok((await pg.locator("#view").innerText()).includes('"\'><img src=x id=pwn'), "the log shows payloads as plain text (test is real)");
+  await visit("daily log (by poisoned person)");
+  await pg.evaluate(() => { S.log = { day: "", type: "all", who: "" }; render(); });
+  await visit("daily log (everyone)");
+  await pg.evaluate(() => { cfg.user.role = "viewer"; render(); });
+  await visit("daily log (viewer)");
+  await pg.evaluate(() => { cfg.user.role = "admin"; S.log = null; S.sub = null; S.f = {}; });
   // import preview with poisoned names/codes
   await pg.evaluate(() => { S.tab = "more"; S.sub = "inventory"; S.f = { invTab: "io", imp: { mode: "receive", text: "" } }; render(); });
   await pg.fill("#imp_text", 'Item code,Description,Quantity,Total\nNEW1,"<img src=x id=pwn900 onerror=window.__pwn=900>",1,10');
@@ -86,6 +103,6 @@ const P = n => `X${n}"'><img src=x id=pwn${n} onerror="window.__pwn=${n}"><svg o
   // sign-in page and user chip with poisoned names
   await pg.evaluate(() => { cfg.user.name = '<img src=x id=pwn902 onerror=window.__pwn=902>'; syncStatus(); }); await visit("header chip");
   assert.deepStrictEqual(errs, [], "no script errors");
-  console.log("xss: " + (views.length + jobs.length + items.length + 20) + " screens checked, nothing executed");
+  console.log("xss: " + (views.length + jobs.length + items.length + 23) + " screens checked, nothing executed");
   await b.close(); srv.close();
 })().catch(e => { console.error(e); process.exit(1); });

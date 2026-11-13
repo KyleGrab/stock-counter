@@ -952,18 +952,12 @@ function vStockOut() {
       msgHtml() + '<button class="btn wide" data-action="outSave"' + (S.busy ? " disabled" : "") + ">Save stock out</button></section>";
   }
   // record
-  var since = Date.now() - 30 * 864e5, groups = {}, order = [];
+  var since = Date.now() - 30 * 864e5;
   var reversed = {}; D.Moves.forEach(function (m) { if (m.type === "reverse") reversed[m.ref] = true; });
-  D.Moves.forEach(function (m) {
-    if (m.type !== "out") return;
-    if (!o.older && new Date(m.ts).getTime() < since) return;
-    var k = m.ts + "|" + m.by;
-    if (!groups[k]) { groups[k] = { ts: m.ts, by: m.by, first: m, moves: [] }; order.push(k); }
-    groups[k].moves.push(m);
-  });
-  order.sort(function (a, b) { return new Date(groups[b].ts) - new Date(groups[a].ts); });
-  var rec = order.map(function (k) {
-    var g = groups[k], f = g.first, total = g.moves.reduce(function (s, m) { return s + n(m.value); }, 0);
+  var order = C.groupMoves(D.Moves.filter(function (m) { return m.type === "out" && (o.older || new Date(m.ts).getTime() >= since); }))
+    .sort(function (a, b) { return new Date(b.ts) - new Date(a.ts); });
+  var rec = order.map(function (g) {
+    var f = g.first, total = g.moves.reduce(function (s, m) { return s + n(m.value); }, 0);
     return '<div class="hist"><div class="spread"><div><b>' + esc(dtime(g.ts)) + '</b><div class="tiny muted">by ' + esc(g.by) + (f.installer ? " · collected by " + esc(f.installer) : "") + (f.approvedBy ? " · approved by " + esc(f.approvedBy) : "") + "</div></div>" +
       (mgr ? '<div class="right"><span class="mono">' + R(total) + "</span></div>" : "") + "</div>" +
       '<div class="small">To: ' + esc(outWhere(f)) + "</div>" +
@@ -988,6 +982,12 @@ function canReverse(m) {
   if (m.job) { var j = X.jobs[m.job]; if (!j || !(j.status === "out" || (m.type === "out" && j.status === "kitted"))) return false; }
   return true;
 }
+// The "why?" box and Confirm button for reversing one movement; shared by item history and the daily log (same revConfirm path).
+function revPanel(m) {
+  return '<div class="panel" style="padding:10px"><p class="small">This records a correction that undoes the movement above. Nothing is deleted.</p>' +
+    '<label class="f">Why? (required)<input id="rev_reason" data-bind="revReason" value="' + esc(S.f.revReason || "") + '" placeholder="e.g. Typed 100 instead of 10"></label>' +
+    '<div class="row"><button class="btn small" data-action="revConfirm" data-id="' + esc(m.id) + '">Confirm correction</button><button class="btn ghost small" data-action="revCancel">Cancel</button></div></div>';
+}
 function vItemHistory(sku) {
   var it = X.items[sku];
   var list = D.Moves.filter(function (m) { return m.sku === sku; }).slice(-150).reverse();
@@ -1002,9 +1002,7 @@ function vItemHistory(sku) {
       '<div class="right"><span class="mono">' + q(m.qty, sku) + '</span><span class="tiny muted">' + esc(placeName(m.from)) + " → " + esc(placeName(m.to)) + "</span></div></div>" +
       ((m.reason || m.ref || m.serial) ? '<div class="tiny muted">' + [m.serial ? "Serial " + esc(m.serial) : "", m.reason ? esc(m.reason) : "", m.ref && m.type !== "reverse" ? esc(m.ref) : ""].filter(Boolean).join(" · ") + "</div>" : "") +
       (canReverse(m) && !open ? '<button class="btn ghost small" data-action="revStart" data-id="' + esc(m.id) + '">Reverse this</button>' : "") +
-      (open ? '<div class="panel" style="padding:10px"><p class="small">This records a correction that undoes the movement above. Nothing is deleted.</p>' +
-        '<label class="f">Why? (required)<input id="rev_reason" data-bind="revReason" value="' + esc(S.f.revReason || "") + '" placeholder="e.g. Typed 100 instead of 10"></label>' +
-        '<div class="row"><button class="btn small" data-action="revConfirm" data-id="' + esc(m.id) + '">Confirm correction</button><button class="btn ghost small" data-action="revCancel">Cancel</button></div></div>' : "") +
+      (open ? revPanel(m) : "") +
       "</div>";
   }).join("");
   return '<div class="row"><button class="btn ghost small" data-action="itemBack">← Stock</button></div>' +
@@ -1013,6 +1011,102 @@ function vItemHistory(sku) {
     '<section class="panel"><h3>Where it is now</h3>' + (places.length ? places.map(function (l) { return '<div class="spread"><span>' + esc(placeName(l)) + '</span><span class="mono">' + q(bal(l, sku), sku) + "</span></div>"; }).join("") : '<p class="muted small">None in stock.</p>') + "</section>" +
     '<section class="panel"><h3>Movements</h3><p class="tiny muted">Newest first. Movements are never edited or deleted; mistakes are reversed with a reason, so the record stays complete for an audit.</p>' +
     (rows || '<p class="muted">No movements yet.</p>') + "</section>";
+}
+
+/* ---------- Daily log (reads Moves and Counts; nothing is stored here) ---------- */
+var LOG_TYPES = [["all", "All"], ["in", "Stock in"], ["out", "Stock out"], ["jobs", "Jobs"], ["counts", "Counts"], ["fixes", "Corrections"]];
+function logState() { return S.log || (S.log = { day: "", type: "all", who: "" }); }
+function logToday() { return C.saDay(now()); }
+function placeWords(l) {
+  if (l && String(l).indexOf("JOB:") === 0) { var no = String(l).slice(4), j = X.jobs[no]; return "Job " + no + (j && j.client ? " · " + j.client : ""); }
+  return placeName(l);
+}
+function unitWord(sku) { var u = unitOfSku(sku); return u === "ea" ? "ea" : UNIT[u].short; }
+// All tasks on one South African day that the signed-in person may see, with the chosen filters applied.
+function logTasks() {
+  var st = logState(), day = st.day || logToday(), me = cfg.user && cfg.user.username, own = role() === "storeman", tasks = [];
+  C.groupMoves(D.Moves.filter(function (m) { return C.saDay(m.ts) === day; })).forEach(function (g) {
+    var types = g.moves.map(function (m) { return m.type; });
+    tasks.push({ ts: g.ts, by: g.by, approvedBy: g.first.approvedBy || "", kind: C.taskKind(types), label: C.taskLabel(types), moves: g.moves, first: g.first, ord: 1 });
+  });
+  (D.Counts || []).forEach(function (c) {
+    if (C.saDay(c.ts) === day) tasks.push({ ts: c.ts, by: c.by, approvedBy: "", kind: "counts", label: "Count submitted", count: c, ord: 0 });
+    if (c.status !== "pending" && c.decidedAt && C.saDay(c.decidedAt) === day)
+      tasks.push({ ts: c.decidedAt, by: c.decidedBy || "", approvedBy: "", kind: "counts", label: c.status === "approved" ? "Count approved" : "Count rejected", count: c, ord: 2 });
+  });
+  tasks = tasks.filter(function (t) {
+    if (own && t.by !== me) return false;
+    if (!own && st.who && t.by !== st.who) return false;
+    return st.type === "all" || t.kind === st.type;
+  });
+  tasks.sort(function (a, b) { return (new Date(b.ts) - new Date(a.ts)) || (b.ord - a.ord); });
+  tasks.forEach(function (t) { t.lines = t.count ? countLinesOf(t.count) : t.moves; });
+  return tasks;
+}
+function logValueOut(tasks) {   // rand value that left the store (managers only see it)
+  var v = 0; tasks.forEach(function (t) { (t.moves || []).forEach(function (m) { if (m.from === "WH") v += n(m.value); }); });
+  return C.round2(v);
+}
+function logCollected(m) { return m.type === "out" && m.installer ? "Collected by " + m.installer : ""; }
+function vLog() {
+  var st = logState(), today = logToday(), day = st.day || today, mgr = canManage(), own = role() === "storeman";
+  var tasks = logTasks(), nLines = tasks.reduce(function (s, t) { return s + t.lines.length; }, 0);
+  var reversed = {}; D.Moves.forEach(function (m) { if (m.type === "reverse") reversed[m.ref] = true; });
+  var people = {}; D.Moves.forEach(function (m) { if (m.by) people[m.by] = 1; }); (D.Counts || []).forEach(function (c) { if (c.by) people[c.by] = 1; if (c.decidedBy) people[c.decidedBy] = 1; });
+  if (st.who) people[st.who] = 1;
+  var dayText = new Date(day + "T12:00:00Z").toLocaleDateString("en-ZA", { timeZone: "UTC", weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  var html = backMore() + "<h2>Daily log</h2>" + msgHtml() +
+    '<p class="small muted">Everything saved on the day you pick, grouped by task. South African time. It reads the stock record; nothing here is a second copy.' + (own ? " You see your own tasks." : "") + "</p>" +
+    '<section class="panel"><div class="row"><button class="btn ghost small" data-action="logPrev">‹ Previous day</button>' +
+    '<label class="f">Day<input type="date" id="log_day" data-log="day" value="' + esc(day) + '" max="' + esc(today) + '"></label>' +
+    '<button class="btn ghost small" data-action="logNext"' + (day >= today ? " disabled" : "") + ">Next day ›</button></div>" +
+    '<div class="small"><b>' + esc(dayText) + "</b>" + (day === today ? " (today)" : "") + "</div>" +
+    '<div class="row"><label class="f">Show<select id="log_type" data-log="type">' + LOG_TYPES.map(function (t) { return '<option value="' + t[0] + '"' + (t[0] === st.type ? " selected" : "") + ">" + t[1] + "</option>"; }).join("") + "</select></label>" +
+    (own ? "" : '<label class="f">Person<select id="log_who" data-log="who"><option value="">Everyone</option>' + Object.keys(people).sort().map(function (p) { return '<option value="' + esc(p) + '"' + (p === st.who ? " selected" : "") + ">" + esc(p) + "</option>"; }).join("") + "</select></label>") + "</div>" +
+    '<p class="small" id="logSummary"><b>' + tasks.length + (tasks.length === 1 ? " task" : " tasks") + "</b> · " + nLines + (nLines === 1 ? " line" : " lines") + (mgr ? " · <b>" + R(logValueOut(tasks)) + "</b> moved out of the store" : "") + "</p>" +
+    '<button class="btn ghost" data-action="logCsv">Download CSV</button></section>';
+  html += '<div id="logList">' + (tasks.length ? tasks.map(function (t) {
+    var f = t.first, c = t.count, total = c ? n(c.value) : t.moves.reduce(function (s, m) { return s + n(m.value); }, 0);
+    var from = c ? (c.place === "WH" ? "Store shelves" : vanName(c.place)) : placeWords(f.from), to = c ? "" : placeWords(f.to);
+    var refs = c ? "" : [f.type !== "reverse" && f.ref ? "Ref: " + f.ref : "", f.reason ? (f.type === "reverse" ? "Reason: " : "Note: ") + f.reason : "", logCollected(f)].filter(Boolean).map(function (x) { return '<div class="tiny muted">' + esc(x) + "</div>"; }).join("");
+    var note = c ? (c.status !== "pending" && c.decisionNote && t.label !== "Count submitted" ? "Reason: " + c.decisionNote : c.note && t.label === "Count submitted" ? "Note: " + c.note : "") : "";
+    var lines = t.lines.map(function (m) {
+      if (c) return '<div class="spread"><span>' + esc(nameOf(m.sku)) + ' <span class="tiny muted">counted ' + q(m.counted, m.sku) + " of " + q(m.system, m.sku) + "</span></span>" + (mgr && m.diff ? '<span class="mono">' + R(m.value) + "</span>" : "") + "</div>";
+      var open = S.f.rev === m.id;
+      return '<div class="spread"><span><span class="mono">' + q(m.qty, m.sku) + "</span> " + esc(nameOf(m.sku)) + (reversed[m.id] ? ' <span class="pill p-closed">Corrected</span>' : "") +
+        (m.to !== f.to ? ' <span class="tiny muted">→ ' + esc(placeWords(m.to)) + "</span>" : "") + (m.approvedBy && m.approvedBy !== t.approvedBy ? ' <span class="tiny muted">approved by ' + esc(m.approvedBy) + "</span>" : "") + "</span>" +
+        (mgr ? '<span class="mono">' + R(m.value) + "</span>" : "") + "</div>" +
+        (canReverse(m) && !open ? '<div><button class="btn ghost small" data-action="revStart" data-id="' + esc(m.id) + '">Reverse this</button></div>' : "") + (open ? revPanel(m) : "");
+    }).join("");
+    return '<div class="hist"><div class="spread"><div><b>' + esc(C.saTime(t.ts)) + " · " + esc(t.label) + '</b><div class="tiny muted">by ' + esc(t.by) + (t.approvedBy ? " · approved by " + esc(t.approvedBy) : "") + "</div></div>" +
+      (mgr && total ? '<div class="right"><span class="mono">' + R(total) + "</span></div>" : "") + "</div>" +
+      (from || to ? '<div class="small">' + esc(from) + (to ? " → " + esc(to) : "") + "</div>" : "") + refs + (note ? '<div class="tiny muted">' + esc(note) + "</div>" : "") + lines + "</div>";
+  }).join("") : '<section class="panel"><p class="muted small">Nothing recorded for this day' + (st.type !== "all" || st.who ? " with these filters" : "") + ".</p></section>") + "</div>";
+  return html;
+}
+function logCsvText(tasks, mgr) {
+  var head = ["date", "time", "by", "approved_by", "task", "item_code", "item_name", "qty", "unit", "from", "to", "job", "reference", "reason"].concat(mgr ? ["unit_cost", "value"] : []);
+  var rows = [head];
+  tasks.forEach(function (t) {
+    var pre = [C.saDay(t.ts), C.saTime(t.ts), t.by, t.approvedBy || "", t.label];
+    if (t.count) {
+      var c = t.count;
+      t.lines.forEach(function (l) { rows.push(pre.concat([l.sku, nameOf(l.sku), n(l.counted), unitWord(l.sku), c.place === "WH" ? "Store shelves" : vanName(c.place), "", "", c.id, (t.label === "Count submitted" ? c.note : c.decisionNote) || ""], mgr ? ["", n(l.value)] : [])); });
+      return;
+    }
+    t.moves.forEach(function (m) {
+      var uc = m.unitCost !== undefined && m.unitCost !== "" && m.unitCost !== null ? n(m.unitCost) : (n(m.qty) > 0 ? C.round4(n(m.value) / n(m.qty)) : 0);
+      var reason = [logCollected(m), m.reason].filter(Boolean).join(". ");
+      rows.push(pre.concat([m.sku, nameOf(m.sku), n(m.qty), unitWord(m.sku), placeWords(m.from), placeWords(m.to), m.job || "", m.type === "reverse" ? "" : (m.ref || ""), reason], mgr ? [uc, n(m.value)] : []));
+    });
+  });
+  return C.csv(rows);
+}
+function downloadText(name, text, type) {
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["﻿" + text], { type: type || "text/csv;charset=utf-8" })); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
 }
 
 /* ---------- Counts ---------- */
@@ -1074,7 +1168,7 @@ function tile(sub, title, desc, badge) {
     '<div class="right">' + (badge || "") + "<span aria-hidden=\"true\">›</span></div></button>";
 }
 function vMore() {
-  var subs = { items: vItems, labels: vLabels, vans: vVans, account: vAccount, users: vUsers, reports: vReports, corrections: vCorrections, inventory: vInventory };
+  var subs = { items: vItems, labels: vLabels, vans: vVans, account: vAccount, users: vUsers, reports: vReports, corrections: vCorrections, inventory: vInventory, log: vLog };
   var need = { users: isAdmin(), items: canManage(), vans: canManage(), corrections: canManage(), inventory: canManage(), reports: role() !== "storeman" };
   if (S.sub && subs[S.sub] && need[S.sub] !== false) return subs[S.sub]();
   if (canManage()) {
@@ -1086,6 +1180,7 @@ function vMore() {
     return "<h2>" + hubName() + '</h2><p class="small muted">Signed in as ' + esc(ROLE_LABEL[role()]) + ". Every change here is checked by the Google Sheet.</p><div class=\"list\">" +
       tile("inventory", "Inventory", "Approve counts, stock take, adjust, import and export",
         (pending ? '<span class="pill p-bad">' + pending + " to approve</span>" : "") + (low ? '<span class="pill p-kitted">' + low + " to order</span>" : "")) +
+      tile("log", "Daily log", "Everything done on a day, by task; filter, download, reverse") +
       tile("reports", "Missing stock report", "By installer, van and job; jobs over quote", L.total > 0 ? '<span class="pill p-bad">' + R(L.total) + " · 30 days</span>" : "") +
       tile("corrections", "Corrections log", "Every reversed movement, who and why", reversals ? '<span class="pill p-kitted">' + reversals + "</span>" : "") +
       tile("items", "Items", "Products, units, costs, reorder levels, cable allowance") +
@@ -1095,6 +1190,7 @@ function vMore() {
       tile("account", isAdmin() ? "My account and connection" : "My account", isAdmin() ? "Change PIN, sign out, Google Sheet link" : "Change PIN, sign out") + "</div>";
   }
   return "<h2>More</h2><div class=\"list\">" +
+    tile("log", "Daily log", role() === "storeman" ? "What you did on a day; download or reverse a mistake" : "Everything done on a day, by task") +
     tile("labels", "Stickers", canWork() ? "Make and print QR stickers for drums, bins and shelves" : "View and print stickers") +
     (role() === "viewer" ? tile("reports", "Missing stock report", "By installer, van and job; jobs over quote") : "") +
     tile("account", "My account", "Change PIN, sign out") + "</div>";
@@ -1430,14 +1526,14 @@ function bindValue(path, value) {
 
 // Changing between demo and the real Sheet starts from a clean copy on the phone.
 function switchMode(mode) {
-  cfg.mode = mode; cfg.token = ""; cfg.user = null; S.users = null; S.out = null; saveCfg();
+  cfg.mode = mode; cfg.token = ""; cfg.user = null; S.users = null; S.out = null; S.log = null; saveCfg();
   SD = emptyData(); Q = []; persist(); rebuild();
 }
 
 var A = {
   startDemo: function () { switchMode("demo"); S.f = {}; S.loginMsg = null; render(); },
   back: function () { S.sub = null; S.job = null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
-  sub: function (b) { if (b.dataset.tab2) { S.tab = b.dataset.tab2; S.item = null; S.job = null; } S.sub = b.dataset.sub || null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
+  sub: function (b) { if (b.dataset.tab2) { S.tab = b.dataset.tab2; S.item = null; S.job = null; } S.sub = b.dataset.sub || null; S.msg = null; S.f = {}; if (S.sub === "log") S.log = null; render(); window.scrollTo(0, 0); },
   newJob: function () { S.sub = "new"; S.f = {}; S.msg = null; render(); },
   openJob: function (b) { S.job = b.dataset.job; S.sub = null; S.f = {}; S.msg = null; render(); window.scrollTo(0, 0); },
   addLine: function () { S.f.nj.lines.push({ sku: "", quoted: "" }); render(); },
@@ -1535,6 +1631,21 @@ var A = {
         msg: function (who) { return "Approved by " + who + ". Correction recorded."; }, after: function () { S.f = {}; } });
     }
     save(ops, "Correction recorded.", function () { S.f = {}; });
+  },
+  logPrev: function () { var st = logState(); st.day = C.addDays(st.day || logToday(), -1); S.msg = null; S.f = {}; render(); },
+  logNext: function () { var st = logState(), d = C.addDays(st.day || logToday(), 1); st.day = d > logToday() ? logToday() : d; S.msg = null; S.f = {}; render(); },
+  logSet: function (t) {
+    var st = logState(), f = t.dataset.log, v = t.value;
+    if (f === "day") { if (!C.isDay(v)) return; st.day = v > logToday() ? logToday() : v; }
+    else if (f === "type") st.type = v;
+    else if (f === "who") st.who = v;
+    S.msg = null; S.f = {}; render();
+  },
+  logCsv: function () {
+    var tasks = logTasks(), st = logState();
+    if (!tasks.length) return flash("err", "Nothing to download for this day with these filters.");
+    downloadText("stock-log-" + (st.day || logToday()) + ".csv", logCsvText(tasks, canManage()));
+    flash("ok", "Daily log downloaded.");
   },
   outBack: function () { stopCam(); S.sub = null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
   outCam: function () { startCam("Scan each item that is leaving the store"); },
@@ -1728,7 +1839,7 @@ var A = {
     S.busy = true; S.msg = null; render();
     var typedPin = cleanPin(f.pin);
     api.call("login", { username: username, pin: typedPin }).then(function (res) {
-      if (S.out && (!cfg.user || cfg.user.username !== res.user.username)) S.out = null;   // a draft never carries over to another person
+      if ((S.out || S.log) && (!cfg.user || cfg.user.username !== res.user.username)) { S.out = null; S.log = null; }   // a draft never carries over to another person
       cfg.token = res.token; cfg.user = res.user; saveCfg();
       if (DEV_QUICK_SIGNIN && cfg.mode === "live" && f.remember) LS.set("sc_quick", { url: cfg.url, username: res.user.username, name: res.user.name, pin: typedPin });
       S.f = res.user.mustChange ? { cp: { old: typedPin, known: true } } : {}; S.loginMsg = null; S.loading = !res.user.mustChange; S.tab = "jobs";
@@ -1747,7 +1858,7 @@ var A = {
     var t = cfg.token;
     if (t) api.call("logout", {}).catch(function () {});
     cfg.token = ""; saveCfg(); stopCam();
-    S.f = {}; S.out = null; S.msg = null; S.loginMsg = "Signed out."; S.tab = "jobs"; S.sub = null; S.job = null; S.item = null;
+    S.f = {}; S.out = null; S.log = null; S.msg = null; S.loginMsg = "Signed out."; S.tab = "jobs"; S.sub = null; S.job = null; S.item = null;
     render();
   },
   saveConnection: function () {
@@ -2131,6 +2242,7 @@ document.addEventListener("click", function (e) {
 document.addEventListener("input", function (e) {
   var t = e.target;
   if (t.dataset && t.dataset.out) { A.outSet(t); return; }
+  if (t.dataset && t.dataset.log) { A.logSet(t); return; }
   if (!t.dataset || !t.dataset.bind) return;
   if (t.type === "checkbox") { bindValue(t.dataset.bind, t.checked); render(); return; }
   bindValue(t.dataset.bind, t.value);

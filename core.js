@@ -350,11 +350,62 @@
     return null;
   }
 
+  /* ---- Daily log helpers ---- */
+  // Days are South African days (Africa/Johannesburg, UTC+2 all year, no daylight saving), whatever the phone's own time zone says.
+  // Timestamps are ISO UTC strings; a day is "YYYY-MM-DD".
+  var SA_OFFSET_MS = 2 * 3600 * 1000;
+  function pad2(x) { return (x < 10 ? "0" : "") + x; }
+  function saShift(ts) { var t = new Date(ts).getTime(); return isNaN(t) ? null : new Date(t + SA_OFFSET_MS); }
+  function saDay(ts) { var d = saShift(ts); return d ? d.getUTCFullYear() + "-" + pad2(d.getUTCMonth() + 1) + "-" + pad2(d.getUTCDate()) : ""; }
+  function saTime(ts) { var d = saShift(ts); return d ? pad2(d.getUTCHours()) + ":" + pad2(d.getUTCMinutes()) : ""; }
+  function isDay(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || "")); if (!m) return false;
+    var d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+    return d.getUTCFullYear() === +m[1] && d.getUTCMonth() === +m[2] - 1 && d.getUTCDate() === +m[3];
+  }
+  function addDays(day, k) {
+    if (!isDay(day)) return "";
+    var m = day.split("-"), d = new Date(Date.UTC(+m[0], +m[1] - 1, +m[2]) + k * 864e5);
+    return d.getUTCFullYear() + "-" + pad2(d.getUTCMonth() + 1) + "-" + pad2(d.getUTCDate());
+  }
+  // Moves that belong together: the same instant (ts) by the same person (one save = one task).
+  function groupMoves(moves) {
+    var groups = {}, order = [];
+    (moves || []).forEach(function (m) {
+      var k = m.ts + "|" + m.by;
+      if (!groups[k]) { groups[k] = { ts: m.ts, by: m.by, first: m, moves: [] }; order.push(k); }
+      groups[k].moves.push(m);
+    });
+    return order.map(function (k) { return groups[k]; });
+  }
+  var TASK_LABEL = { adjust: "Adjustment", receive: "Received", kit: "Kitted to job", extra: "Extra to job", "return": "Job closed", scrap: "Job closed", used: "Job closed",
+    missing: "Job closed", topup: "Van top-up", out: "Stock out", kituse: "Count adjustment", countshort: "Count adjustment", countover: "Count adjustment", reverse: "Correction" };
+  // Plain label for one task from the move types saved together (a job close books return/scrap/used/missing at once).
+  function taskLabel(types) {
+    var seen = [];
+    (types || []).forEach(function (t) { var l = TASK_LABEL[t] || t; if (seen.indexOf(l) < 0) seen.push(l); });
+    return seen.join(" + ") || "Movement";
+  }
+  // Which filter a move type belongs to: in, out, jobs, counts, fixes.
+  var TASK_KIND = { receive: "in", out: "out", kit: "jobs", extra: "jobs", "return": "jobs", scrap: "jobs", used: "jobs", missing: "jobs", topup: "jobs",
+    kituse: "counts", countshort: "counts", countover: "counts", reverse: "fixes", adjust: "fixes" };
+  function taskKind(types) { return (types && types.length && TASK_KIND[types[0]]) || "jobs"; }
+  // CSV (RFC 4180): quote cells with commas, quotes or line breaks. Text that starts with = + - @ (or a tab/return) would run as a formula
+  // in Excel, so it gets a leading apostrophe. Real numbers are written as they are.
+  function csvCell(v) {
+    if (typeof v === "number") return isFinite(v) ? String(v) : "";
+    v = v == null ? "" : String(v);
+    if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
+    return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  }
+  function csv(rows) { return rows.map(function (r) { return r.map(csvCell).join(","); }).join("\r\n"); }
+
   var Core = {
     balances: balances, bal: bal, kitDefault: kitDefault, jobSummary: jobSummary, closeJob: closeJob,
     newAverageCost: newAverageCost, onHand: onHand, losses: losses, overQuote: overQuote,
     countMoves: countMoves, countLines: countLines, linesToMoves: linesToMoves, parseImport: parseImport, parseScan: parseScan, normCode: normCode, round4: round4, isLength: isLength, unitOf: unitOf, VAT_RATE: VAT_RATE, nextNumber: nextNumber, round2: round2,
-    isRealPlace: isRealPlace, checkBalances: checkBalances
+    isRealPlace: isRealPlace, checkBalances: checkBalances,
+    saDay: saDay, saTime: saTime, isDay: isDay, addDays: addDays, groupMoves: groupMoves, taskLabel: taskLabel, taskKind: taskKind, csvCell: csvCell, csv: csv
   };
   if (typeof module !== "undefined" && module.exports) module.exports = Core;
   else root.Core = Core;

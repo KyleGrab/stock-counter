@@ -164,3 +164,41 @@ console.log("core v1.3: all tests passed");
   assert.deepStrictEqual([js.issued, js.outstanding], [0, 0]);
   console.log("core v1.12: all tests passed");
 }
+
+// v1.13 daily log helpers
+{
+  assert.strictEqual(C.saDay("2026-11-12T23:30:00Z"), "2026-11-13", "23:30 UTC on the 12th is the 13th in South Africa");
+  assert.strictEqual(C.saDay("2026-11-12T21:59:59.999Z"), "2026-11-12", "just before midnight SA time");
+  assert.strictEqual(C.saDay("2026-11-12T22:00:00Z"), "2026-11-13", "22:00 UTC is midnight SA time");
+  assert.strictEqual(C.saDay("2026-12-31T22:30:00Z"), "2027-01-01", "year rolls over");
+  assert.strictEqual(C.saDay("2026-07-01T10:00:00Z"), "2026-07-01", "no daylight saving in winter");
+  assert.strictEqual(C.saDay("garbage"), "");
+  assert.strictEqual(C.saTime("2026-11-12T23:30:00Z"), "01:30");
+  assert.strictEqual(C.addDays("2026-11-30", 1), "2026-12-01");
+  assert.strictEqual(C.addDays("2026-03-01", -1), "2026-02-28");
+  assert.strictEqual(C.addDays("nope", 1), "");
+  assert.ok(C.isDay("2026-02-28") && !C.isDay("2026-02-30") && !C.isDay("2026-2-3") && !C.isDay(""));
+  const g = C.groupMoves([{ ts: "t1", by: "a", id: 1 }, { ts: "t1", by: "b", id: 2 }, { ts: "t1", by: "a", id: 3 }, { ts: "t2", by: "a", id: 4 }]);
+  assert.deepStrictEqual(g.map(x => x.moves.map(m => m.id)), [[1, 3], [2], [4]]);
+  assert.strictEqual(C.taskLabel(["return", "scrap", "used", "missing"]), "Job closed");
+  assert.strictEqual(C.taskLabel(["out"]), "Stock out");
+  assert.strictEqual(C.taskLabel(["reverse"]), "Correction");
+  assert.strictEqual(C.taskLabel(["countshort", "countover", "kituse"]), "Count adjustment");
+  assert.strictEqual(C.taskLabel(["kit"]), "Kitted to job");
+  assert.strictEqual(C.taskKind(["receive"]), "in");
+  assert.strictEqual(C.taskKind(["reverse"]), "fixes");
+  // CSV
+  assert.strictEqual(C.csvCell("plain"), "plain");
+  assert.strictEqual(C.csvCell("a,b"), '"a,b"');
+  assert.strictEqual(C.csvCell('say "hi"'), '"say ""hi"""');
+  assert.strictEqual(C.csvCell("line1\nline2"), '"line1\nline2"');
+  assert.strictEqual(C.csvCell("=1+1"), "'=1+1");
+  assert.strictEqual(C.csvCell("+27 82"), "'+27 82");
+  assert.strictEqual(C.csvCell("-5 m"), "'-5 m");
+  assert.strictEqual(C.csvCell("@SUM(A1)"), "'@SUM(A1)");
+  assert.strictEqual(C.csvCell('=HYPERLINK("x","y")'), "\"'=HYPERLINK(\"\"x\"\",\"\"y\"\")\"");
+  assert.strictEqual(C.csvCell(-5), "-5", "real numbers are not mangled");
+  assert.strictEqual(C.csvCell(null), "");
+  assert.strictEqual(C.csv([["a", 1], ["b,c", 2.5]]), 'a,1\r\n"b,c",2.5');
+  console.log("core v1.13: daily log helpers passed");
+}
