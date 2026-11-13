@@ -329,6 +329,7 @@ var demo = {
                 if (r.status && r.status !== cur.status) {
                   if (cur.by === actor.username) throw demoErr("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
                   r.decidedBy = actor.username;
+                  r.decidedAt = new Date().toISOString();   // the Sheet's clock, not the phone's
                   if (approver && r.status === "approved") decidedCounts[r.id] = true;
                 } else { delete r.decidedBy; delete r.decidedAt; delete r.decisionNote; }
               }

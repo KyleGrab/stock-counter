@@ -699,3 +699,22 @@ console.log("backend roles: all tests passed");
   hdr[17] = ""; assert.ok(app(TL, [M("h3")]).ok); assert.strictEqual(hdr[17], "approvedBy");
   console.log("backend fix round F1-F6: all tests passed");
 }
+
+// --- decidedAt is the Sheet's time, not the phone's ---
+{
+  const { ctx, post } = makeGas();
+  ctx.setAdminPin_("482915", "482915");
+  const A = post({ action: "login", username: "admin", pin: "482915" }).token;
+  assert.ok(post({ action: "users", token: A, cmd: "save", isNew: true, user: { username: "lebo", name: "Lebo", role: "manager" }, pin: "580214" }).ok);
+  let L = post({ action: "login", username: "lebo", pin: "580214" });
+  if (L.user.mustChange) { assert.ok(post({ action: "changePin", token: L.token, oldPin: "580214", newPin: "690325" }).ok); L = post({ action: "login", username: "lebo", pin: "690325" }); }
+  const LT = L.token;
+  assert.ok(post({ token: A, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "CNT-T1", place: "WH", ts: new Date().toISOString(), status: "pending", lines: "[]", value: 0 }] }] }).ok);
+  const before = Date.now();
+  const r = post({ token: LT, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "CNT-T1", status: "rejected", decidedAt: "2001-01-01T00:00:00.000Z", decisionNote: "recount" }], expect: { field: "status", values: ["pending"] } }] });
+  assert.ok(r.ok, r.error);
+  const c = post({ token: A }).data.Counts.find(x => x.id === "CNT-T1");
+  assert.ok(Date.parse(c.decidedAt) >= before - 1000, "decidedAt stamped by the Sheet, phone's 2001 date ignored: " + c.decidedAt);
+  assert.strictEqual(c.decidedBy, "lebo");
+  console.log("backend decidedAt: all tests passed");
+}

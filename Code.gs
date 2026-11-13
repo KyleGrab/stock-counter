@@ -867,6 +867,7 @@ function applyBatch_(ops, user, approver) {
             if (r.status && r.status !== cur.status) {
               if (cur.by === actor.username) throw fail_("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
               r.decidedBy = actor.username;   // set here only, when the status changes; with an override this is the manager
+              r.decidedAt = new Date().toISOString();   // the Sheet's clock, not the phone's
               if (approver && r.status === "approved") decidedCounts[k] = true;
             } else { delete r.decidedBy; delete r.decidedAt; delete r.decisionNote; }   // not a decision: can't touch the decision fields
           }
