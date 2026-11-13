@@ -860,7 +860,7 @@ function applyBatch_(ops, user, approver) {
             if (cur.status !== "pending") throw fail_("This count has already been decided. Refresh.");
           }
           if (!cur) {   // a new count: who counted comes from the sign-in, and nobody has decided it yet
-            r.by = user.username; r.status = r.status || "pending";
+            r.by = user.username; r.status = "pending";   // every new count waits for a decision, whoever creates it
             r.decidedBy = ""; r.decidedAt = ""; r.decisionNote = "";
           } else {
             delete r.by;   // an existing count keeps the name of whoever counted it

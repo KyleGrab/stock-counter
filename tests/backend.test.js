@@ -718,3 +718,15 @@ console.log("backend roles: all tests passed");
   assert.strictEqual(c.decidedBy, "lebo");
   console.log("backend decidedAt: all tests passed");
 }
+
+// --- a new count is always pending, even if a manager sends "approved" ---
+{
+  const { ctx, post } = makeGas();
+  ctx.setAdminPin_("482915", "482915");
+  const A = post({ action: "login", username: "admin", pin: "482915" }).token;
+  assert.ok(post({ token: A, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "CNT-NEW", place: "WH", ts: new Date().toISOString(), status: "approved", lines: "[]", value: 0 }] }] }).ok);
+  const c = post({ token: A }).data.Counts.find(x => x.id === "CNT-NEW");
+  assert.strictEqual(c.status, "pending", "new counts always start pending");
+  assert.strictEqual(c.decidedBy, "");
+  console.log("backend new count pending: all tests passed");
+}

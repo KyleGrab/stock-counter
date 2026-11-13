@@ -323,7 +323,7 @@ var demo = {
                 if (!cur) throw demoErr(OV_SCOPE_MSG);
                 if (cur.status !== "pending") throw demoErr("This count has already been decided. Refresh.");
               }
-              if (!cur) { r.by = me.username; r.decidedBy = ""; r.decidedAt = ""; r.decisionNote = ""; }   // new count: nobody has decided it
+              if (!cur) { r.by = me.username; r.status = "pending"; r.decidedBy = ""; r.decidedAt = ""; r.decisionNote = ""; }   // new count: always pending, nobody has decided it
               else {
                 delete r.by;
                 if (r.status && r.status !== cur.status) {
@@ -997,6 +997,7 @@ function placeName(l) { return !l ? "" : l === "WH" ? "Store" : l.indexOf("JOB:"
 function canReverse(m) {
   if (!canWork() || !REVERSIBLE[m.type]) return false;   // a User needs a manager's approval to actually do it (see askManager)
   if (D.Moves.some(function (x) { return x.type === "reverse" && x.ref === m.id; })) return false;
+  if (Q.some(function (b) { return b.ops.some(function (op) { return op.op === "append" && (op.rows || []).some(function (r) { return r.id === m.id; }); }); })) return false;   // wait until it has reached the Sheet
   if (m.job) { var j = X.jobs[m.job]; if (!j || !(j.status === "out" || (m.type === "out" && j.status === "kitted"))) return false; }
   return true;
 }
