@@ -168,6 +168,48 @@ assert.ok(seed.ok, seed.error);
   await page.waitForFunction(() => document.getElementById("statusText").textContent.startsWith("Up to date"));
   assert.ok(movesSent > 0, "phone only asks for movements it doesn't have");
 
+  // 9. Manager override end to end: a User's phone, a Warehouse Manager's own username and PIN, checked by the Sheet
+  assert.ok(gas.post({ action: "users", token: key, cmd: "save", isNew: true, user: { username: "lebo", name: "Lebo M", role: "manager" }, pin: "583217" }).ok);
+  { const x = gas.post({ action: "login", username: "lebo", pin: "583217" }); assert.ok(gas.post({ action: "changePin", token: x.token, oldPin: "583217", newPin: "640291" }).ok); }
+  assert.ok(gas.post({ token: key, ops: [{ op: "append", sheet: "Moves", rows: [{ id: "ov1", ts: new Date().toISOString(), type: "receive", sku: "MC4", qty: 4, from: "SUPPLIER", to: "WH", value: 112 }] }] }).ok);
+  await page.locator("#navHome").click(); await page.getByRole("button", { name: "Sign out", exact: true }).first().click();
+  await page.fill("#lg_user", "sipho"); await page.fill("#lg_pin", "7140");
+  await page.getByRole("button", { name: "Sign in", exact: true }).click();
+  await page.waitForSelector("text=+ New job");
+  await page.locator("nav button[data-tab=stock]").click();
+  await page.getByRole("button", { name: "MC4 connector pair" }).click();
+  await page.waitForSelector("text=Movements");
+  await page.getByRole("button", { name: "Reverse this" }).first().click();
+  await page.fill("#rev_reason", "Counted twice");
+  await page.getByRole("button", { name: "Confirm correction" }).click();
+  await page.locator("#ovModal").waitFor({ state: "visible" });
+  const revRows = () => gas.sheets.Moves.rows.filter(r => r[2] === "reverse").length, revBefore = revRows();
+  // no signal: refused with the exact message, nothing queued or saved
+  await context.setOffline(true);
+  await page.fill("#ov_user", "lebo"); await page.fill("#ov_pin", "640291"); await page.locator("#ovOk").click();
+  await page.waitForFunction(() => document.getElementById("ovErr").textContent === "Needs signal: the Sheet has to check the manager's PIN.");
+  assert.strictEqual(await page.inputValue("#ov_pin"), "", "PIN cleared");
+  assert.strictEqual(await page.evaluate(() => Q.length), 0, "nothing queued");
+  assert.strictEqual(revRows(), revBefore);
+  await context.setOffline(false);
+  // wrong PIN: the Sheet refuses and the pop-up stays open
+  await page.fill("#ov_pin", "111222"); await page.locator("#ovOk").click();
+  await page.waitForFunction(() => /Manager username or PIN is wrong/.test(document.getElementById("ovErr").textContent));
+  assert.strictEqual(revRows(), revBefore);
+  assert.ok(gas.sheets.Log.rows.some(r => r[2] === "manager approval failed" && r[1] === "sipho"));
+  // right PIN
+  await page.fill("#ov_pin", "640291"); await page.keyboard.press("Enter");
+  await page.waitForSelector("text=Approved by Lebo M. Correction recorded.");
+  await page.locator("#ovModal").waitFor({ state: "hidden" });
+  const ovRev = gas.sheets.Moves.rows.filter(r => r[2] === "reverse").pop();
+  assert.strictEqual(revRows(), revBefore + 1);
+  assert.deepStrictEqual([ovRev[15], ovRev[17], ovRev[16]], ["sipho", "lebo", "receive"], "by = the User, approvedBy = the manager");
+  assert.ok(gas.sheets.Log.rows.some(r => r[2] === "manager approval" && /lebo approved for sipho: 1 correction/.test(r[3])));
+  assert.ok((await text()).includes("approved by lebo"), "phone shows who approved after merging the Sheet's answer");
+  const kept = await page.evaluate(() => JSON.stringify(localStorage));
+  assert.ok(!kept.includes("640291") && !kept.includes("111222") && !/override/i.test(kept), "no manager PIN or override on the phone");
+  await page.evaluate(() => { S.f = {}; });
+
   // dev quick sign-in on the real Sheet: remember me -> one tap; PIN change keeps it working; wrong PIN turns it off
   await page.locator("#navHome").click(); await page.getByRole("button", { name: "Sign out", exact: true }).first().click();
   assert.strictEqual(await page.getByRole("button", { name: /Sign in as/ }).count(), 0, "no quick button until remembered");

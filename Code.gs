@@ -21,6 +21,9 @@
  *    A count is approved once, and never by the person who counted.
  *  - Every movement is stamped with the signed-in user, so names can't be faked.
  *  - Movements (Moves tab) can only be ADDED, never changed or deleted.
+ *  - Manager override: when a User is signed in, a correction or a count decision is accepted only
+ *    with a Warehouse Manager's or Senior Admin's OWN username and PIN, checked here (same wrong-PIN
+ *    limits as sign-in). The record shows both people (by = the User, approvedBy = the manager).
  *  - The Sheet hands out job, sticker and van numbers, so two phones never clash.
  *  - Job steps are checked (a job can't be kitted or closed twice).
  *  - Stock in the store, vans and jobs can't go below zero.
@@ -28,13 +31,13 @@
  *  - Text that looks like a spreadsheet formula is stored as plain text.
  */
 
-var VERSION = "1.6";
+var VERSION = "1.7";
 
 var SHEETS = {
   Items:    { key: "sku",  cols: ["sku", "name", "uom", "track", "cost", "reorder", "allowancePct"] },
   Jobs:     { key: "no",   cols: ["no", "client", "type", "van", "installer", "quoteRef", "status", "created", "kittedAt", "outAt", "closedAt", "missingValue", "reason"] },
   Lines:    { key: "id",   cols: ["id", "job", "sku", "quoted"] },
-  Moves:    { key: "id",   cols: ["id", "ts", "type", "sku", "qty", "from", "to", "job", "van", "installer", "serial", "unitCost", "value", "ref", "reason", "by", "reverses"] },
+  Moves:    { key: "id",   cols: ["id", "ts", "type", "sku", "qty", "from", "to", "job", "van", "installer", "serial", "unitCost", "value", "ref", "reason", "by", "reverses", "approvedBy"] },
   Labels:   { key: "code", cols: ["code", "sku", "note"] },
   Vans:     { key: "id",   cols: ["id", "name"] },
   VanKit:   { key: "sku",  cols: ["sku", "target"] },
@@ -66,6 +69,7 @@ function setup() {
     sh.setFrozenRows(1);
     if (SHEETS[name].private && sh.hideSheet) sh.hideSheet();
   });
+  ensureColumns_("Moves");   // a Sheet made by an older version gets any new last column(s)
   var first = ss.getSheetByName("Sheet1");
   if (first && ss.getSheets().length > 1 && first.getLastRow() === 0) ss.deleteSheet(first);
   if (rows_("Users", 0).length) { Logger.log("Setup checked. Users already exist."); return null; }
@@ -211,19 +215,31 @@ function sync_(body, user) {
   if (!Array.isArray(ops) || ops.length > MAX_OPS) throw fail_("Too many changes in one save. Save in smaller parts.");
   ops.forEach(function (op) { if (op && op.rows && (!Array.isArray(op.rows) || op.rows.length > MAX_ROWS)) throw fail_("Too many rows in one save. Import in smaller parts."); });
   if (body.batch && String(body.batch).length > 100) throw fail_("Bad request.");
+  var approver = null;
   if (ops.length) {
     var cache = CacheService.getScriptCache();
     var done = body.batch ? cache.get("b_" + body.batch) : null;
-    if (done) assigned = JSON.parse(done);
+    if (done) assigned = JSON.parse(done);   // a retry: already applied (and any manager approval already checked), nothing more to do
     else {
-      assigned = applyBatch_(ops, user);
+      // Manager override: verify the manager FIRST. Nothing is written unless this passes.
+      approver = body.override != null ? verifyOverride_(body.override, user) : null;
+      try {
+        if (approver) overrideScope_(ops);
+        assigned = applyBatch_(ops, user, approver);
+      } catch (err) {
+        if (approver) log_(user.username, "manager approval failed", approver.username + ": " + String(err && err.message || err));
+        throw err;
+      }
+      if (approver) log_(user.username, "manager approval", approver.username + " approved for " + user.username + ": " + overrideSummary_(ops));
       if (body.batch) cache.put("b_" + body.batch, JSON.stringify(assigned), 21600);
     }
     SpreadsheetApp.flush();
   }
   var data = readAll_(Number(body.have) || 0);
   if (user.role === "admin") data.Users = publicUsers_();
-  return { ok: true, version: VERSION, assigned: assigned, data: data, user: publicUser_(user) };
+  var res = { ok: true, version: VERSION, assigned: assigned, data: data, user: publicUser_(user) };
+  if (approver) res.approver = { username: approver.username, name: approver.name };   // so the phone can say who approved (a name, not a secret)
+  return res;
 }
 
 /* ---------------- logins ---------------- */
@@ -302,23 +318,43 @@ function endSessions_(username) {
 }
 function endSession_(token) { if (token) write_({ op: "remove", sheet: "Sessions", rows: [{ tokenHash: hash_(String(token)) }] }); }
 
-function login_(body) {
-  var name = cleanName_(body.username).slice(0, 40), pin = cleanPin_(body.pin).slice(0, 20);
-  var cache = CacheService.getScriptCache(), fk = "fail_" + name;
+/**
+ * The one place a username + PIN is checked, for sign-in AND for a manager override:
+ * per-username wrong-PIN counter and lock, system-wide counter, active login, pinMatches_.
+ * mode "login" or "override" only changes the wording and what the Log says. Returns the user, or throws.
+ */
+function verifyPin_(name, pin, mode, phoneUser) {
+  var cache = CacheService.getScriptCache(), fk = "fail_" + name, ov = mode === "override";
+  function note(login, detail) { if (ov) log_(phoneUser, "manager approval failed", name + ": " + detail); else log_(name, login, detail); }
   var all = Number(cache.get("fail_all") || 0);
-  if (all >= MAX_TRIES_ALL) { log_(name, "sign-in blocked", "too many wrong PINs on all logins"); throw fail_("Too many wrong sign-ins on this system just now. New sign-ins are paused for " + LOCK_MINUTES + " minutes. Phones already signed in keep working."); }
+  if (all >= MAX_TRIES_ALL) {
+    note("sign-in blocked", "too many wrong PINs on all logins");
+    throw fail_(ov ? "Too many wrong PINs on this system just now. Manager approval is paused for " + LOCK_MINUTES + " minutes."
+      : "Too many wrong sign-ins on this system just now. New sign-ins are paused for " + LOCK_MINUTES + " minutes. Phones already signed in keep working.");
+  }
   var tries = Number(cache.get(fk) || 0);
-  if (tries >= MAX_TRIES) { log_(name, "sign-in blocked", "login locked"); throw fail_("Too many wrong PINs. This login is locked for " + LOCK_MINUTES + " minutes, or an admin can reset the PIN."); }
+  if (tries >= MAX_TRIES) {
+    note("sign-in blocked", "login locked");
+    throw fail_(ov ? "Too many wrong PINs for that manager login. It is locked for " + LOCK_MINUTES + " minutes, or an admin can reset the PIN."
+      : "Too many wrong PINs. This login is locked for " + LOCK_MINUTES + " minutes, or an admin can reset the PIN.");
+  }
   var u = findUser_(name);
   var ok = u && u.active === "yes" && pinMatches_(u, pin);
   if (!ok) {
     cache.put(fk, String(tries + 1), LOCK_MINUTES * 60);
     cache.put("fail_all", String(all + 1), LOCK_MINUTES * 60);
-    log_(name, "sign-in failed", !u ? "no such login" : u.active !== "yes" ? "login switched off" : "wrong PIN (" + (tries + 1) + ")");
-    var left = MAX_TRIES - tries - 1;
-    throw fail_(u && u.active !== "yes" ? "This login has been switched off. Ask an admin." : "Wrong username or PIN." + (left > 0 && left <= 2 ? " " + left + " tries left." : ""));
+    note("sign-in failed", !u ? "no such login" : u.active !== "yes" ? "login switched off" : "wrong PIN (" + (tries + 1) + ")");
+    var left = MAX_TRIES - tries - 1, hint = left > 0 && left <= 2 ? " " + left + " tries left." : "";
+    if (ov) throw fail_("Manager username or PIN is wrong." + hint);
+    throw fail_(u && u.active !== "yes" ? "This login has been switched off. Ask an admin." : "Wrong username or PIN." + hint);
   }
   cache.remove(fk);
+  return u;
+}
+
+function login_(body) {
+  var name = cleanName_(body.username).slice(0, 40), pin = cleanPin_(body.pin).slice(0, 20);
+  var u = verifyPin_(name, pin, "login");
   if (String(u.pinHash).indexOf("v2:") !== 0) writeUser_({ username: u.username }, pin);   // upgrade an old-style hash
   log_(u.username, "signed in", "");
   var token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, "");
@@ -393,6 +429,93 @@ function users_(body, me) {
     return { ok: true, users: publicUsers_() };
   }
   throw fail_("Unknown request.");
+}
+
+/* ---------------- manager override ----------------
+ * A User's phone may carry { override: { username, pin } } on a sync request. The Sheet checks it
+ * (never the phone), and only for corrections and count decisions. The PIN is used here once:
+ * it is never logged, stored, cached or sent back.
+ */
+var OVERRIDE_SCOPE_MSG = "Manager approval is only for corrections and count decisions.";
+var OVERRIDE_WHO_MSG = "Manager approval must come from a Warehouse Manager or Senior Admin other than you.";
+// Same list as REVERSIBLE in the app: the movement types a correction may undo.
+var REVERSIBLE_ = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1, adjust: 1, out: 1 };
+var COUNT_MOVE_ = { countshort: 1, countover: 1, kituse: 1 };
+var COUNT_DECISION_KEYS_ = { id: 1, status: 1, decidedAt: 1, decisionNote: 1 };
+
+/** Checks the manager's own username and PIN like a sign-in (same counters and lock). Returns the approver. */
+function verifyOverride_(o, user) {
+  o = o && typeof o === "object" && !Array.isArray(o) ? o : {};
+  var name = cleanName_(o.username).slice(0, 40), pin = cleanPin_(o.pin).slice(0, 20);
+  var a = verifyPin_(name, pin, "override", user.username);
+  if (!isManagerRole_(a.role) || a.username === user.username) {
+    log_(user.username, "manager approval failed", name + ": not a manager other than the signed-in user");
+    throw fail_(OVERRIDE_WHO_MSG);
+  }
+  if (a.mustChange === "yes") { log_(user.username, "manager approval failed", name + ": still on a temporary PIN"); throw fail_("That manager must sign in once and choose their own PIN first."); }
+  if (user.role === "viewer") { log_(user.username, "manager approval failed", "viewer login"); throw fail_("Your login can view only."); }
+  return a;
+}
+
+/** What an override batch may contain, judged from the request alone: reversals and count decisions (with their adjustment moves). */
+function overrideScope_(ops) {
+  var decided = {}, any = false;
+  ops.forEach(function (op) {
+    if (op && op.op === "upsert" && op.sheet === "Counts") {
+      if (!Array.isArray(op.rows) || !op.rows.length) throw fail_(OVERRIDE_SCOPE_MSG);
+      op.rows.forEach(function (r) {
+        var id = r && String(r.id || "");
+        if (!id || decided[id] || (r.status !== "approved" && r.status !== "rejected")) throw fail_(OVERRIDE_SCOPE_MSG);
+        Object.keys(r).forEach(function (k) { if (!COUNT_DECISION_KEYS_[k]) throw fail_(OVERRIDE_SCOPE_MSG); });
+        decided[id] = r.status; any = true;
+      });
+    }
+  });
+  ops.forEach(function (op) {
+    if (op && op.op === "upsert" && op.sheet === "Counts") return;
+    if (!op || op.op !== "append" || op.sheet !== "Moves" || !Array.isArray(op.rows) || !op.rows.length) throw fail_(OVERRIDE_SCOPE_MSG);
+    op.rows.forEach(function (r) {
+      if (!r || typeof r !== "object") throw fail_(OVERRIDE_SCOPE_MSG);
+      if (r.type === "reverse") { any = true; return; }
+      if (COUNT_MOVE_[r.type] && decided[String(r.ref || "")] === "approved") return;   // booked by an approval in this same batch
+      throw fail_(OVERRIDE_SCOPE_MSG);
+    });
+  });
+  if (!any) throw fail_(OVERRIDE_SCOPE_MSG);
+}
+
+/** Text for the Log: how many corrections, which counts. */
+function overrideSummary_(ops) {
+  var corr = 0, counts = [];
+  ops.forEach(function (op) {
+    if (op.op === "append") (op.rows || []).forEach(function (r) { if (r.type === "reverse") corr++; });
+    else if (op.op === "upsert" && op.sheet === "Counts") (op.rows || []).forEach(function (r) { counts.push("count " + r.id + " " + r.status); });
+  });
+  return (corr ? corr + " correction(s)" : "") + (corr && counts.length ? "; " : "") + counts.join("; ");
+}
+
+/** A correction must undo exactly one real, reversible movement that isn't already undone (the phone can't invent one). */
+function checkReversal_(r, moves) {
+  var orig = moves[String(r.ref || "")];
+  if (!orig || !REVERSIBLE_[orig.type] || r.reverses !== orig.type || String(r.sku) !== String(orig.sku) ||
+      Math.abs(Number(r.qty) - Number(orig.qty)) > 0.005 || r.from !== orig.to || r.to !== orig.from) throw fail_(OVERRIDE_SCOPE_MSG);
+  Object.keys(moves).forEach(function (k) {
+    if (k !== String(r.id) && moves[k].type === "reverse" && String(moves[k].ref) === String(orig.id)) throw fail_("That movement has already been corrected. Refresh.");
+  });
+}
+
+/** The adjustment moves an approval must book for a count, exactly as the app works them out from the count's lines. */
+function expectedCountMoves_(c) {
+  var lines; try { lines = JSON.parse(c.lines || "[]"); } catch (e) { lines = []; }
+  var isVan = c.place !== "WH", out = {};
+  (Array.isArray(lines) ? lines : []).forEach(function (l) {
+    var diff = Math.round(Number(l && l.diff) * 100) / 100;
+    if (!l || !isFinite(diff) || Math.abs(diff) <= 1e-9) return;
+    out[String(l.sku)] = diff < 0
+      ? { type: isVan ? "kituse" : "countshort", qty: -diff, from: c.place, to: isVan ? "USED" : "LOSS" }
+      : { type: "countover", qty: diff, from: "LOSS", to: c.place };
+  });
+  return out;
 }
 
 /** What each role may change. Checked for every operation, before anything is written. */
@@ -537,7 +660,7 @@ function exceptions_(d, now) {
     d.Lines.forEach(function (l) { if (l.job === no) row(l.sku).quoted += num(l.quoted); });
     d.Moves.forEach(function (m) {
       var q = num(m.qty);
-      if (m.type === "reverse") { if (m.reverses === "extra" && m.from === loc) row(m.sku).issued -= q; return; }
+      if (m.type === "reverse") { if ((m.reverses === "extra" || m.reverses === "out") && m.from === loc) row(m.sku).issued -= q; return; }
       if (m.to === loc) row(m.sku).issued += q;
       else if (m.from === loc && (m.to === "WH" || m.to === "SCRAP")) row(m.sku).back += q;
     });
@@ -607,7 +730,7 @@ function exceptions_(d, now) {
 
   // 8. Corrections in the window: every one should have a good reason.
   d.Moves.forEach(function (m) {
-    if (m.type === "reverse" && days(m.ts) <= RULES.LOOKBACK_DAYS) add("Low", "Correction made", m.job || m.sku, name(m.sku) + ": undid " + (m.reverses || "") + " of " + R2(num(m.qty)) + ". Reason: " + (m.reason || "none"), num(m.value), m.by);
+    if (m.type === "reverse" && days(m.ts) <= RULES.LOOKBACK_DAYS) add("Low", "Correction made", m.job || m.sku, name(m.sku) + ": undid " + (m.reverses || "") + " of " + R2(num(m.qty)) + ". Reason: " + (m.reason || "none") + (m.approvedBy ? " (approved by " + m.approvedBy + ")" : ""), num(m.value), m.by);
   });
 
   var rank = { High: 0, Medium: 1, Low: 2 };
@@ -621,7 +744,8 @@ function exceptions_(d, now) {
  * Two phases. Phase 1 checks every operation against an in-memory copy and works out
  * new numbers. Nothing is written unless every check passes. Phase 2 writes.
  */
-function applyBatch_(ops, user) {
+function applyBatch_(ops, user, approver) {
+  var actor = approver || user;   // with a manager override, permission checks run as the manager
   var mem = {};          // sheet -> { keys: [...], rows: {key: row} } loaded on demand
   function load(name) {
     if (mem[name]) return mem[name];
@@ -630,13 +754,15 @@ function applyBatch_(ops, user) {
     mem[name] = { keys: rows.map(function (r) { return String(r[k]); }), rows: byKey };
     return mem[name];
   }
-  var assigned = {}, plan = [], newMoves = [];
+  var assigned = {}, plan = [], newMoves = [], countSeen = {}, decidedCounts = {};
+  // counts as they were BEFORE this batch (an override judges moves against the count's state when it was pending)
+  var counts0 = approver ? JSON.parse(JSON.stringify(load("Counts").rows)) : null;
 
   ops.forEach(function (raw) {
     var op = substitute_(raw, assigned);
     var def = SHEETS[op.sheet];
     if (!def || def.private) throw new Error("Unknown tab: " + op.sheet);
-    permitted_(op, user);
+    permitted_(op, actor);
 
     if (op.op === "create") {
       var num = NUMBERING[op.sheet];
@@ -666,7 +792,17 @@ function applyBatch_(ops, user) {
         if (seen[String(r.id)]) return false;   // already saved by an earlier retry
         seen[String(r.id)] = r;
         r.by = user.username;                   // who did it comes from the sign-in, not the phone
+        r.approvedBy = approver ? approver.username : "";   // likewise: only the Sheet says who approved
         return true;
+      });
+      if (approver) fresh.forEach(function (r) {
+        if (r.type === "reverse") return checkReversal_(r, seen);
+        // a count adjustment: must be one the approved count calls for, once
+        var c = counts0[String(r.ref)], want = c && c.status === "pending" ? expectedCountMoves_(c)[String(r.sku)] : null;
+        if (c && c.status !== "pending") throw fail_("This count has already been decided. Refresh.");
+        var cs = countSeen[c && c.id] = countSeen[c && c.id] || {};
+        if (!want || cs[r.sku] || want.type !== r.type || want.from !== r.from || want.to !== r.to || Math.abs(Number(r.qty) - want.qty) > 0.005) throw fail_(OVERRIDE_SCOPE_MSG);
+        cs[r.sku] = true;
       });
       newMoves = newMoves.concat(fresh);
       if (fresh.length) plan.push({ op: "insert", sheet: "Moves", rows: fresh });
@@ -682,11 +818,16 @@ function applyBatch_(ops, user) {
         if (!k) throw new Error("Missing " + def.key + " for " + op.sheet + ".");
         var cur = mm.rows[k];
         if (op.sheet === "Counts") {
-          if (!isManagerRole_(user.role) && (cur || r.status !== "pending")) throw fail_("Only a Warehouse Manager or Senior Admin can approve or reject counts.");
+          if (!isManagerRole_(actor.role) && (cur || r.status !== "pending")) throw fail_("Only a Warehouse Manager or Senior Admin can approve or reject counts.");
+          if (approver) {
+            if (!cur) throw fail_(OVERRIDE_SCOPE_MSG);
+            if (cur.status !== "pending") throw fail_("This count has already been decided. Refresh.");
+          }
           if (!cur) { r.by = user.username; r.status = r.status || "pending"; }
           if (cur && r.status && r.status !== cur.status) {
-            if (cur.by === user.username) throw fail_("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
-            r.decidedBy = user.username;
+            if (cur.by === actor.username) throw fail_("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
+            r.decidedBy = actor.username;   // with an override this is the manager, not the phone's user
+            if (approver && r.status === "approved") decidedCounts[k] = true;
           }
         }
         if (op.expect) {
@@ -719,6 +860,13 @@ function applyBatch_(ops, user) {
     }
 
     throw new Error("Unknown operation: " + op.op);
+  });
+
+  // An approval must book every adjustment the count calls for: a phone can't approve and quietly leave some out.
+  Object.keys(decidedCounts).forEach(function (id) {
+    Object.keys(expectedCountMoves_(counts0[id])).forEach(function (sku) {
+      if (!(countSeen[id] && countSeen[id][sku])) throw fail_(OVERRIDE_SCOPE_MSG);
+    });
   });
 
   if (newMoves.length) {
@@ -793,6 +941,21 @@ function ensureRows_(sh, lastRowNeeded, cols) {
   sh.insertRowsAfter(max, add);
   sh.getRange(max + 1, 1, add, cols || sh.getMaxColumns()).setNumberFormat("@");
 }
+/**
+ * Adds any column the code knows about that an older Sheet doesn't have yet, at the END of the header row
+ * (so no existing data moves). Safe to run again. If an earlier header was changed by hand it does nothing.
+ */
+function ensureColumns_(name) {
+  var sh = sheet_(name), cols = SHEETS[name].cols;
+  if (sh.getMaxColumns() < cols.length) sh.insertColumnsAfter(sh.getMaxColumns(), cols.length - sh.getMaxColumns());
+  var head = sh.getRange(1, 1, 1, cols.length).getValues()[0];
+  for (var i = 0; i < cols.length; i++) {
+    if (String(head[i]) === cols[i]) continue;
+    if (String(head[i]) !== "") return;
+    sh.getRange(1, i + 1, sh.getMaxRows(), 1).setNumberFormat("@");
+    sh.getRange(1, i + 1, 1, 1).setValues([[cols[i]]]).setFontWeight("bold");
+  }
+}
 /** Append rows below the last used row, making room if needed. */
 function appendRows_(sh, values, cols) {
   if (!values.length) return;
@@ -805,6 +968,7 @@ function write_(step) {
   var def = SHEETS[step.sheet], sh = sheet_(step.sheet), cols = def.cols, rows = step.rows || [];
 
   if (step.op === "insert") {
+    if (step.sheet === "Moves") ensureColumns_("Moves");   // an older Sheet may not have the newest column yet
     appendRows_(sh, rows.map(function (r) { return toRow_(cols, r); }), cols.length);
     return;
   }

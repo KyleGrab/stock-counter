@@ -225,7 +225,7 @@ The Sheet can check itself and list what needs attention in an **Exceptions** ta
 | "Changes from another person waiting" | Someone saved work offline and signed out. They must sign in on that phone so the record shows who did it. |
 | "No connection" | No signal. Nothing was saved. Try again when there's signal. |
 | "New sign-ins are paused" | Someone (or something) typed 30 wrong PINs. Wait 15 minutes, or **Stock Counter → Set admin PIN…** to clear it. Then check the hidden **Log** tab to see which usernames were tried. |
-| Changed `Code.gs` later | Paste the new code, **save**, then **Deploy → Manage deployments → ✏ Edit → Version: New version → Deploy.** The link stays the same. The phone only uses the new code after this step. |
+| Changed `Code.gs` later | Paste the new code, **save**, then **Deploy → Manage deployments → ✏ Edit → Version: New version → Deploy.** The link stays the same. The phone only uses the new code after this step. Sheet version 1.7 adds one column to Moves (`approvedBy`); it is added automatically on the next save (or by running `setup`), and nothing existing moves. |
 | Wrong number saved | Movements can't be edited (that's the audit trail). Correct it with a count or a return. |
 
 **Backups:** the Google Sheet keeps its own history (File → Version history). Download a copy monthly: File → Download → Excel.

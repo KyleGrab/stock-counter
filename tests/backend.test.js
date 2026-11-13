@@ -343,3 +343,228 @@ console.log("backend roles: all tests passed");
   assert.ok(/Unknown tab/.test(g2.post({ token: T2, ops: [{ op: "upsert", sheet: "Exceptions", rows: [{ checked: "x" }] }] }).error));
   console.log("backend v1.6 exception rules: all tests passed");
 }
+
+// --- v1.7 sheet: manager override (a manager approves on a User's phone) ---
+{
+  const { ctx, post, sheets, cache } = makeGas();
+  ctx.setAdminPin_("482915", "482915");
+  const A = post({ action: "login", username: "admin", pin: "482915" }).token;
+  const mkUser = (u, role, pin) => assert.ok(post({ action: "users", token: A, cmd: "save", isNew: true, user: { username: u, name: u, role }, pin }).ok);
+  mkUser("lebo", "manager", "583217"); mkUser("mona", "manager", "694815"); mkUser("sipho", "storeman", "5832"); mkUser("zed", "storeman", "7391");
+  mkUser("owner", "viewer", "4821"); mkUser("gone", "manager", "725813");
+  const login = (u, pin, np) => { const x = post({ action: "login", username: u, pin }); assert.ok(x.ok, x.error); assert.ok(post({ action: "changePin", token: x.token, oldPin: pin, newPin: np }).ok); return x.token; };
+  const TS = login("sipho", "5832", "7140"), TL = login("lebo", "583217", "640291"), TO = login("owner", "4821", "2864");
+  login("zed", "7391", "9315");
+  login("gone", "725813", "640293");
+  assert.ok(post({ action: "users", token: A, cmd: "save", isNew: false, user: { username: "gone", name: "gone", role: "manager", active: "no" } }).ok);
+  const LEBO = { username: "lebo", pin: "640291" };
+  const col = (sheet, name) => ctx.SHEETS[sheet].cols.indexOf(name);
+  const moveRow = id => sheets.Moves.rows.find(r => r[0] === id);
+  const logs = () => sheets.Log.rows.slice(1).map(r => r.join("|"));
+  const ts = "2026-11-12T09:00:00.000Z";
+  const M = (id, o) => Object.assign({ id, ts, type: "receive", sku: "PV", qty: 10, from: "SUPPLIER", to: "WH" }, o || {});
+  const REV = (id, orig, o) => Object.assign({ id, ts, type: "reverse", reverses: orig.type, ref: orig.id, sku: orig.sku, qty: orig.qty, from: orig.to, to: orig.from, reason: "typo" }, o || {});
+  assert.ok(post({ token: A, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", name: "PV red", uom: "m", track: "qty", cost: 10 }] }, { op: "append", sheet: "Moves", rows: [M("base", { qty: 100 })] }] }).ok);
+  assert.ok(post({ token: TS, ops: [{ op: "append", sheet: "Moves", rows: [M("r1"), M("r2"), M("r3"), M("r4"), M("r5")] }] }).ok, "storeman receives");
+  const ov = (token, ops, override, batch) => post({ token, ops, override, batch });
+
+  // columns: approvedBy is the LAST column
+  assert.strictEqual(ctx.SHEETS.Moves.cols[ctx.SHEETS.Moves.cols.length - 1], "approvedBy");
+  assert.strictEqual(sheets.Moves.rows[0][col("Moves", "approvedBy")], "approvedBy");
+
+  // a User cannot reverse without an override, with the old message
+  assert.ok(/Only a Warehouse Manager or Senior Admin can record corrections/.test(post({ token: TS, ops: [{ op: "append", sheet: "Moves", rows: [REV("x0", M("r1"))] }] }).error));
+  // a phone cannot forge approvedBy on a normal save
+  assert.ok(post({ token: TS, ops: [{ op: "append", sheet: "Moves", rows: [M("forge", { approvedBy: "lebo" })] }] }).ok);
+  assert.strictEqual(moveRow("forge")[col("Moves", "approvedBy")], "");
+
+  // valid override: User reverses; by = the User, approvedBy = the manager; Log written; no PIN anywhere
+  const before = sheets.Log.rows.length;
+  let r = ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("v1", M("r1"))] }], LEBO, "ob1");
+  assert.ok(r.ok, r.error);
+  assert.strictEqual(moveRow("v1")[col("Moves", "by")], "sipho");
+  assert.strictEqual(moveRow("v1")[col("Moves", "approvedBy")], "lebo");
+  assert.ok(logs().slice(before - 1).some(l => /manager approval\|lebo approved for sipho: 1 correction\(s\)/.test(l)));
+  assert.ok(!JSON.stringify(r).includes("640291"), "response never contains the PIN");
+  const everything = JSON.stringify([sheets, cache]);
+  assert.ok(!everything.includes("640291"), "the manager's PIN is not stored in the Sheet, Log or cache");
+  assert.ok(r.data.Moves.some(m => m.id === "v1" && m.approvedBy === "lebo"));
+  // the same movement can't be corrected twice
+  assert.ok(/already been corrected/.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("v1b", M("r1"))] }], LEBO).error));
+
+  // replay: same batch id returns the cached result, doesn't re-check the PIN or write again
+  const failBefore = cache.fail_all, rows = sheets.Moves.rows.length;
+  r = ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("v1", M("r1"))] }], { username: "lebo", pin: "000000" }, "ob1");
+  assert.ok(r.ok, "replayed override batch is answered from the cache");
+  assert.strictEqual(cache.fail_all, failBefore, "replay doesn't touch the wrong-PIN counters");
+  assert.strictEqual(sheets.Moves.rows.length, rows, "nothing written twice");
+  // a repeated row id with a fresh batch id is also saved once
+  assert.ok(ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("v1", M("r1"))] }], LEBO, "ob1-again").ok);
+  assert.strictEqual(sheets.Moves.rows.filter(x => x[0] === "v1").length, 1);
+
+  // the reversal must be a real, matching undo (phone can't invent one)
+  const bad = o => ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("bad", M("r2"), o)] }], LEBO);
+  for (const o of [{ ref: "nope" }, { qty: 9 }, { from: "WH", to: "LOSS" }, { sku: "OTHER" }, { reverses: "kit" }, { ref: "v1" }])
+    assert.ok(/only for corrections/.test(bad(o).error) || /already been corrected/.test(bad(o).error), JSON.stringify(o));
+  assert.ok(!moveRow("bad"));
+
+  // wrong PIN: refused as a whole, counted against that manager and system-wide, logged, nothing written
+  const rows2 = sheets.Moves.rows.length;
+  r = ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("w1", M("r2"))] }], { username: "lebo", pin: "111222" });
+  assert.strictEqual(r.ok, false); assert.ok(/Manager username or PIN is wrong\./.test(r.error));
+  assert.strictEqual(cache.fail_lebo, "1"); assert.ok(Number(cache.fail_all) >= 1);
+  assert.ok(logs().some(l => /sipho\|manager approval failed\|lebo: wrong PIN \(1\)/.test(l)));
+  assert.ok(!JSON.stringify(sheets.Log.rows).includes("111222"), "a wrong PIN is never logged");
+  assert.strictEqual(sheets.Moves.rows.length, rows2);
+  assert.ok(/Manager username or PIN is wrong/.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("w2", M("r2"))] }], { username: "nobody", pin: "111222" }).error), "unknown manager: same message");
+  assert.ok(/Manager username or PIN is wrong/.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("w2", M("r2"))] }], "lebo").error), "malformed override: same message");
+  const wrong = () => ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("w2", M("r2"))] }], { username: "lebo", pin: "111222" });
+  wrong(); wrong(); assert.strictEqual(cache.fail_lebo, "3");
+  assert.ok(/1 tries left/.test(wrong().error), "tries-left hint, like sign-in");
+  wrong();
+  r = ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("w3", M("r2"))] }], LEBO);
+  assert.ok(/locked/.test(r.error), "5 wrong PINs lock that manager, even for the right PIN");
+  assert.ok(/locked/.test(post({ action: "login", username: "lebo", pin: "640291" }).error), "the lock is the same one sign-in uses");
+  assert.ok(!moveRow("w3"));
+  delete cache.fail_lebo; delete cache.fail_all;
+  // the system-wide counter pauses manager approval too
+  cache.fail_all = "30";
+  assert.ok(/paused/.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("w4", M("r2"))] }], LEBO).error));
+  delete cache.fail_all;
+  assert.ok(ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("v2", M("r2"))] }], LEBO).ok, "works again once the counters clear");
+  assert.strictEqual(cache.fail_lebo, undefined, "a right PIN clears that manager's counter");
+
+  // approver must be an active manager/admin other than the signed-in user
+  const rev3 = id => [{ op: "append", sheet: "Moves", rows: [REV(id, M("r3"))] }];
+  const WHO = /Warehouse Manager or Senior Admin other than you/;
+  assert.ok(WHO.test(ov(TS, rev3("a1"), { username: "zed", pin: "9315" }).error), "a User can't approve");
+  assert.ok(WHO.test(ov(TS, rev3("a2"), { username: "owner", pin: "2864" }).error), "a Viewer can't approve");
+  assert.ok(/Manager username or PIN is wrong/.test(ov(TS, rev3("a3"), { username: "gone", pin: "640293" }).error), "a switched-off manager can't approve");
+  assert.ok(WHO.test(ov(TL, rev3("a4"), LEBO).error), "can't approve your own work");
+  assert.ok(ov(TO, rev3("a5"), { username: "lebo", pin: "640291" }).error, "a Viewer phone can't use an override");
+  assert.ok(WHO.test(ov(TS, rev3("a6"), { username: "SIPHO", pin: "7140" }).error), "can't approve as yourself");
+  assert.ok(logs().some(l => /manager approval failed\|lebo: not a manager other than/.test(l)));
+  ["a1", "a2", "a3", "a4", "a5", "a6"].forEach(id => assert.ok(!moveRow(id)));
+
+  // scope: only reversals and count decisions
+  const SCOPE = /only for corrections and count decisions/;
+  assert.ok(SCOPE.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [M("s1")] }], LEBO).error), "a receive is not a correction");
+  assert.ok(SCOPE.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("s2", M("r3")), M("s3")] }], LEBO).error), "one bad row refuses the batch");
+  assert.ok(SCOPE.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [M("s4", { type: "countshort", from: "WH", to: "LOSS", ref: "c-none" })] }], LEBO).error), "count move without a decided count");
+  assert.ok(SCOPE.test(ov(TS, [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", cost: 1 }] }], LEBO).error));
+  assert.ok(SCOPE.test(ov(TS, [{ op: "create", sheet: "Vans", ref: "$V", row: { name: "x" } }], LEBO).error));
+  assert.ok(SCOPE.test(ov(TS, [{ op: "upsert", sheet: "Jobs", rows: [{ no: "J-1", status: "closed" }] }], LEBO).error));
+  assert.ok(SCOPE.test(ov(TS, [{ op: "replaceLines", sheet: "Lines", job: "J-1", rows: [] }], LEBO).error));
+  assert.ok(SCOPE.test(ov(TS, [{ op: "remove", sheet: "Vans", rows: [{ id: "VAN-1" }] }], LEBO).error));
+  assert.ok(SCOPE.test(ov(TS, [{ op: "upsert", sheet: "Counts", rows: [{ id: "brand-new", status: "pending" }] }], LEBO).error), "can't submit a count with an override");
+  assert.ok(SCOPE.test(ov(TS, [{ op: "upsert", sheet: "Counts", rows: [{ id: "c-x", status: "approved", place: "VAN-1" }] }], LEBO).error), "can't change other count fields");
+  assert.ok(!moveRow("s2") && !moveRow("s1"), "a refused override wrote nothing");
+
+  // count decisions
+  const line = (sku, system, counted) => ({ sku, system, counted, diff: counted - system, value: (counted - system) * 10 });
+  const count = (id, by, lines, place) => post({ token: by, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id, place: place || "WH", status: "pending", lines: JSON.stringify(lines), value: -50 }] }] });
+  assert.ok(count("c1", TS, [line("PV", 133, 128)]).ok);
+  const decide = (id, st, extra) => ({ op: "upsert", sheet: "Counts", rows: [Object.assign({ id, status: st, decidedAt: "2026-11-12T10:00:00.000Z" }, extra || {})], expect: { field: "status", values: ["pending"] } });
+  const cmove = (id, ref, o) => M(id, Object.assign({ type: "countshort", from: "WH", to: "LOSS", qty: 5, ref, reason: "Count by sipho, approved" }, o || {}));
+  assert.ok(/can approve or reject/.test(post({ token: TS, ops: [decide("c1", "approved")] }).error), "a User still can't decide counts without an override");
+  // phone leaves the adjustment out, or changes it: refused
+  assert.ok(SCOPE.test(ov(TS, [decide("c1", "approved")], LEBO).error), "approval without its adjustment move");
+  assert.ok(SCOPE.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [cmove("cm0", "c1", { qty: 1 })] }, decide("c1", "approved")], LEBO).error), "wrong quantity");
+  assert.ok(SCOPE.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [cmove("cm0", "c1", { sku: "OTHER" })] }, decide("c1", "approved")], LEBO).error));
+  assert.ok(SCOPE.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [cmove("cm0", "c1")] }, decide("c1", "rejected")], LEBO).error), "no stock moves when rejecting");
+  assert.strictEqual(post({ token: TL }).data.Counts.find(c => c.id === "c1").status, "pending");
+  r = ov(TS, [{ op: "append", sheet: "Moves", rows: [cmove("cm1", "c1")] }, decide("c1", "approved")], LEBO);
+  assert.ok(r.ok, r.error);
+  const c1 = r.data.Counts.find(c => c.id === "c1");
+  assert.strictEqual(c1.status, "approved"); assert.strictEqual(c1.decidedBy, "lebo", "decidedBy is the manager, not the phone's user");
+  assert.strictEqual(moveRow("cm1")[col("Moves", "by")], "sipho"); assert.strictEqual(moveRow("cm1")[col("Moves", "approvedBy")], "lebo");
+  assert.ok(logs().some(l => /lebo approved for sipho: count c1 approved/.test(l)));
+  assert.ok(/already been decided/.test(ov(TS, [decide("c1", "approved")], LEBO).error), "can't decide twice");
+  // reject, with the reason kept; and the approver can't be the person who counted
+  assert.ok(count("c2", TS, [line("PV", 100, 90)]).ok);
+  r = ov(TS, [decide("c2", "rejected", { decisionNote: "recount please" })], { username: "mona", pin: "694815" });
+  assert.ok(r.ok === false && /choose their own PIN/.test(r.error), "a manager still on a temporary PIN can't approve");
+  const TM = login("mona", "694815", "731846");
+  r = ov(TS, [decide("c2", "rejected", { decisionNote: "recount please" })], { username: "mona", pin: "731846" });
+  assert.ok(r.ok, r.error);
+  assert.strictEqual(r.data.Counts.find(c => c.id === "c2").decidedBy, "mona"); assert.strictEqual(r.data.Counts.find(c => c.id === "c2").decisionNote, "recount please");
+  assert.ok(logs().some(l => /mona approved for sipho: count c2 rejected/.test(l)));
+  assert.ok(count("c3", TL, [line("PV", 100, 95)]).ok, "a manager's own count");
+  assert.ok(/own count/.test(ov(TS, [{ op: "append", sheet: "Moves", rows: [cmove("cm3", "c3")] }, decide("c3", "approved")], LEBO).error), "the approver who counted it is refused");
+  assert.ok(!moveRow("cm3") && post({ token: TL }).data.Counts.find(c => c.id === "c3").status === "pending");
+  // a zero-difference count needs no moves
+  assert.ok(count("c4", TS, [line("PV", 50, 50)]).ok);
+  assert.ok(ov(TS, [decide("c4", "approved")], LEBO).ok);
+  // approving and reversing together, with the count decision first in the list
+  assert.ok(count("c5", TS, [line("PV", 90, 85)]).ok);
+  assert.ok(ov(TS, [decide("c5", "approved"), { op: "append", sheet: "Moves", rows: [cmove("cm5", "c5"), REV("v5", M("r4"))] }], LEBO).ok, "order inside the batch doesn't matter");
+  // van count adjustments (kituse) are tied to their count the same way
+  assert.ok(count("c6", TS, [line("PV", 10, 7)], "VAN-1").ok);
+  assert.ok(post({ token: A, ops: [{ op: "append", sheet: "Moves", rows: [M("vt", { type: "topup", from: "WH", to: "VAN-1", qty: 10 })] }] }).ok);
+  assert.ok(ov(TS, [{ op: "append", sheet: "Moves", rows: [cmove("cm6", "c6", { type: "kituse", from: "VAN-1", to: "USED", qty: 3 })] }, decide("c6", "approved")], LEBO).ok);
+
+  // a manager acting alone is unchanged (no override needed, no approvedBy)
+  assert.ok(post({ token: TL, ops: [{ op: "append", sheet: "Moves", rows: [REV("m1", M("r5"))] }] }).ok);
+  assert.strictEqual(moveRow("m1")[col("Moves", "approvedBy")], "");
+
+  // Moves still can't be edited with an override
+  assert.ok(SCOPE.test(ov(TS, [{ op: "upsert", sheet: "Moves", rows: [{ id: "base", qty: 1 }] }], LEBO).error));
+
+  // exception rules: a reversed stock-out gives the quantity back to the job; "approved by" shows on corrections
+  const now = Date.parse("2026-11-12T12:00:00Z"), iso = h => new Date(now - h * 36e5).toISOString();
+  const s = o => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, v == null ? "" : String(v)]));
+  const d = {
+    Items: [s({ sku: "PV", name: "PV red", uom: "m", cost: 10 })], Vans: [], Counts: [],
+    Jobs: [s({ no: "J-9", client: "Z", status: "out", installer: "Sipho", outAt: iso(5) })],
+    Lines: [s({ id: "L9", job: "J-9", sku: "PV", quoted: 10 })],
+    Moves: [
+      s({ id: "k", type: "kit", sku: "PV", qty: 10, from: "WH", to: "JOB:J-9", job: "J-9", ts: iso(5) }),
+      s({ id: "o", type: "out", sku: "PV", qty: 20, from: "WH", to: "JOB:J-9", job: "J-9", ts: iso(4) }),
+      s({ id: "ro", type: "reverse", reverses: "out", ref: "o", sku: "PV", qty: 20, from: "JOB:J-9", to: "WH", job: "J-9", ts: iso(3), value: 200, reason: "wrong job", by: "sipho", approvedBy: "lebo" })
+    ]
+  };
+  const ex = ctx.exceptions_(d, now);
+  assert.strictEqual(ex.filter(e => /over quote/.test(e.rule)).length, 0, "a reversed stock-out no longer counts as issued to the job");
+  const corr = ex.find(e => e.rule === "Correction made");
+  assert.ok(/approved by lebo/.test(corr.detail), corr.detail);
+  d.Moves.pop();
+  assert.strictEqual(ctx.exceptions_(d, now).filter(e => /over quote/.test(e.rule)).length, 1, "without the reversal the stock-out is over quote");
+  console.log("backend v1.7 manager override: all tests passed");
+}
+
+// --- v1.7 sheet: an existing Sheet (made by 1.6) gets the new Moves column without moving any data ---
+{
+  const { ctx, post, sheets } = makeGas();
+  ctx.setAdminPin_("482915", "482915");
+  const T = post({ action: "login", username: "admin", pin: "482915" }).token;
+  const cols16 = ctx.SHEETS.Moves.cols.slice(0, -1);
+  assert.strictEqual(cols16.length, 17);
+  // turn the Moves tab back into what version 1.6 made: 17 headers and an old row
+  const old = ["m-old", "2026-11-01T08:00:00.000Z", "receive", "PV", "7", "SUPPLIER", "WH", "", "", "", "", "9", "63", "INV-1", "", "sipho", ""];
+  sheets.Moves.rows.length = 0; sheets.Moves.rows.push(cols16.slice(), old.slice());
+  assert.strictEqual(sheets.Moves.rows[0].length, 17);
+  let rd = post({ token: T }).data.Moves;
+  assert.strictEqual(rd.length, 1); assert.strictEqual(rd[0].qty, "7"); assert.strictEqual(rd[0].approvedBy, "", "old rows read with a blank approvedBy");
+  // the first save adds the header cell, leaves the old row alone, and writes the new row in the new column
+  assert.ok(post({ token: T, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", name: "PV", uom: "m", track: "qty", cost: 9 }] }, { op: "append", sheet: "Moves", rows: [{ id: "m-new", ts: "2026-11-02T08:00:00.000Z", type: "receive", sku: "PV", qty: 3, from: "SUPPLIER", to: "WH" }] }] }).ok);
+  assert.strictEqual(sheets.Moves.rows[0].length, 18); assert.strictEqual(sheets.Moves.rows[0][17], "approvedBy");
+  assert.deepStrictEqual(sheets.Moves.rows[0].slice(0, 17), cols16, "no header moved");
+  assert.deepStrictEqual(sheets.Moves.rows[1].slice(0, 17), old, "old row untouched");
+  assert.ok(!sheets.Moves.rows[1][17], "old row has a blank approvedBy");
+  assert.strictEqual(sheets.Moves.rows[2][0], "m-new"); assert.strictEqual(sheets.Moves.rows[2][15], "admin");
+  // running it again (and setup again) changes nothing
+  const snap = JSON.stringify(sheets.Moves.rows);
+  ctx.ensureColumns_("Moves"); ctx.setup();
+  assert.strictEqual(JSON.stringify(sheets.Moves.rows), snap, "idempotent");
+  rd = post({ token: T }).data.Moves;
+  assert.deepStrictEqual(rd.map(m => m.id), ["m-old", "m-new"]);
+  // and the override works on that upgraded Sheet
+  assert.ok(post({ action: "users", token: T, cmd: "save", isNew: true, user: { username: "sipho", name: "S", role: "storeman" }, pin: "5832" }).ok);
+  assert.ok(post({ action: "users", token: T, cmd: "save", isNew: true, user: { username: "lebo", name: "L", role: "manager" }, pin: "583217" }).ok);
+  const TS = (() => { const x = post({ action: "login", username: "sipho", pin: "5832" }); post({ action: "changePin", token: x.token, oldPin: "5832", newPin: "7140" }); return x.token; })();
+  const TL = (() => { const x = post({ action: "login", username: "lebo", pin: "583217" }); post({ action: "changePin", token: x.token, oldPin: "583217", newPin: "640291" }); return x.token; })();
+  const r = post({ token: TS, override: { username: "lebo", pin: "640291" }, ops: [{ op: "append", sheet: "Moves", rows: [{ id: "rv", ts: "2026-11-03T08:00:00.000Z", type: "reverse", reverses: "receive", ref: "m-old", sku: "PV", qty: 7, from: "WH", to: "SUPPLIER", reason: "typo" }] }] });
+  assert.ok(r.ok, r.error);
+  assert.strictEqual(sheets.Moves.rows.find(x => x[0] === "rv")[17], "lebo");
+  console.log("backend v1.7 column upgrade: all tests passed");
+}

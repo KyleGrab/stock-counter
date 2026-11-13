@@ -67,9 +67,25 @@ const P = n => `X${n}"'><img src=x id=pwn${n} onerror="window.__pwn=${n}"><svg o
   // scan an unknown poisoned code; message shows it
   await pg.evaluate(() => { stopCam(); go("scan"); });
   await pg.fill("#sc_code", '<img src=x id=pwn901 onerror=window.__pwn=901>'); await pg.getByRole("button", { name: "Go", exact: true }).click(); await visit("scan message");
+  // v1.13 manager override: a User's Counts tab (waiting counts), poisoned "approved by", and the pop-up summary
+  await pg.evaluate(() => {
+    const P3 = n => `X${n}"'><img src=x id=pwn${n} onerror="window.__pwn=${n}"><svg onload="window.__pwn=${n}"></svg>&lt;b&gt;`;
+    const d = LS.get("sc_demo", null);
+    d.Moves.forEach((m, i) => { if (i % 3 === 0) m.approvedBy = P3(970 + i); });
+    d.Counts.push({ id: "CNT-x1", place: "WH", ts: new Date().toISOString(), by: P3(960), status: "pending", lines: JSON.stringify([{ sku: d.Items[0].sku, system: 5, counted: 3, diff: -2, value: -2 }]), value: -2, note: P3(961) });
+    LS.set("sc_demo", d); SD = emptyData(); Q = []; persist(); rebuild();
+    cfg.user.role = "storeman"; S.tab = "counts"; S.sub = null; S.item = null; S.f = { rejecting: "CNT-x1", rejNote: P3(962) }; render();
+  });
+  assert.ok((await pg.locator("#view").innerText()).includes("Waiting for approval"), "a User sees the waiting counts");
+  await visit("counts (User)");
+  const items2 = await pg.evaluate(() => D.Items.slice(0, 3).map(i => i.sku));
+  for (const s of items2) { await pg.evaluate(s => { S.tab = "stock"; S.item = s; S.f = {}; render(); }, s); await visit("item (User) " + s); }
+  await pg.evaluate(() => { askManager({ summary: '<img src=x id=pwn990 onerror=window.__pwn=990>', ops: [], msg: function () { return ""; } }); });
+  await visit("manager pop-up"); assert.ok((await pg.locator("#ovSummary").innerText()).includes("<img"), "summary is plain text");
+  await pg.evaluate(() => { ovClose(); cfg.user.role = "admin"; S.item = null; });
   // sign-in page and user chip with poisoned names
   await pg.evaluate(() => { cfg.user.name = '<img src=x id=pwn902 onerror=window.__pwn=902>'; syncStatus(); }); await visit("header chip");
   assert.deepStrictEqual(errs, [], "no script errors");
-  console.log("xss: " + (views.length + jobs.length + items.length + 15) + " screens checked, nothing executed");
+  console.log("xss: " + (views.length + jobs.length + items.length + 20) + " screens checked, nothing executed");
   await b.close(); srv.close();
 })().catch(e => { console.error(e); process.exit(1); });

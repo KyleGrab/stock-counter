@@ -144,6 +144,8 @@ tfoot td{border-top:2px solid var(--line);border-bottom:0}
 .panel > label.f,.panel > .f{flex:0 0 auto}
 .quick{border-top:1px dashed var(--line);padding-top:12px;display:flex;flex-direction:column;gap:8px}
 .hint{border-left:3px solid var(--accent);padding:4px 0 4px 10px;font-size:14px}
+.modal{position:fixed;inset:0;z-index:60;background:rgba(15,21,27,.6);display:flex;align-items:center;justify-content:center;padding:14px;overflow-y:auto}
+.modal .panel{width:100%;max-width:420px;box-shadow:0 8px 30px rgba(0,0,0,.3)}
 @media print{body{padding:0;background:#fff}nav,header,.noprint{display:none!important}}
 </style>
 </head>
@@ -178,6 +180,18 @@ tfoot td{border-top:2px solid var(--line);border-bottom:0}
   <button data-tab="counts"><svg viewBox="0 0 24 24"><path d="M9 11l3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9"/></svg>Counts</button>
   <button data-tab="more"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>More</button>
 </div></nav>
+<div class="modal" id="ovModal" hidden role="dialog" aria-modal="true" aria-labelledby="ovTitle">
+  <div class="panel">
+    <div class="eyebrow">Manager approval</div>
+    <h2 id="ovTitle">Manager approval needed</h2>
+    <p class="small" id="ovSummary"></p>
+    <p class="tiny muted">A Warehouse Manager or Senior Admin types their own username and PIN. The Sheet checks it; nothing is saved on this phone.</p>
+    <label class="f">Manager username<input id="ov_user" type="text" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false"></label>
+    <label class="f">Manager PIN<input id="ov_pin" type="password" inputmode="numeric" autocomplete="off"></label>
+    <div class="msg err" id="ovErr" role="alert" hidden></div>
+    <div class="row"><button class="btn" id="ovOk" type="button">Approve</button><button class="btn ghost" id="ovCancel" type="button">Cancel</button></div>
+  </div>
+</div>
 <script src="core.js"></script>
 <script src="app.js"></script>
 </body>

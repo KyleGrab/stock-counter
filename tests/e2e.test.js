@@ -188,7 +188,17 @@ const server = http.createServer((req, res) => {
   assert.ok(!(await text()).includes("Missing, last 30 days"), "storeman doesn't see the missing-stock report");
   await page.getByRole("button", { name: "PV cable 6 mm² red" }).click();
   await page.waitForSelector("text=Movements");
-  assert.strictEqual(await page.getByRole("button", { name: "Reverse this" }).count(), 0, "storeman can't reverse");
+  // v1.13: a User can ask for a correction, but nothing is saved until a manager types their own username and PIN
+  assert.ok(await page.getByRole("button", { name: "Reverse this" }).count() > 0, "storeman can ask for a correction");
+  await page.getByRole("button", { name: "Reverse this" }).first().click();
+  await page.fill("#rev_reason", "Just checking");
+  await page.getByRole("button", { name: "Confirm correction" }).click();
+  await page.locator("#ovModal").waitFor({ state: "visible" });
+  assert.strictEqual(await page.evaluate(() => D.Moves.filter(m => m.type === "reverse").length), 0, "no correction without a manager");
+  await page.locator("#ovCancel").click();
+  await page.locator("#ovModal").waitFor({ state: "hidden" });
+  assert.strictEqual(await page.evaluate(() => D.Moves.filter(m => m.type === "reverse").length), 0);
+  await page.evaluate(() => { S.f = {}; });
   // viewer: look only
   await signInAs("owner", "8642");
   assert.ok(await page.locator("nav button[data-tab=scan]").isHidden());
@@ -264,11 +274,105 @@ const server = http.createServer((req, res) => {
   await page.getByRole("button", { name: "Confirm correction" }).click();
   await page.waitForSelector("text=Correction recorded");
   assert.strictEqual(await page.evaluate(() => C.bal(X.B, "WH", "MC4")), soBefore[1], "reversal returns it to the store");
+  // --- manager override (v1.13): a User needs a manager's own username and PIN for corrections and count decisions ---
+  await signInAs("sipho", "1357");
+  const redWh = await page.evaluate(() => C.bal(X.B, "WH", "PV6-RED"));
+  await page.locator("nav button[data-tab=stock]").click();
+  await page.getByRole("button", { name: /PV cable 6 mm² red/ }).first().click();
+  await page.waitForSelector("text=Movements");
+  await page.getByRole("button", { name: "Reverse this" }).first().click();   // newest movement = sipho's stock out of 5 m
+  await page.fill("#rev_reason", "Wrong load");
+  await page.getByRole("button", { name: "Confirm correction" }).click();
+  await page.locator("#ovModal").waitFor({ state: "visible" });
+  assert.ok((await page.locator("#ovSummary").innerText()).includes("Stock out"), "pop-up says what is being approved");
+  assert.strictEqual(await page.getAttribute("#ov_pin", "type"), "password");
+  assert.strictEqual(await page.getAttribute("#ov_pin", "inputmode"), "numeric");
+  assert.strictEqual(await page.getAttribute("#ov_pin", "autocomplete"), "off");
+  assert.strictEqual(await page.evaluate(() => D.Moves.filter(m => m.type === "reverse" && m.by === "sipho").length), 0, "nothing saved before approval");
+  // Escape closes and clears; Cancel too
+  await page.fill("#ov_user", "lebo"); await page.fill("#ov_pin", "580214");
+  await page.keyboard.press("Escape");
+  await page.locator("#ovModal").waitFor({ state: "hidden" });
+  assert.deepStrictEqual(await page.evaluate(() => [$("#ov_user").value, $("#ov_pin").value, OV]), ["", "", null], "Escape clears the fields");
+  await page.getByRole("button", { name: "Confirm correction" }).click();
+  await page.locator("#ovModal").waitFor({ state: "visible" });
+  await page.fill("#ov_user", "lebo"); await page.fill("#ov_pin", "580214");
+  await page.locator("#ovCancel").click();
+  await page.locator("#ovModal").waitFor({ state: "hidden" });
+  assert.strictEqual(await page.evaluate(() => $("#ov_pin").value), "");
+  // wrong PIN: error in the pop-up, stays open, PIN field cleared
+  await page.getByRole("button", { name: "Confirm correction" }).click();
+  await page.fill("#ov_user", "lebo"); await page.fill("#ov_pin", "111222");
+  await page.locator("#ovOk").click();
+  await page.waitForFunction(() => /Manager username or PIN is wrong/.test(document.getElementById("ovErr").textContent));
+  assert.ok(await page.locator("#ovModal").isVisible(), "pop-up stays open");
+  assert.strictEqual(await page.inputValue("#ov_pin"), "", "PIN field cleared after a refusal");
+  // the signed-in User can't approve their own correction, and a User/Viewer can't approve either
+  for (const [u, p, re] of [["sipho", "1357", /other than you/], ["owner", "8642", /other than you/]]) {
+    await page.fill("#ov_user", u); await page.fill("#ov_pin", p); await page.keyboard.press("Enter");
+    await page.waitForFunction(r => new RegExp(r).test(document.getElementById("ovErr").textContent), re.source);
+  }
+  assert.strictEqual(await page.evaluate(() => D.Moves.filter(m => m.type === "reverse" && m.by === "sipho").length), 0, "still nothing saved");
+  // right PIN, Enter submits
+  await page.fill("#ov_user", "lebo"); await page.fill("#ov_pin", "580214"); await page.keyboard.press("Enter");
+  await page.waitForSelector("text=Approved by Lebo (warehouse manager). Correction recorded.");
+  await page.locator("#ovModal").waitFor({ state: "hidden" });
+  assert.strictEqual(await page.evaluate(() => $("#ov_pin").value + $("#ov_user").value), "", "fields cleared on success");
+  assert.strictEqual(await page.evaluate(() => C.bal(X.B, "WH", "PV6-RED")), redWh + 5, "the correction returned the 5 m to the store");
+  assert.deepStrictEqual(await page.evaluate(() => { const m = D.Moves.filter(x => x.type === "reverse" && x.by === "sipho"); return [m.length, m[0].approvedBy, m[0].reason]; }), [1, "lebo", "Wrong load"]);
+  assert.ok((await text()).includes("approved by lebo"), "history shows who approved");
+  // a User counts the store shelves; it appears under "Waiting for approval" in the Counts tab
+  const lugSys = await page.evaluate(() => C.bal(X.B, "WH", "LUG-16"));
+  await page.locator("nav button[data-tab=counts]").click();
+  await page.locator("#cnt_LUG-16").fill(String(lugSys - 2)); await page.locator("#cnt_LUG-16").blur();
+  await page.getByRole("button", { name: "Submit count for approval" }).click();
+  await page.waitForSelector("text=Count submitted");
+  assert.ok((await text()).includes("Waiting for approval"));
+  const waitingBefore = await page.getByRole("button", { name: "Approve", exact: true }).count();
+  assert.ok(waitingBefore >= 2, "the waiting counts have Approve buttons for a User");
+  const myCount = () => page.evaluate(() => D.Counts.filter(c => c.status === "pending" && c.lines.includes("LUG-16"))[0].id);
+  await page.locator('button[data-action=approveCount][data-id="' + await myCount() + '"]').click();
+  await page.locator("#ovModal").waitFor({ state: "visible" });
+  assert.ok((await page.locator("#ovSummary").innerText()).includes("store shelves"));
+  await page.fill("#ov_user", "lebo"); await page.fill("#ov_pin", "580214"); await page.locator("#ovOk").click();
+  await page.waitForSelector("text=Count approved by Lebo (warehouse manager).");
+  assert.deepStrictEqual(await page.evaluate(() => { const c = D.Counts.filter(x => x.by === "sipho" && x.status === "approved"); const m = D.Moves.filter(x => x.type === "countshort" && x.sku === "LUG-16" && x.ref === c[0].id); return [c.length, c[0].decidedBy, m.length, m[0].by, m[0].approvedBy, m[0].ref === c[0].id]; }), [1, "lebo", 1, "sipho", "lebo", true], "decidedBy is the manager; the adjustment shows both people");
+  assert.strictEqual(await page.evaluate(() => C.bal(X.B, "WH", "LUG-16")), lugSys - 2);
+  // reject needs a reason, then the pop-up
+  await page.locator("#cnt_LUG-16").fill(String(lugSys + 5)); await page.locator("#cnt_LUG-16").blur();
+  await page.getByRole("button", { name: "Submit count for approval" }).click();
+  await page.waitForSelector("text=Count submitted");
+  const rejId = await myCount();
+  await page.locator('button[data-action=rejStart][data-id="' + rejId + '"]').click();
+  await page.getByRole("button", { name: "Reject count" }).click();
+  await page.waitForSelector("text=Give a reason");
+  assert.ok(await page.locator("#ovModal").isHidden(), "no pop-up until there is a reason");
+  await page.locator("#rej_" + rejId).fill("Recount please");
+  await page.getByRole("button", { name: "Reject count" }).click();
+  await page.locator("#ovModal").waitFor({ state: "visible" });
+  await page.fill("#ov_user", "admin"); await page.fill("#ov_pin", "246810"); await page.locator("#ovOk").click();
+  await page.waitForSelector("text=Count rejected by Kyle (senior admin).");
+  assert.deepStrictEqual(await page.evaluate(() => { const c = D.Counts.filter(x => x.status === "rejected"); return [c.length, c[0].decidedBy, c[0].decisionNote]; }), [1, "admin", "Recount please"]);
+  // nothing sensitive stayed on the phone. (The demo's pretend Users tab, sc_demo_users, is the one place demo PINs live, like the Sheet's Users tab.)
+  const stored = await page.evaluate(() => { const o = {}; for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); o[k] = localStorage.getItem(k); } return o; });
+  for (const [k, v] of Object.entries(stored)) {
+    assert.ok(!/override/i.test(v), "no 'override' in localStorage " + k);
+    assert.ok(!v.includes("111222"), "a wrong PIN is never stored: " + k);
+    if (k !== "sc_demo_users") assert.ok(!v.includes("580214") && !v.includes("246810"), "manager PIN not in localStorage " + k);
+  }
+  assert.ok(!(await page.evaluate(() => JSON.stringify([S, cfg, Q, D.Moves.slice(-5)]))).match(/580214|246810|111222/), "no manager PIN in app state, config or queue");
+  // a Viewer sees no reverse or approve at all
+  await signInAs("owner", "8642");
+  await page.locator("nav button[data-tab=stock]").click();
+  await page.getByRole("button", { name: /PV cable 6 mm² red/ }).first().click();
+  await page.waitForSelector("text=Movements");
+  assert.strictEqual(await page.getByRole("button", { name: "Reverse this" }).count(), 0, "viewer can't reverse");
+  assert.strictEqual(await page.getByRole("button", { name: "Approve", exact: true }).count(), 0);
   // --- inventory: User submits a count, Warehouse Manager approves ---
   await signInAs("sipho", "1357");
   await page.locator("nav button[data-tab=counts]").click();
   await page.fill("#cnt_flt", "black");
-  assert.ok(!(await text()).includes("MC4 connector"), "search filters the list");
+  assert.ok(!(await page.locator("#view .tablewrap").first().innerText()).includes("MC4 connector"), "search filters the list (the count form; waiting counts below keep their own tables)");
   await page.locator("#cnt_PV6-BLK").fill("300"); await page.locator("#cnt_PV6-BLK").blur();
   await page.waitForSelector("text=short");
   await page.fill("#cnt_note", "Recounted twice");

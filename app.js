@@ -23,7 +23,7 @@ function siteUrl() { return (cfg.site || (location.origin + location.pathname)).
  * Q  = saves waiting to reach the Sheet (offline queue). Each has a fixed batch id, so a retry is applied once.
  * D  = what the screens show: SD plus the queued saves applied on top.
  */
-var APP_VERSION = "1.12";
+var APP_VERSION = "1.13";
 /*
  * DEV PHASE ONLY. One-tap sign-in buttons. Set to false to remove them everywhere.
  *  - Demo: a button per demo login (demo data stays on the phone).
@@ -127,6 +127,70 @@ var DEMO_USERS = [
   { username: "owner", name: "Owner (viewer)", role: "viewer", active: "yes", mustChange: "no", pin: "8642" }
 ];
 function demoErr(msg, signIn) { var e = new Error(msg); e.signIn = !!signIn; return e; }
+/*
+ * Manager override in the demo: the same rules as Code.gs (verifyOverride_, overrideScope_, checkReversal_, expectedCountMoves_).
+ * Wrong-PIN counters are kept in memory only (they reset when the page reloads); no PIN is ever stored.
+ */
+var DEMO_REVERSIBLE = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1, adjust: 1, out: 1 };
+var OV_SCOPE_MSG = "Manager approval is only for corrections and count decisions.";
+var OV_WHO_MSG = "Manager approval must come from a Warehouse Manager or Senior Admin other than you.";
+var demoFails = {};
+function demoFailGet(k) { var f = demoFails[k]; if (f && f.until < Date.now()) { delete demoFails[k]; f = null; } return f ? f.n : 0; }
+function demoFailPut(k, n) { demoFails[k] = { n: n, until: Date.now() + 15 * 60000 }; }
+function demoVerifyOverride(o, me, users) {
+  o = o && typeof o === "object" && !Array.isArray(o) ? o : {};
+  var name = String(o.username == null ? "" : o.username).trim().toLowerCase().slice(0, 40), pin = cleanPin(o.pin).slice(0, 20), fk = "fail_" + name;
+  var all = demoFailGet("fail_all");
+  if (all >= 30) throw demoErr("Too many wrong PINs on this system just now. Manager approval is paused for 15 minutes.");
+  var tries = demoFailGet(fk);
+  if (tries >= 5) throw demoErr("Too many wrong PINs for that manager login. It is locked for 15 minutes, or an admin can reset the PIN.");
+  var a = users.find(function (x) { return x.username === name; });
+  if (!(a && a.active === "yes" && a.pin === pin)) {
+    demoFailPut(fk, tries + 1); demoFailPut("fail_all", all + 1);
+    var left = 5 - tries - 1;
+    throw demoErr("Manager username or PIN is wrong." + (left > 0 && left <= 2 ? " " + left + " tries left." : ""));
+  }
+  delete demoFails[fk];
+  if (!(a.role === "admin" || a.role === "manager") || a.username === me.username) throw demoErr(OV_WHO_MSG);
+  if (a.mustChange === "yes") throw demoErr("That manager must sign in once and choose their own PIN first.");
+  if (me.role === "viewer") throw demoErr("Your login can view only.");
+  return a;
+}
+function demoOverrideScope(ops) {
+  var decided = {}, any = false, bad = function () { return demoErr(OV_SCOPE_MSG); };
+  ops.forEach(function (op) {
+    if (op && op.op === "upsert" && op.sheet === "Counts") {
+      if (!Array.isArray(op.rows) || !op.rows.length) throw bad();
+      op.rows.forEach(function (r) {
+        var id = r && String(r.id || "");
+        if (!id || decided[id] || (r.status !== "approved" && r.status !== "rejected")) throw bad();
+        Object.keys(r).forEach(function (k) { if (!/^(id|status|decidedAt|decisionNote)$/.test(k)) throw bad(); });
+        decided[id] = r.status; any = true;
+      });
+    }
+  });
+  ops.forEach(function (op) {
+    if (op && op.op === "upsert" && op.sheet === "Counts") return;
+    if (!op || op.op !== "append" || op.sheet !== "Moves" || !Array.isArray(op.rows) || !op.rows.length) throw bad();
+    op.rows.forEach(function (r) {
+      if (!r || typeof r !== "object") throw bad();
+      if (r.type === "reverse") { any = true; return; }
+      if (/^(countshort|countover|kituse)$/.test(r.type) && decided[String(r.ref || "")] === "approved") return;
+      throw bad();
+    });
+  });
+  if (!any) throw bad();
+}
+function demoExpectedCountMoves(c) {
+  var lines; try { lines = JSON.parse(c.lines || "[]"); } catch (e) { lines = []; }
+  var isVan = c.place !== "WH", out = {};
+  (Array.isArray(lines) ? lines : []).forEach(function (l) {
+    var diff = Math.round(Number(l && l.diff) * 100) / 100;
+    if (!l || !isFinite(diff) || Math.abs(diff) <= 1e-9) return;
+    out[String(l.sku)] = diff < 0 ? { type: isVan ? "kituse" : "countshort", qty: -diff, from: c.place, to: isVan ? "USED" : "LOSS" } : { type: "countover", qty: diff, from: "LOSS", to: c.place };
+  });
+  return out;
+}
 var demo = {
   users: function () {
     var list = LS.get("sc_demo_users", null) || JSON.parse(JSON.stringify(DEMO_USERS));
@@ -209,18 +273,22 @@ var demo = {
   sync: function (body, me, users) {
     var d = LS.get("sc_demo", null) || seedDemo();
     var done = LS.get("sc_demo_batches", {}) || {};
-    var assigned = {};
+    var assigned = {}, approver = null;
     if (body.ops && body.ops.length) {
-      if (done[body.batch]) assigned = done[body.batch];
+      if (done[body.batch]) assigned = done[body.batch];   // a retry: already applied, nothing is checked again
       else {
-        var work = JSON.parse(JSON.stringify(d)), newMoves = [];
+        approver = body.override != null ? demoVerifyOverride(body.override, me, users) : null;
+        if (approver) demoOverrideScope(body.ops);
+        var actor = approver || me;
+        var work = JSON.parse(JSON.stringify(d)), newMoves = [], countSeen = {}, decidedCounts = {};
+        var counts0 = JSON.parse(JSON.stringify(work.Counts));
         body.ops.forEach(function (raw) {
           var op = JSON.parse(JSON.stringify(raw), function (k, v) {
             if (typeof v !== "string" || k === "ref") return v;
             Object.keys(assigned).forEach(function (r) { v = v.replace(new RegExp(r.replace(/[$]/g, "\\$&") + "(?![A-Za-z0-9_])", "g"), assigned[r]); });
             return v;
           });
-          var why = permitted(op, me.role); if (why) throw demoErr(why);
+          var why = permitted(op, actor.role); if (why) throw demoErr(why);
           if (op.op === "create") {
             var nb = NUMBERING[op.sheet], key = KEYS[op.sheet];
             var id = C.nextNumber(work[op.sheet].map(function (r) { return r[key]; }), nb[0], nb[1]);
@@ -232,12 +300,17 @@ var demo = {
           if (op.op === "upsert" && op.sheet === "Counts") {
             op.rows.forEach(function (r) {
               var cur = work.Counts.find(function (x) { return x.id === r.id; });
-              var mgr = me.role === "admin" || me.role === "manager";
+              var mgr = actor.role === "admin" || actor.role === "manager";
               if (!mgr && (cur || r.status !== "pending")) throw demoErr("Only a Warehouse Manager or Senior Admin can approve or reject counts.");
+              if (approver) {
+                if (!cur) throw demoErr(OV_SCOPE_MSG);
+                if (cur.status !== "pending") throw demoErr("This count has already been decided. Refresh.");
+              }
               if (!cur) r.by = me.username;
               if (cur && r.status && r.status !== cur.status) {
-                if (cur.by === me.username) throw demoErr("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
-                r.decidedBy = me.username;
+                if (cur.by === actor.username) throw demoErr("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
+                r.decidedBy = actor.username;
+                if (approver && r.status === "approved") decidedCounts[r.id] = true;
               }
             });
           }
@@ -254,10 +327,26 @@ var demo = {
           }
           if (op.op === "append") {
             var have = {}; work.Moves.forEach(function (m) { have[m.id] = 1; });
-            op.rows = op.rows.filter(function (m) { return !have[m.id]; }).map(function (m) { return Object.assign({}, m, { by: me.username }); });
+            op.rows = op.rows.filter(function (m) { return !have[m.id]; }).map(function (m) { return Object.assign({}, m, { by: me.username, approvedBy: approver ? approver.username : "" }); });
+            if (approver) op.rows.forEach(function (m) {
+              if (m.type === "reverse") {
+                var orig = work.Moves.find(function (x) { return x.id === m.ref; });
+                if (!orig || !DEMO_REVERSIBLE[orig.type] || m.reverses !== orig.type || String(m.sku) !== String(orig.sku) || Math.abs(Number(m.qty) - Number(orig.qty)) > 0.005 || m.from !== orig.to || m.to !== orig.from) throw demoErr(OV_SCOPE_MSG);
+                if (work.Moves.some(function (x) { return x.type === "reverse" && x.ref === orig.id; }) || op.rows.some(function (x) { return x !== m && x.type === "reverse" && x.ref === orig.id; })) throw demoErr("That movement has already been corrected. Refresh.");
+                return;
+              }
+              var c = counts0.find(function (x) { return x.id === m.ref; });
+              if (c && c.status !== "pending") throw demoErr("This count has already been decided. Refresh.");
+              var want = c ? demoExpectedCountMoves(c)[String(m.sku)] : null, cs = countSeen[m.ref] = countSeen[m.ref] || {};
+              if (!want || cs[m.sku] || want.type !== m.type || want.from !== m.from || want.to !== m.to || Math.abs(Number(m.qty) - want.qty) > 0.005) throw demoErr(OV_SCOPE_MSG);
+              cs[m.sku] = true;
+            });
             newMoves = newMoves.concat(op.rows);
           }
           applyOpsLocal(work, [op]);
+        });
+        Object.keys(decidedCounts).forEach(function (id) {
+          Object.keys(demoExpectedCountMoves(counts0.find(function (x) { return x.id === id; }))).forEach(function (sku) { if (!(countSeen[id] && countSeen[id][sku])) throw demoErr(OV_SCOPE_MSG); });
         });
         var items = {}; work.Items.forEach(function (i) { items[i.sku] = i; });
         var problem = C.checkBalances(d.Moves, newMoves, items);
@@ -271,7 +360,7 @@ var demo = {
     var from = have2 > 0 && have2 <= total ? have2 : 0;
     out.Moves = out.Moves.slice(from); out.movesFrom = from; out.movesTotal = total;
     if (me.role === "admin") out.Users = this.listUsers(users);
-    return { ok: true, assigned: assigned, data: out, user: this.publicUser(me) };
+    return { ok: true, assigned: assigned, data: out, user: this.publicUser(me), approver: approver ? { username: approver.username, name: approver.name } : undefined };
   }
 };
 function netError() { var e = new Error("No signal. Your change is saved on this phone and will sync automatically."); e.net = true; return e; }
@@ -296,6 +385,10 @@ var api = {
     var p = cfg.mode === "demo" ? demo.call(action, body) : post(cfg.url, body);
     return p.catch(function (e) { if (e.signIn) signedOut(e.message); throw e; });
   },
+  // Manager override: sent straight to the Sheet (never queued, never stored). The caller wipes `override` afterwards.
+  override: function (ops, batch, override) {
+    return api.call("sync", { ops: ops, batch: batch, have: SD.Moves.length, override: override });
+  },
   sync: function (ops, batch, have) {
     return api.call("sync", { ops: ops || [], batch: batch || "", have: have == null ? SD.Moves.length : have }).then(function (res) {
       if (res.user) { cfg.user = res.user; saveCfg(); }
@@ -305,7 +398,7 @@ var api = {
 };
 // The Sheet said this sign-in is no longer valid. Keep queued work; ask to sign in again.
 function signedOut(msg) {
-  cfg.token = ""; saveCfg(); stopCam();
+  cfg.token = ""; saveCfg(); stopCam(); ovClose();
   S.loginMsg = msg; S.tab = "jobs"; S.sub = null; S.job = null; S.item = null; S.f = {};
   setTimeout(render, 0);
 }
@@ -414,12 +507,12 @@ function save(ops, okMsg, after, opts) {
   return Promise.resolve();
 }
 
-var flushing = false;
+var flushing = false, flushP = Promise.resolve();
 function flush() {
   if (flushing || !Q.length || !cfg.mode || !cfg.token) return;
   flushing = true;
   var b = Q[0];
-  api.sync(b.ops, b.batch).then(function (res) {
+  flushP = api.sync(b.ops, b.batch).then(function (res) {
     Q.shift();
     if (!applyServer(res)) { persist(); flushing = false; return fullReload(); }
     flushing = false;
@@ -430,8 +523,14 @@ function flush() {
     // The Sheet refused it (e.g. stock used on another device). Drop it and tell the person.
     Q.shift(); persist();
     S.msg = { k: "err", t: "Not saved: " + b.label + " Reason: " + e.message };
-    fullReload();
+    return fullReload();
   });
+}
+// Send everything waiting on this phone and tell me if the queue is now empty (used before a manager approval).
+function flushAll() {
+  if (!Q.length) return Promise.resolve(true);
+  if (!flushing) flush();
+  return flushP.then(function () { return !Q.length ? true : flushing ? flushAll() : false; });
 }
 function fullReload() {
   if (!cfg.mode || !cfg.token) { S.loading = false; syncStatus(); render(); return Promise.resolve(); }
@@ -865,12 +964,12 @@ function vStockOut() {
   order.sort(function (a, b) { return new Date(groups[b].ts) - new Date(groups[a].ts); });
   var rec = order.map(function (k) {
     var g = groups[k], f = g.first, total = g.moves.reduce(function (s, m) { return s + n(m.value); }, 0);
-    return '<div class="hist"><div class="spread"><div><b>' + esc(dtime(g.ts)) + '</b><div class="tiny muted">by ' + esc(g.by) + (f.installer ? " · collected by " + esc(f.installer) : "") + "</div></div>" +
+    return '<div class="hist"><div class="spread"><div><b>' + esc(dtime(g.ts)) + '</b><div class="tiny muted">by ' + esc(g.by) + (f.installer ? " · collected by " + esc(f.installer) : "") + (f.approvedBy ? " · approved by " + esc(f.approvedBy) : "") + "</div></div>" +
       (mgr ? '<div class="right"><span class="mono">' + R(total) + "</span></div>" : "") + "</div>" +
       '<div class="small">To: ' + esc(outWhere(f)) + "</div>" +
       (f.ref ? '<div class="tiny muted">Ref: ' + esc(f.ref) + "</div>" : "") + (f.reason ? '<div class="tiny muted">Note: ' + esc(f.reason) + "</div>" : "") +
       g.moves.map(function (m) {
-        return '<div class="spread"><span><span class="mono">' + q(m.qty, m.sku) + "</span> " + esc(nameOf(m.sku)) + (reversed[m.id] ? ' <span class="pill p-closed">Corrected</span>' : "") + "</span>" + (mgr ? '<span class="mono">' + R(m.value) + "</span>" : "") + "</div>";
+        return '<div class="spread"><span><span class="mono">' + q(m.qty, m.sku) + "</span> " + esc(nameOf(m.sku)) + (reversed[m.id] ? ' <span class="pill p-closed">Corrected</span>' : "") + (m.approvedBy && m.approvedBy !== f.approvedBy ? ' <span class="tiny muted">approved by ' + esc(m.approvedBy) + "</span>" : "") + "</span>" + (mgr ? '<span class="mono">' + R(m.value) + "</span>" : "") + "</div>";
       }).join("") + "</div>";
   }).join("");
   return html + '<section class="panel"><h3>Recent stock out</h3><p class="tiny muted">' + (o.older ? "All stock out, newest first." : "Last 30 days, newest first.") + " Stock out is never edited or deleted; a manager can reverse a mistake from the item's history.</p>" +
@@ -884,7 +983,7 @@ var MOVE_LABEL = { adjust: "Adjustment", receive: "Received", kit: "Kitted to jo
 var REVERSIBLE = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1, adjust: 1, out: 1 };
 function placeName(l) { return !l ? "" : l === "WH" ? "Store" : l.indexOf("JOB:") === 0 ? l.slice(4) : l === "SUPPLIER" ? "Supplier" : l === "USED" ? "Used" : l === "LOSS" ? "Lost/found" : l === "SCRAP" ? "Scrap" : l === "OUT" ? "Customer / other" : vanName(l); }
 function canReverse(m) {
-  if (!canManage() || !REVERSIBLE[m.type]) return false;
+  if (!canWork() || !REVERSIBLE[m.type]) return false;   // a User needs a manager's approval to actually do it (see askManager)
   if (D.Moves.some(function (x) { return x.type === "reverse" && x.ref === m.id; })) return false;
   if (m.job) { var j = X.jobs[m.job]; if (!j || !(j.status === "out" || (m.type === "out" && j.status === "kitted"))) return false; }
   return true;
@@ -899,7 +998,7 @@ function vItemHistory(sku) {
     var open = S.f.rev === m.id;
     return '<div class="hist"><div class="spread"><div><b>' + esc(MOVE_LABEL[m.type] || m.type) + "</b>" + (m.type === "reverse" ? ' <span class="tiny muted">of ' + esc(MOVE_LABEL[m.reverses] || m.reverses) + "</span>" : "") +
       (reversed[m.id] ? ' <span class="pill p-closed">Corrected</span>' : "") + (pending[m.id] ? ' <span class="pill p-kitted">Waiting to sync</span>' : "") +
-      '<div class="tiny muted">' + esc(dtime(m.ts)) + (m.by ? " · " + esc(m.by) : "") + "</div></div>" +
+      '<div class="tiny muted">' + esc(dtime(m.ts)) + (m.by ? " · " + esc(m.by) : "") + (m.approvedBy ? " · approved by " + esc(m.approvedBy) : "") + "</div></div>" +
       '<div class="right"><span class="mono">' + q(m.qty, sku) + '</span><span class="tiny muted">' + esc(placeName(m.from)) + " → " + esc(placeName(m.to)) + "</span></div></div>" +
       ((m.reason || m.ref || m.serial) ? '<div class="tiny muted">' + [m.serial ? "Serial " + esc(m.serial) : "", m.reason ? esc(m.reason) : "", m.ref && m.type !== "reverse" ? esc(m.ref) : ""].filter(Boolean).join(" · ") + "</div>" : "") +
       (canReverse(m) && !open ? '<button class="btn ghost small" data-action="revStart" data-id="' + esc(m.id) + '">Reverse this</button>' : "") +
@@ -959,7 +1058,7 @@ function vCounts(inInv) {
       '<p class="muted">' + (all.length ? "No items match." : isVan ? "No van kit list yet. An admin sets it up in Admin → Vans." : "No items yet.") + "</p>") +
     '<div id="cntTotal"></div>' +
     (!direct ? '<label class="f">Note for the admin (optional)<input id="cnt_note" data-bind="cnote" value="' + esc(S.f.cnote || "") + '" placeholder="e.g. Drum 2 label damaged, measured by hand"></label>' : "") +
-    msgHtml() + '<button class="btn wide" data-action="saveCount"' + (S.busy || !all.length ? " disabled" : "") + ">" + (direct ? "Save count" : "Submit count for approval") + "</button></section>";
+    msgHtml() + '<button class="btn wide" data-action="saveCount"' + (S.busy || !all.length ? " disabled" : "") + ">" + (direct ? "Save count" : "Submit count for approval") + "</button></section>" + (inInv ? "" : vWaiting());
 }
 function countTotal(place) {
   var lines = C.countLines(place, S.f.cnt || {}, X.B, X.items);
@@ -1022,32 +1121,33 @@ function findReceipt(ref) {
   return D.Moves.find(function (m) { return m.type === "receive" && String(m.ref || "").replace(/\s+/g, "").toLowerCase() === k; }) || null;
 }
 function countLinesOf(c) { try { return JSON.parse(c.lines || "[]"); } catch (e) { return []; } }
+function countLinesTable(c) {
+  var lines = countLinesOf(c);
+  return '<div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">System</th><th class="n">Counted</th><th class="n">Diff</th><th class="n">Value</th></tr></thead><tbody>' +
+    lines.map(function (l) {
+      return "<tr><td>" + esc(nameOf(l.sku)) + '</td><td class="n">' + q(l.system, l.sku) + '</td><td class="n">' + q(l.counted, l.sku) + '</td><td class="n">' +
+        (l.diff < 0 ? '<span class="pill p-bad">' + q(l.diff, l.sku) + "</span>" : l.diff > 0 ? "+" + q(l.diff, l.sku) : "✓") + '</td><td class="n">' + (l.diff ? R(l.value) : "") + "</td></tr>";
+    }).join("") + "</tbody></table></div>";
+}
+// One pending count with its Approve / Reject buttons. A User's buttons open the manager pop-up; a manager's act directly.
+function pendingCountCard(c) {
+  var me = cfg.user && cfg.user.username, lines = countLinesOf(c), diffs = lines.filter(function (l) { return l.diff; }).length;
+  var own = canManage() && c.by === me, open = S.f.rejecting === c.id;
+  return '<section class="panel"><div class="spread"><div><h3>' + (c.place === "WH" ? "Store shelves" : esc(vanName(c.place))) + '</h3><div class="tiny muted">Counted by <b>' + esc(c.by) + "</b> · " + esc(dtime(c.ts)) +
+    " · " + lines.length + (lines.length === 1 ? " line, " : " lines, ") + diffs + " different</div></div>" + '<span class="pill ' + (n(c.value) < 0 ? "p-bad" : "p-closed") + '">' + R(c.value) + "</span></div>" +
+    (c.note ? '<div class="small">Note: ' + esc(c.note) + "</div>" : "") + countLinesTable(c) +
+    '<p class="tiny muted">Approving books the differences shown, as they were when counted. Stock that moved since then is not affected.</p>' +
+    (own ? '<div class="msg info">This is your own count. Another Warehouse Manager or the Senior Admin must approve it.</div>' :
+      open ? '<label class="f">Why reject it? (required)<input id="rej_' + esc(c.id) + '" data-bind="rejNote" value="' + esc(S.f.rejNote || "") + '" placeholder="e.g. Drum 2 missed, please recount"></label>' +
+        '<div class="row"><button class="btn" data-action="rejectCount" data-id="' + esc(c.id) + '">Reject count</button><button class="btn ghost" data-action="rejCancel">Cancel</button></div>' :
+      '<div class="row"><button class="btn" data-action="approveCount" data-id="' + esc(c.id) + '"' + (S.busy ? " disabled" : "") + ">Approve</button>" +
+        '<button class="btn ghost" data-action="rejStart" data-id="' + esc(c.id) + '">Reject</button></div>') + "</section>";
+}
 function vApprove() {
   var list = (D.Counts || []).slice().sort(function (a, b) { return String(b.ts).localeCompare(String(a.ts)); });
   var pend = list.filter(function (c) { return c.status === "pending"; });
   var done = list.filter(function (c) { return c.status !== "pending"; }).slice(0, 10);
-  function linesTable(c) {
-    var lines = countLinesOf(c);
-    return '<div class="tablewrap"><table><thead><tr><th>Item</th><th class="n">System</th><th class="n">Counted</th><th class="n">Diff</th><th class="n">Value</th></tr></thead><tbody>' +
-      lines.map(function (l) {
-        return "<tr><td>" + esc(nameOf(l.sku)) + '</td><td class="n">' + q(l.system, l.sku) + '</td><td class="n">' + q(l.counted, l.sku) + '</td><td class="n">' +
-          (l.diff < 0 ? '<span class="pill p-bad">' + q(l.diff, l.sku) + "</span>" : l.diff > 0 ? "+" + q(l.diff, l.sku) : "✓") + '</td><td class="n">' + (l.diff ? R(l.value) : "") + "</td></tr>";
-      }).join("") + "</tbody></table></div>";
-  }
-  var me = cfg.user && cfg.user.username;
-  var html = pend.length ? pend.map(function (c) {
-    var lines = countLinesOf(c), diffs = lines.filter(function (l) { return l.diff; }).length;
-    var own = c.by === me, open = S.f.rejecting === c.id;
-    return '<section class="panel"><div class="spread"><div><h3>' + (c.place === "WH" ? "Store shelves" : esc(vanName(c.place))) + '</h3><div class="tiny muted">Counted by <b>' + esc(c.by) + "</b> · " + esc(dtime(c.ts)) +
-      " · " + lines.length + (lines.length === 1 ? " line, " : " lines, ") + diffs + " different</div></div>" + '<span class="pill ' + (n(c.value) < 0 ? "p-bad" : "p-closed") + '">' + R(c.value) + "</span></div>" +
-      (c.note ? '<div class="small">Note: ' + esc(c.note) + "</div>" : "") + linesTable(c) +
-      '<p class="tiny muted">Approving books the differences shown, as they were when counted. Stock that moved since then is not affected.</p>' +
-      (own ? '<div class="msg info">This is your own count. Another Warehouse Manager or the Senior Admin must approve it.</div>' :
-        open ? '<label class="f">Why reject it? (required)<input id="rej_' + esc(c.id) + '" data-bind="rejNote" value="' + esc(S.f.rejNote || "") + '" placeholder="e.g. Drum 2 missed, please recount"></label>' +
-          '<div class="row"><button class="btn" data-action="rejectCount" data-id="' + esc(c.id) + '">Reject count</button><button class="btn ghost" data-action="rejCancel">Cancel</button></div>' :
-        '<div class="row"><button class="btn" data-action="approveCount" data-id="' + esc(c.id) + '"' + (S.busy ? " disabled" : "") + ">Approve</button>" +
-          '<button class="btn ghost" data-action="rejStart" data-id="' + esc(c.id) + '">Reject</button></div>') + "</section>";
-  }).join("") : '<section class="panel"><p class="muted">No counts waiting. When a User counts the store shelves, it appears here for approval.</p></section>';
+  var html = pend.length ? pend.map(pendingCountCard).join("") : '<section class="panel"><p class="muted">No counts waiting. When a User counts the store shelves, it appears here for approval.</p></section>';
   if (done.length) html += '<section class="panel"><h3>Recent decisions</h3>' + done.map(function (c) {
     return '<div class="hist"><div class="spread"><div><b>' + (c.place === "WH" ? "Store shelves" : esc(vanName(c.place))) + '</b><div class="tiny muted">Counted by ' + esc(c.by) + " · " + esc(dshort(c.ts)) +
       " · " + (c.status === "approved" ? "approved" : "rejected") + " by " + esc(c.decidedBy || "") + "</div></div>" +
@@ -1055,6 +1155,13 @@ function vApprove() {
       (c.status === "rejected" && c.decisionNote ? '<div class="tiny">Reason: ' + esc(c.decisionNote) + "</div>" : "") + "</div>";
   }).join("") + "</section>";
   return html;
+}
+// Counts tab for a User: the counts waiting for a manager, who can approve right here by typing their own username and PIN.
+function vWaiting() {
+  if (role() !== "storeman") return "";
+  var pend = (D.Counts || []).filter(function (c) { return c.status === "pending"; }).sort(function (a, b) { return String(b.ts).localeCompare(String(a.ts)); });
+  return '<h3>Waiting for approval</h3><p class="small muted">A Warehouse Manager or Senior Admin approves or rejects a count here by typing their own username and PIN. The Sheet checks it.</p>' +
+    (pend.length ? pend.map(pendingCountCard).join("") : '<section class="panel"><p class="muted small">No counts are waiting for approval.</p></section>');
 }
 
 var ADJ_REASONS = ["Damaged / written off", "Found", "Count correction", "Supplier short-delivered", "Other"];
@@ -1232,7 +1339,7 @@ function vCorrections() {
   return backMore() + "<h2>Corrections log</h2><p class=\"small muted\">Every movement that was reversed, by whom and why. Corrections are only possible for admins, from an item's history in Stock.</p>" +
     '<section class="panel">' + (list.length ? list.map(function (m) {
       return '<div class="hist"><div class="spread"><div><b>' + esc(nameOf(m.sku)) + '</b><div class="tiny muted">Undid: ' + esc(MOVE_LABEL[m.reverses] || m.reverses) + (m.job ? " · job " + esc(m.job) : "") + "</div></div>" +
-        '<div class="right"><span class="mono">' + q(m.qty, m.sku) + '</span><span class="tiny muted">' + esc(dtime(m.ts)) + " · " + esc(m.by || "") + "</span></div></div>" +
+        '<div class="right"><span class="mono">' + q(m.qty, m.sku) + '</span><span class="tiny muted">' + esc(dtime(m.ts)) + " · " + esc(m.by || "") + (m.approvedBy ? " · approved by " + esc(m.approvedBy) : "") + "</span></div></div>" +
         '<div class="small">Reason: ' + esc(m.reason || "—") + "</div></div>";
     }).join("") : '<p class="muted">No corrections yet.</p>') + "</section>";
 }
@@ -1422,7 +1529,12 @@ var A = {
     var r = mv("reverse", m.sku, n(m.qty), m.to, m.from, { reverses: m.type, ref: m.id, job: m.job || "", van: m.van || "", installer: m.installer || "",
       serial: m.serial || "", reason: S.f.revReason.trim() });
     r.value = n(m.value);
-    save([{ op: "append", sheet: "Moves", rows: [r] }], "Correction recorded.", function () { S.f = {}; });
+    var ops = [{ op: "append", sheet: "Moves", rows: [r] }];
+    if (!canManage()) {   // a User: the correction only happens with a manager's own username and PIN, checked by the Sheet
+      return askManager({ summary: "Correction: undo " + (MOVE_LABEL[m.type] || m.type) + " of " + q(m.qty, m.sku) + " " + nameOf(m.sku) + ". Reason: " + r.reason, ops: ops,
+        msg: function (who) { return "Approved by " + who + ". Correction recorded."; }, after: function () { S.f = {}; } });
+    }
+    save(ops, "Correction recorded.", function () { S.f = {}; });
   },
   outBack: function () { stopCam(); S.sub = null; S.msg = null; S.f = {}; render(); window.scrollTo(0, 0); },
   outCam: function () { startCam("Scan each item that is leaving the store"); },
@@ -1684,20 +1796,33 @@ var A = {
   approveCount: function (b) {
     var c = (D.Counts || []).find(function (x) { return x.id === b.dataset.id; });
     if (!c || c.status !== "pending") return flash("err", "This count has already been decided.");
-    if (c.by === cfg.user.username) return flash("err", "You can't approve your own count.");
+    if (!canWork()) return flash("err", "Your login can view only.");
+    if (canManage() && c.by === cfg.user.username) return flash("err", "You can't approve your own count.");
     var moves = C.linesToMoves(c.place, countLinesOf(c), X.items, now(), "Count by " + c.by + ", approved", c.id);
     moves.forEach(function (m) { m.id = uid(); m.by = cfg.user.username; });
     var ops = [];
     if (moves.length) ops.push({ op: "append", sheet: "Moves", rows: moves });
     ops.push({ op: "upsert", sheet: "Counts", rows: [{ id: c.id, status: "approved", decidedAt: now() }], expect: { field: "status", values: ["pending"] } });
+    if (!canManage()) {
+      return askManager({ summary: "Approve the " + (c.place === "WH" ? "store shelves" : vanName(c.place)) + " count by " + c.by + ": " + moves.length + " adjustment(s), " + R(c.value) + ".", ops: ops,
+        msg: function (who) { return "Count approved by " + who + ". " + (moves.length ? moves.length + " adjustment(s) booked (" + R(c.value) + ")." : "Nothing to adjust."); },
+        after: function () { S.f.rejecting = null; } });
+    }
     save(ops, "Count approved. " + (moves.length ? moves.length + " adjustment(s) booked (" + R(c.value) + ")." : "Nothing to adjust."), function () { S.f.invTab = "approve"; });
   },
   rejStart: function (b) { S.f.rejecting = b.dataset.id; S.f.rejNote = ""; render(); },
   rejCancel: function () { S.f.rejecting = null; render(); },
   rejectCount: function (b) {
     if (!String(S.f.rejNote || "").trim()) return flash("err", "Give a reason, so the counter knows what to fix.");
-    save([{ op: "upsert", sheet: "Counts", rows: [{ id: b.dataset.id, status: "rejected", decidedAt: now(), decisionNote: S.f.rejNote.trim() }], expect: { field: "status", values: ["pending"] } }],
-      "Count rejected. Stock not changed.", function () { S.f.rejecting = null; S.f.invTab = "approve"; });
+    if (!canWork()) return flash("err", "Your login can view only.");
+    var rc = (D.Counts || []).find(function (x) { return x.id === b.dataset.id; });
+    if (!rc || rc.status !== "pending") return flash("err", "This count has already been decided.");
+    var rops = [{ op: "upsert", sheet: "Counts", rows: [{ id: b.dataset.id, status: "rejected", decidedAt: now(), decisionNote: S.f.rejNote.trim() }], expect: { field: "status", values: ["pending"] } }];
+    if (!canManage()) {
+      return askManager({ summary: "Reject the " + (rc.place === "WH" ? "store shelves" : vanName(rc.place)) + " count by " + rc.by + ". Reason: " + S.f.rejNote.trim(), ops: rops,
+        msg: function (who) { return "Count rejected by " + who + ". Stock not changed."; }, after: function () { S.f.rejecting = null; } });
+    }
+    save(rops, "Count rejected. Stock not changed.", function () { S.f.rejecting = null; S.f.invTab = "approve"; });
   },
   adjDir: function (b) { S.f.adj.dir = b.dataset.d; render(); },
   saveAdjust: function () {
@@ -1849,6 +1974,63 @@ function printSheet(title, cells, cols) {
   setTimeout(function () { try { w.focus(); w.print(); } catch (e) {} }, 400);
 }
 
+/* ===================== manager pop-up (override) ===================== */
+/*
+ * A User can ask for a correction or a count decision, but only a Warehouse Manager or Senior Admin can approve it,
+ * by typing THEIR OWN username and PIN here. The phone never decides: the Sheet checks them and refuses otherwise.
+ * The PIN lives only in this pop-up's field until the moment it is sent. It is never saved on the phone, never queued,
+ * never put in S or cfg, and the field and the request object are wiped as soon as the answer comes back (or on cancel).
+ * The request goes straight to the Sheet and is NOT queued, so with no signal nothing is saved.
+ */
+var OV = null;   // the open pop-up: { summary, ops, batch, msg, after, busy }. Holds no username or PIN.
+var NEEDS_SIGNAL = "Needs signal: the Sheet has to check the manager's PIN.";
+function ovInert(on) { [".wrap", "nav.tabs"].forEach(function (sel) { var el = document.querySelector(sel); if (el) el.inert = on; }); }
+function ovMsg(t) { var e = $("#ovErr"); if (e) { e.textContent = t || ""; e.hidden = !t; } }
+function askManager(o) {
+  if (!canWork() || canManage()) return;
+  OV = { summary: o.summary, ops: o.ops, batch: uid(), msg: o.msg, after: o.after, busy: false };
+  $("#ovSummary").textContent = o.summary;
+  $("#ov_user").value = ""; $("#ov_pin").value = ""; ovMsg("");
+  $("#ovOk").disabled = $("#ovCancel").disabled = false;
+  $("#ovModal").hidden = false; ovInert(true);
+  $("#ov_user").focus();
+}
+function ovClose() {
+  var m = $("#ovModal"); if (!m) return;
+  $("#ov_pin").value = ""; $("#ov_user").value = "";
+  m.hidden = true; ovInert(false); OV = null;
+}
+function ovSubmit() {
+  var o = OV; if (!o || o.busy) return;
+  var typed = $("#ov_user").value.trim(), cred = { username: typed, pin: $("#ov_pin").value };
+  $("#ov_pin").value = "";                                  // the field never keeps the PIN, even if something goes wrong
+  if (!typed || !String(cred.pin).replace(/\s+/g, "")) { cred.pin = ""; return ovMsg("Type the manager's own username and PIN."); }
+  if (cfg.mode === "live" && !navigator.onLine) { cred.pin = ""; return ovMsg(NEEDS_SIGNAL); }
+  o.busy = true; $("#ovOk").disabled = $("#ovCancel").disabled = true; ovMsg("");
+  flushAll().then(function (ok) {
+    if (!ok) { var e = new Error("Other changes on this phone haven't reached the Sheet yet. Wait for them to sync (check the signal), then try again."); e.local = true; throw e; }
+    return api.override(o.ops, o.batch, cred);
+  }).then(function (res) {
+    cred.pin = "";
+    if (res.user) { cfg.user = res.user; saveCfg(); }
+    var who = (res.approver && res.approver.name) || typed, merged = applyServer(res);
+    ovClose();
+    S.msg = { k: "ok", t: o.msg(who) };
+    if (o.after) o.after();
+    return merged ? null : fullReload();
+  }).catch(function (e) {
+    cred.pin = "";
+    if (e.signIn) return;                                    // signed out: signedOut() already closed the pop-up
+    ovMsg(e.net ? NEEDS_SIGNAL : e.message);
+    var u = $("#ov_user"); if (u && OV === o) { $("#ov_pin").value = ""; $("#ov_pin").focus(); }
+  }).then(function () {
+    cred.pin = ""; cred.username = "";
+    o.busy = false;
+    if (OV === o) $("#ovOk").disabled = $("#ovCancel").disabled = false;
+    syncStatus(); render();
+  });
+}
+
 /* ===================== scanning ===================== */
 var cam = null, lastCode = "", lastAt = 0;
 function startCam(title) {
@@ -1936,6 +2118,8 @@ document.addEventListener("click", function (e) {
   }
   if (b.id === "homeNo") { $("#homeConfirm").hidden = true; return; }
   if (b.id === "homeYes") { $("#homeConfirm").hidden = true; S.f.confirmLogout = true; A.logout(); window.scrollTo(0, 0); return; }
+  if (b.id === "ovOk") { ovSubmit(); return; }
+  if (b.id === "ovCancel") { if (OV && !OV.busy) ovClose(); return; }
   if (b.id === "camStop") { if (S.scanFor) A.doneSerials(); else stopCam(); return; }
   if (b.dataset.tab) {
     if (b.dataset.tab === "scan") { S.scanFor = null; go("scan"); startCam(); return; }
@@ -1974,8 +2158,11 @@ document.addEventListener("change", function (e) {
   if (t.dataset && t.dataset.rerender && t.tagName !== "SELECT" && t.type !== "checkbox") render();
 });
 document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape" && OV) { e.preventDefault(); if (!OV.busy) ovClose(); return; }
   if (e.key !== "Enter" || e.isComposing) return;
   var id = e.target.id || "";
+  if (id === "ov_user") { e.preventDefault(); if ($("#ov_pin").value) ovSubmit(); else $("#ov_pin").focus(); return; }
+  if (id === "ov_pin") { e.preventDefault(); ovSubmit(); return; }
   // Sign-in: Enter on the username moves to the PIN; Enter on the PIN signs in
   if (id === "lg_url") { e.preventDefault(); var u = $("#lg_user"); if (u) u.focus(); return; }
   if (id === "lg_user") { e.preventDefault(); if (!String((S.f.lg || {}).pin || "")) { var pn = $("#lg_pin"); if (pn) pn.focus(); } else A.login(); return; }

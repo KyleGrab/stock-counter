@@ -4,7 +4,7 @@
  * only used when there's no signal. Fonts: saved copy first (they never change). The scanner libraries live in vendor/.
  * Requests to the Google Sheet are never cached.
  */
-var CACHE = "stock-counter-v11";
+var CACHE = "stock-counter-v12";
 var SHELL = [
   "./", "index.html", "app.js", "core.js", "manifest.json", "icon.svg",
   "vendor/html5-qrcode.min.js", "vendor/qrcode-generator.js"
