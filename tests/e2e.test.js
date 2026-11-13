@@ -287,7 +287,7 @@ const server = http.createServer((req, res) => {
   assert.ok((await page.locator("#ovSummary").innerText()).includes("Stock out"), "pop-up says what is being approved");
   assert.strictEqual(await page.getAttribute("#ov_pin", "type"), "password");
   assert.strictEqual(await page.getAttribute("#ov_pin", "inputmode"), "numeric");
-  assert.strictEqual(await page.getAttribute("#ov_pin", "autocomplete"), "off");
+  assert.strictEqual(await page.getAttribute("#ov_pin", "autocomplete"), "new-password");
   assert.strictEqual(await page.evaluate(() => D.Moves.filter(m => m.type === "reverse" && m.by === "sipho").length), 0, "nothing saved before approval");
   // Escape closes and clears; Cancel too
   await page.fill("#ov_user", "lebo"); await page.fill("#ov_pin", "580214");
@@ -398,10 +398,31 @@ const server = http.createServer((req, res) => {
   let [logDl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Download CSV" }).click()]);
   assert.strictEqual(logDl.suggestedFilename(), "stock-log-" + todaySA + ".csv");
   let logCsv = fs.readFileSync(await logDl.path(), "utf8");
-  assert.ok(logCsv.startsWith("﻿date,time,by,approved_by,task,item_code,item_name,qty,unit,from,to,job,reference,reason,unit_cost,value\r\n"), "manager CSV has value columns");
+  assert.ok(logCsv.startsWith("﻿date,time,by,approved_by,task,item_code,item_name,qty,unit,from,to,collected_by,job,reference,reason,unit_cost,value\r\n"), "manager CSV has value columns (collected_by right after to)");
   assert.ok(logCsv.includes('"\'=INV-9, ""x"""'), "formula guard and RFC 4180 quoting");
   assert.ok(logCsv.includes('"Line one\nline two"'), "newline quoted");
   assert.ok(/,Stock out,/.test(logCsv) && /,Correction,/.test(logCsv) && /,Received,/.test(logCsv));
+  // F9: collected_by is its own column (from the move's installer) and is no longer folded into reason
+  {
+    const rows = logCsv.replace(/^\uFEFF/, "").trim().split("\r\n").map(r => r.split(","));
+    const h = rows[0], iTo = h.indexOf("to"), iCol = h.indexOf("collected_by"), iReason = h.indexOf("reason");
+    assert.strictEqual(iCol, iTo + 1, "collected_by is right after to");
+    const so = rows.find(r => r[h.indexOf("task")] === "Stock out");
+    assert.strictEqual(so[iCol], "Test Driver", "collected_by comes from the installer field");
+    assert.ok(!/Collected by/.test(so[iReason]), "no longer folded into reason");
+    assert.ok(!/Test Driver/.test(logCsv.split("\r\n").filter(r => /,Received,/.test(r)).join()), "other tasks don't get it");
+  }
+  // F10: "moved out of the store" counts only out / kit / extra / topup from the store (not receipts reversed, corrections, adjustments)
+  {
+    const r = await page.evaluate(() => {
+      const tasks = logTasks(); let want = 0, naive = 0;
+      tasks.forEach(t => (t.moves || []).forEach(m => { if (m.from === "WH") { naive += n(m.value); if (/^(out|kit|extra|topup)$/.test(m.type)) want += n(m.value); } }));
+      return { shown: logValueOut(tasks), want: C.round2(want), naive: C.round2(naive) };
+    });
+    assert.strictEqual(r.shown, r.want, "total = stock out / kit / extra / top-up only");
+    assert.ok(r.want > 0, "something moved out");
+    assert.ok(await page.evaluate(() => LOG_TYPES.some(t => t[0] === "counts" && t[1] === "Counts & adjustments") && C.taskKind(["adjust"]) === "counts"), "adjustments file under Counts & adjustments");
+  }
   // Previous / Next day
   await page.getByRole("button", { name: /Previous day/ }).click();
   assert.strictEqual(await page.inputValue("#log_day"), await page.evaluate(d => C.addDays(d, -1), todaySA));
@@ -428,14 +449,14 @@ const server = http.createServer((req, res) => {
   await openLog();
   t = await lt();
   assert.ok(t.includes("by sipho"), "User sees own tasks");
-  assert.deepStrictEqual(await page.evaluate(() => [...new Set(logTasks().map(x => x.by))]), ["sipho"], "User sees only own tasks");
-  assert.ok(!/(^|\n)\d\d:\d\d · [^\n]*\nby (lebo|admin)/.test(t), "no one else's task headings");
+  assert.deepStrictEqual(await page.evaluate(() => logTasks().filter(x => x.by !== "sipho" && !(x.count && x.count.by === "sipho")).length), 0, "User sees only own tasks (and decisions on counts they submitted)");
+  assert.deepStrictEqual(await page.evaluate(() => [...new Set(logTasks().filter(x => x.by !== "sipho").map(x => x.label.replace(/ by .*/, "")))].filter(l => !/^Count (approved|rejected)$/.test(l))), [], "the only other people's entries are decisions on his own counts");
   assert.ok(!/R\s?\d/.test(await text()) && !(await text()).includes("moved out of the store"), "no rand values for a User");
   assert.strictEqual(await page.locator("#log_who").count(), 0, "no person filter for a User");
   [logDl] = await Promise.all([page.waitForEvent("download"), page.getByRole("button", { name: "Download CSV" }).click()]);
   logCsv = fs.readFileSync(await logDl.path(), "utf8");
-  assert.ok(logCsv.startsWith("﻿date,time,by,approved_by,task,item_code,item_name,qty,unit,from,to,job,reference,reason\r\n"), "User CSV has no value columns");
-  assert.deepStrictEqual(logCsv.trim().split("\r\n").slice(1).filter(r => !/^[^,]*,[^,]*,sipho,/.test(r)), [], "every CSV row is the User's own");
+  assert.ok(logCsv.startsWith("﻿date,time,by,approved_by,task,item_code,item_name,qty,unit,from,to,collected_by,job,reference,reason\r\n"), "User CSV has no value columns");
+  assert.deepStrictEqual(logCsv.trim().split("\r\n").slice(1).filter(r => !/^[^,]*,[^,]*,sipho,/.test(r) && !/,Count (approved|rejected) by /.test(r)), [], "every CSV row is the User's own (or a decision on his own count)");
   // a User reverses from the log through the manager pop-up (the same path as item history)
   await page.getByRole("button", { name: "Reverse this" }).first().click();
   await page.fill("#rev_reason", "Wrong load");
@@ -452,6 +473,30 @@ const server = http.createServer((req, res) => {
   assert.strictEqual(await page.getByRole("button", { name: "Reverse this" }).count(), 0, "viewer can't reverse");
   assert.ok(!/R\s?\d/.test(await text()), "no rand values for a Viewer");
   assert.strictEqual(await page.locator("#log_who").count(), 1, "viewer has the person filter");
+  // --- F7: the demo backend enforces the same server rules as Code.gs (forged decision fields, padded approvals, same-save and closed-job corrections, copied facts) ---
+  await signInAs("sipho", "1357");
+  const demoTry = (body) => page.evaluate(async (b) => { try { const r = await api.call("sync", Object.assign({ have: 0 }, b)); return { ok: true, data: r.data }; } catch (e) { return { ok: false, error: e.message }; } }, body);
+  const LEBO_OV = { username: "lebo", pin: "580214" };
+  let dr = await demoTry({ ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "CF1", place: "WH", ts: "2026-11-12T09:00:00.000Z", status: "pending", lines: "[]", value: 0, decidedBy: "lebo", decidedAt: "2026-11-12T09:00:00.000Z", decisionNote: "ok" }] }], batch: "f7a" });
+  assert.ok(dr.ok, dr.error);
+  assert.deepStrictEqual(dr.data.Counts.filter(c => c.id === "CF1").map(c => [c.by, c.decidedBy, c.decidedAt, c.decisionNote]), [["sipho", "", "", ""]], "forged decision fields on a new count are blanked");
+  const rm = await page.evaluate(() => { const ms = D.Moves.filter(m => m.type === "receive" && C.bal(X.B, "WH", m.sku) >= Number(m.qty) + 1 && !D.Moves.some(x => x.type === "reverse" && x.ref === m.id)); return ms.slice(-2).map(m => ({ id: m.id, sku: m.sku, qty: m.qty, from: m.to, to: m.from, reverses: "receive", ref: m.id })); });
+  const rev = (r, id, o) => Object.assign({}, r, { id, ts: "2001-01-01T00:00:00.000Z", type: "reverse", reason: "test" }, o || {});
+  dr = await demoTry({ ops: [{ op: "append", sheet: "Moves", rows: [rev(rm[0], "f7r1"), rev(rm[1], "f7r2")] }], override: LEBO_OV, batch: "f7b" });
+  assert.ok(!dr.ok && /One manager approval covers one correction or one count decision/.test(dr.error), "padded override batch refused: " + dr.error);
+  dr = await demoTry({ ops: [{ op: "append", sheet: "Moves", rows: [rev(rm[0], "f7r1", { reason: "  " })] }], override: LEBO_OV, batch: "f7c" });
+  assert.ok(!dr.ok && /reason/.test(dr.error), "blank reason refused on the server: " + dr.error);
+  dr = await demoTry({ ops: [{ op: "append", sheet: "Moves", rows: [{ id: "f7n", ts: "2026-11-12T09:00:00.000Z", type: "receive", sku: rm[0].sku, qty: 1, from: "SUPPLIER", to: "WH" }, rev({ sku: rm[0].sku, qty: 1, from: "WH", to: "SUPPLIER", reverses: "receive", ref: "f7n" }, "f7r3")] }], batch: "f7d" });
+  assert.ok(!dr.ok, "a user's own (non-override) correction is refused");
+  await signInAs("lebo", "580214");
+  dr = await demoTry({ ops: [{ op: "append", sheet: "Moves", rows: [{ id: "f7n", ts: "2026-11-12T09:00:00.000Z", type: "receive", sku: rm[0].sku, qty: 1, from: "SUPPLIER", to: "WH" }, rev({ sku: rm[0].sku, qty: 1, from: "WH", to: "SUPPLIER", reverses: "receive", ref: "f7n" }, "f7r3")] }], batch: "f7e" });
+  assert.ok(!dr.ok && /saved earlier/.test(dr.error), "same-save correction refused for a manager too: " + dr.error);
+  const t1 = Date.now();
+  dr = await demoTry({ ops: [{ op: "append", sheet: "Moves", rows: [rev(rm[0], "f7r4", { value: 999999, unitCost: 0.01, job: "J-1234", van: "VAN-9", installer: "evil", serial: "XX" })] }], batch: "f7f" });
+  assert.ok(dr.ok, dr.error);
+  const f7 = dr.data.Moves.find(m => m.id === "f7r4");
+  assert.ok(String(f7.job || "") === "" && Number(f7.value || 0) !== 999999 && (f7.installer || "") === "" && (f7.serial || "") === "", "forged facts replaced by the original's");
+  assert.ok(Date.parse(f7.ts) >= t1 - 1000, "server time, not the phone's");
   // --- inventory: User submits a count, Warehouse Manager approves ---
   await signInAs("sipho", "1357");
   await page.locator("nav button[data-tab=counts]").click();
@@ -476,6 +521,16 @@ const server = http.createServer((req, res) => {
   await page.waitForSelector("text=Count approved");
   assert.strictEqual(await page.evaluate(() => C.bal(X.B, "WH", "PV6-BLK")), 300, "approved count sets store stock");
   assert.notStrictEqual(blackBefore, 300);
+  // F8: the User who submitted the count sees its decision in their daily log, with the manager's name and the decision
+  await signInAs("sipho", "1357");
+  await openLog();
+  t = await lt();
+  assert.ok(/Count approved by lebo/.test(t), "User sees 'Count approved by <manager>' on a count they submitted");
+  assert.ok((await page.evaluate(() => logTasks().filter(x => x.label === "Count approved by lebo").every(x => x.count.by === "sipho"))), "only their own counts");
+  await signInAs("lebo", "580214");
+  await page.locator("nav button[data-tab=more]").click();
+  await page.getByRole("button", { name: /Inventory/ }).click();
+  await page.getByRole("tab", { name: "Adjust" }).waitFor();
   // manager's own count can't be self-approved (submit as manager goes direct, so test via a User count rejected)
   // adjust: write off 6 m damaged
   await page.getByRole("tab", { name: "Adjust" }).click();

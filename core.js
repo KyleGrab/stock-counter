@@ -388,7 +388,7 @@
   }
   // Which filter a move type belongs to: in, out, jobs, counts, fixes.
   var TASK_KIND = { receive: "in", out: "out", kit: "jobs", extra: "jobs", "return": "jobs", scrap: "jobs", used: "jobs", missing: "jobs", topup: "jobs",
-    kituse: "counts", countshort: "counts", countover: "counts", reverse: "fixes", adjust: "fixes" };
+    kituse: "counts", countshort: "counts", countover: "counts", reverse: "fixes", adjust: "counts" };
   function taskKind(types) { return (types && types.length && TASK_KIND[types[0]]) || "jobs"; }
   // CSV (RFC 4180): quote cells with commas, quotes or line breaks. Text that starts with = + - @ (or a tab/return) would run as a formula
   // in Excel, so it gets a leading apostrophe. Real numbers are written as they are.

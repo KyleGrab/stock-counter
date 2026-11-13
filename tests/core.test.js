@@ -187,6 +187,7 @@ console.log("core v1.3: all tests passed");
   assert.strictEqual(C.taskLabel(["kit"]), "Kitted to job");
   assert.strictEqual(C.taskKind(["receive"]), "in");
   assert.strictEqual(C.taskKind(["reverse"]), "fixes");
+  assert.strictEqual(C.taskKind(["adjust"]), "counts", "adjustments file under Counts & adjustments");
   // CSV
   assert.strictEqual(C.csvCell("plain"), "plain");
   assert.strictEqual(C.csvCell("a,b"), '"a,b"');

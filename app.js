@@ -133,6 +133,7 @@ function demoErr(msg, signIn) { var e = new Error(msg); e.signIn = !!signIn; ret
  */
 var DEMO_REVERSIBLE = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1, adjust: 1, out: 1 };
 var OV_SCOPE_MSG = "Manager approval is only for corrections and count decisions.";
+var OV_ONE_MSG = "One manager approval covers one correction or one count decision.";
 var OV_WHO_MSG = "Manager approval must come from a Warehouse Manager or Senior Admin other than you.";
 var demoFails = {};
 function demoFailGet(k) { var f = demoFails[k]; if (f && f.until < Date.now()) { delete demoFails[k]; f = null; } return f ? f.n : 0; }
@@ -156,30 +157,46 @@ function demoVerifyOverride(o, me, users) {
   if (me.role === "viewer") throw demoErr("Your login can view only.");
   return a;
 }
-function demoOverrideScope(ops) {
-  var decided = {}, any = false, bad = function () { return demoErr(OV_SCOPE_MSG); };
+function demoOverrideScope(ops) {   // one manager approval = one action (same rules as Code.gs overrideScope_)
+  var bad = function () { return demoErr(OV_SCOPE_MSG); }, counts = [], reversals = [], countMoves = [];
   ops.forEach(function (op) {
-    if (op && op.op === "upsert" && op.sheet === "Counts") {
-      if (!Array.isArray(op.rows) || !op.rows.length) throw bad();
+    if (!op || typeof op !== "object" || !Array.isArray(op.rows) || !op.rows.length) throw bad();
+    if (op.op === "upsert" && op.sheet === "Counts") {
       op.rows.forEach(function (r) {
-        var id = r && String(r.id || "");
-        if (!id || decided[id] || (r.status !== "approved" && r.status !== "rejected")) throw bad();
+        if (!r || typeof r !== "object" || !String(r.id || "") || (r.status !== "approved" && r.status !== "rejected")) throw bad();
         Object.keys(r).forEach(function (k) { if (!/^(id|status|decidedAt|decisionNote)$/.test(k)) throw bad(); });
-        decided[id] = r.status; any = true;
+        counts.push(r);
       });
-    }
+    } else if (op.op === "append" && op.sheet === "Moves") {
+      op.rows.forEach(function (r) {
+        if (!r || typeof r !== "object") throw bad();
+        if (r.type === "reverse") reversals.push(r);
+        else if (/^(countshort|countover|kituse)$/.test(r.type)) countMoves.push(r);
+        else throw bad();
+      });
+    } else throw bad();
   });
-  ops.forEach(function (op) {
-    if (op && op.op === "upsert" && op.sheet === "Counts") return;
-    if (!op || op.op !== "append" || op.sheet !== "Moves" || !Array.isArray(op.rows) || !op.rows.length) throw bad();
-    op.rows.forEach(function (r) {
-      if (!r || typeof r !== "object") throw bad();
-      if (r.type === "reverse") { any = true; return; }
-      if (/^(countshort|countover|kituse)$/.test(r.type) && decided[String(r.ref || "")] === "approved") return;
-      throw bad();
-    });
-  });
-  if (!any) throw bad();
+  if (!counts.length && !reversals.length) throw bad();
+  if (counts.length + reversals.length > 1) throw demoErr(OV_ONE_MSG);
+  if (reversals.length) { if (countMoves.length) throw demoErr(OV_ONE_MSG); return; }
+  if (countMoves.length && counts[0].status !== "approved") throw bad();
+  countMoves.forEach(function (r) { if (String(r.ref || "") !== String(counts[0].id)) throw bad(); });
+}
+// A correction (any role) must undo one real, earlier, reversible movement, with a reason, on a job that still allows it; then it copies the original's facts (same as Code.gs checkReversal_).
+function demoCheckReversal(m, moves, batchIds, jobs, viaOverride) {
+  var refuse = function () { return demoErr(viaOverride ? OV_SCOPE_MSG : "That movement can't be corrected."); };
+  var ref = String(m.ref || "");
+  if (batchIds[ref]) throw demoErr("A correction can only undo a movement that was saved earlier, not one in the same save.");
+  var orig = moves.find(function (x) { return x.id === ref; });
+  if (!orig || !DEMO_REVERSIBLE.hasOwnProperty(orig.type) || m.reverses !== orig.type || String(m.sku) !== String(orig.sku) || Math.abs(Number(m.qty) - Number(orig.qty)) > 0.005 || m.from !== orig.to || m.to !== orig.from) throw refuse();
+  if (moves.some(function (x) { return x.id !== m.id && x.type === "reverse" && String(x.ref) === String(orig.id); })) throw demoErr("That movement has already been corrected. Refresh.");
+  if (!String(m.reason || "").trim()) throw demoErr("Give a reason for the correction.");
+  if (orig.job) {
+    var j = jobs.find(function (x) { return x.no === orig.job; });
+    if (!j || !(j.status === "out" || (orig.type === "out" && j.status === "kitted"))) throw demoErr("This job is closed; its movements can't be corrected.");
+  }
+  m.job = orig.job || ""; m.van = orig.van || ""; m.installer = orig.installer || ""; m.serial = orig.serial || "";
+  m.unitCost = orig.unitCost === undefined ? "" : orig.unitCost; m.value = orig.value === undefined ? "" : orig.value; m.qty = orig.qty; m.ts = now();
 }
 function demoExpectedCountMoves(c) {
   var lines; try { lines = JSON.parse(c.lines || "[]"); } catch (e) { lines = []; }
@@ -280,7 +297,7 @@ var demo = {
         approver = body.override != null ? demoVerifyOverride(body.override, me, users) : null;
         if (approver) demoOverrideScope(body.ops);
         var actor = approver || me;
-        var work = JSON.parse(JSON.stringify(d)), newMoves = [], countSeen = {}, decidedCounts = {};
+        var work = JSON.parse(JSON.stringify(d)), newMoves = [], countSeen = Object.create(null), decidedCounts = Object.create(null), batchIds = null;
         var counts0 = JSON.parse(JSON.stringify(work.Counts));
         body.ops.forEach(function (raw) {
           var op = JSON.parse(JSON.stringify(raw), function (k, v) {
@@ -306,11 +323,14 @@ var demo = {
                 if (!cur) throw demoErr(OV_SCOPE_MSG);
                 if (cur.status !== "pending") throw demoErr("This count has already been decided. Refresh.");
               }
-              if (!cur) r.by = me.username;
-              if (cur && r.status && r.status !== cur.status) {
-                if (cur.by === actor.username) throw demoErr("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
-                r.decidedBy = actor.username;
-                if (approver && r.status === "approved") decidedCounts[r.id] = true;
+              if (!cur) { r.by = me.username; r.decidedBy = ""; r.decidedAt = ""; r.decisionNote = ""; }   // new count: nobody has decided it
+              else {
+                delete r.by;
+                if (r.status && r.status !== cur.status) {
+                  if (cur.by === actor.username) throw demoErr("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
+                  r.decidedBy = actor.username;
+                  if (approver && r.status === "approved") decidedCounts[r.id] = true;
+                } else { delete r.decidedBy; delete r.decidedAt; delete r.decisionNote; }
               }
             });
           }
@@ -326,15 +346,12 @@ var demo = {
             if (j && j.status !== "quoted") throw demoErr("Job " + op.job + " is already kitted. Its quote materials can't change now.");
           }
           if (op.op === "append") {
-            var have = {}; work.Moves.forEach(function (m) { have[m.id] = 1; });
+            var have = Object.create(null); work.Moves.forEach(function (m) { have[m.id] = 1; });
+            if (!batchIds) { batchIds = Object.create(null); body.ops.forEach(function (o2) { if (o2 && o2.op === "append" && o2.sheet === "Moves") (o2.rows || []).forEach(function (x) { if (x && x.id && !have[x.id]) batchIds[x.id] = true; }); }); }
             op.rows = op.rows.filter(function (m) { return !have[m.id]; }).map(function (m) { return Object.assign({}, m, { by: me.username, approvedBy: approver ? approver.username : "" }); });
+            op.rows.forEach(function (m) { if (m.type === "reverse") demoCheckReversal(m, work.Moves.concat(op.rows), batchIds, work.Jobs, !!approver); });
             if (approver) op.rows.forEach(function (m) {
-              if (m.type === "reverse") {
-                var orig = work.Moves.find(function (x) { return x.id === m.ref; });
-                if (!orig || !DEMO_REVERSIBLE[orig.type] || m.reverses !== orig.type || String(m.sku) !== String(orig.sku) || Math.abs(Number(m.qty) - Number(orig.qty)) > 0.005 || m.from !== orig.to || m.to !== orig.from) throw demoErr(OV_SCOPE_MSG);
-                if (work.Moves.some(function (x) { return x.type === "reverse" && x.ref === orig.id; }) || op.rows.some(function (x) { return x !== m && x.type === "reverse" && x.ref === orig.id; })) throw demoErr("That movement has already been corrected. Refresh.");
-                return;
-              }
+              if (m.type === "reverse") return;
               var c = counts0.find(function (x) { return x.id === m.ref; });
               if (c && c.status !== "pending") throw demoErr("This count has already been decided. Refresh.");
               var want = c ? demoExpectedCountMoves(c)[String(m.sku)] : null, cs = countSeen[m.ref] = countSeen[m.ref] || {};
@@ -1014,7 +1031,7 @@ function vItemHistory(sku) {
 }
 
 /* ---------- Daily log (reads Moves and Counts; nothing is stored here) ---------- */
-var LOG_TYPES = [["all", "All"], ["in", "Stock in"], ["out", "Stock out"], ["jobs", "Jobs"], ["counts", "Counts"], ["fixes", "Corrections"]];
+var LOG_TYPES = [["all", "All"], ["in", "Stock in"], ["out", "Stock out"], ["jobs", "Jobs"], ["counts", "Counts & adjustments"], ["fixes", "Corrections"]];
 function logState() { return S.log || (S.log = { day: "", type: "all", who: "" }); }
 function logToday() { return C.saDay(now()); }
 function placeWords(l) {
@@ -1032,10 +1049,10 @@ function logTasks() {
   (D.Counts || []).forEach(function (c) {
     if (C.saDay(c.ts) === day) tasks.push({ ts: c.ts, by: c.by, approvedBy: "", kind: "counts", label: "Count submitted", count: c, ord: 0 });
     if (c.status !== "pending" && c.decidedAt && C.saDay(c.decidedAt) === day)
-      tasks.push({ ts: c.decidedAt, by: c.decidedBy || "", approvedBy: "", kind: "counts", label: c.status === "approved" ? "Count approved" : "Count rejected", count: c, ord: 2 });
+      tasks.push({ ts: c.decidedAt, by: c.decidedBy || "", owner: c.by, approvedBy: "", kind: "counts", label: (c.status === "approved" ? "Count approved" : "Count rejected") + (c.decidedBy ? " by " + c.decidedBy : ""), count: c, ord: 2 });
   });
   tasks = tasks.filter(function (t) {
-    if (own && t.by !== me) return false;
+    if (own && t.by !== me && t.owner !== me) return false;   // a User also sees the decision on a count they submitted
     if (!own && st.who && t.by !== st.who) return false;
     return st.type === "all" || t.kind === st.type;
   });
@@ -1043,8 +1060,8 @@ function logTasks() {
   tasks.forEach(function (t) { t.lines = t.count ? countLinesOf(t.count) : t.moves; });
   return tasks;
 }
-function logValueOut(tasks) {   // rand value that left the store (managers only see it)
-  var v = 0; tasks.forEach(function (t) { (t.moves || []).forEach(function (m) { if (m.from === "WH") v += n(m.value); }); });
+function logValueOut(tasks) {   // rand value that left the store: stock out, kit, extra, van top-up (not corrections, receipts or adjustments)
+  var v = 0; tasks.forEach(function (t) { (t.moves || []).forEach(function (m) { if (m.from === "WH" && /^(out|kit|extra|topup)$/.test(m.type)) v += n(m.value); }); });
   return C.round2(v);
 }
 function logCollected(m) { return m.type === "out" && m.installer ? "Collected by " + m.installer : ""; }
@@ -1085,19 +1102,18 @@ function vLog() {
   return html;
 }
 function logCsvText(tasks, mgr) {
-  var head = ["date", "time", "by", "approved_by", "task", "item_code", "item_name", "qty", "unit", "from", "to", "job", "reference", "reason"].concat(mgr ? ["unit_cost", "value"] : []);
+  var head = ["date", "time", "by", "approved_by", "task", "item_code", "item_name", "qty", "unit", "from", "to", "collected_by", "job", "reference", "reason"].concat(mgr ? ["unit_cost", "value"] : []);
   var rows = [head];
   tasks.forEach(function (t) {
     var pre = [C.saDay(t.ts), C.saTime(t.ts), t.by, t.approvedBy || "", t.label];
     if (t.count) {
       var c = t.count;
-      t.lines.forEach(function (l) { rows.push(pre.concat([l.sku, nameOf(l.sku), n(l.counted), unitWord(l.sku), c.place === "WH" ? "Store shelves" : vanName(c.place), "", "", c.id, (t.label === "Count submitted" ? c.note : c.decisionNote) || ""], mgr ? ["", n(l.value)] : [])); });
+      t.lines.forEach(function (l) { rows.push(pre.concat([l.sku, nameOf(l.sku), n(l.counted), unitWord(l.sku), c.place === "WH" ? "Store shelves" : vanName(c.place), "", "", "", c.id, (t.label === "Count submitted" ? c.note : c.decisionNote) || ""], mgr ? ["", n(l.value)] : [])); });
       return;
     }
     t.moves.forEach(function (m) {
       var uc = m.unitCost !== undefined && m.unitCost !== "" && m.unitCost !== null ? n(m.unitCost) : (n(m.qty) > 0 ? C.round4(n(m.value) / n(m.qty)) : 0);
-      var reason = [logCollected(m), m.reason].filter(Boolean).join(". ");
-      rows.push(pre.concat([m.sku, nameOf(m.sku), n(m.qty), unitWord(m.sku), placeWords(m.from), placeWords(m.to), m.job || "", m.type === "reverse" ? "" : (m.ref || ""), reason], mgr ? [uc, n(m.value)] : []));
+      rows.push(pre.concat([m.sku, nameOf(m.sku), n(m.qty), unitWord(m.sku), placeWords(m.from), placeWords(m.to), m.installer || "", m.job || "", m.type === "reverse" ? "" : (m.ref || ""), m.reason || ""], mgr ? [uc, n(m.value)] : []));
     });
   });
   return C.csv(rows);

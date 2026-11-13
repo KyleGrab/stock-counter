@@ -497,7 +497,8 @@ console.log("backend roles: all tests passed");
   assert.ok(ov(TS, [decide("c4", "approved")], LEBO).ok);
   // approving and reversing together, with the count decision first in the list
   assert.ok(count("c5", TS, [line("PV", 90, 85)]).ok);
-  assert.ok(ov(TS, [decide("c5", "approved"), { op: "append", sheet: "Moves", rows: [cmove("cm5", "c5"), REV("v5", M("r4"))] }], LEBO).ok, "order inside the batch doesn't matter");
+  assert.ok(ov(TS, [decide("c5", "approved"), { op: "append", sheet: "Moves", rows: [cmove("cm5", "c5")] }], LEBO).ok, "order inside the batch doesn't matter");
+  assert.ok(ov(TS, [{ op: "append", sheet: "Moves", rows: [REV("v5", M("r4"))] }], LEBO).ok, "and a correction is its own approval");
   // van count adjustments (kituse) are tied to their count the same way
   assert.ok(count("c6", TS, [line("PV", 10, 7)], "VAN-1").ok);
   assert.ok(post({ token: A, ops: [{ op: "append", sheet: "Moves", rows: [M("vt", { type: "topup", from: "WH", to: "VAN-1", qty: 10 })] }] }).ok);
@@ -567,4 +568,134 @@ console.log("backend roles: all tests passed");
   assert.ok(r.ok, r.error);
   assert.strictEqual(sheets.Moves.rows.find(x => x[0] === "rv")[17], "lebo");
   console.log("backend v1.7 column upgrade: all tests passed");
+}
+
+// --- fix round F1-F6: the Sheet, not the phone, decides who decided, what a correction copies, and what one approval covers ---
+{
+  const { ctx, post, sheets, cache } = makeGas();
+  ctx.setAdminPin_("482915", "482915");
+  const A = post({ action: "login", username: "admin", pin: "482915" }).token;
+  const mkUser = (u, role, pin) => assert.ok(post({ action: "users", token: A, cmd: "save", isNew: true, user: { username: u, name: u, role }, pin }).ok);
+  mkUser("lebo", "manager", "583217"); mkUser("mona", "manager", "694815"); mkUser("sipho", "storeman", "5832");
+  const login = (u, pin, np) => { const x = post({ action: "login", username: u, pin }); assert.ok(x.ok, x.error); assert.ok(post({ action: "changePin", token: x.token, oldPin: pin, newPin: np }).ok); return x.token; };
+  const TS = login("sipho", "5832", "7140"), TL = login("lebo", "583217", "640291"); login("mona", "694815", "731846");
+  const LEBO = { username: "lebo", pin: "640291" }, MONA = { username: "mona", pin: "731846" };
+  const col = (sheet, name) => ctx.SHEETS[sheet].cols.indexOf(name);
+  const moveRow = id => sheets.Moves.rows.find(r => r[0] === id);
+  const countRow = id => sheets.Counts.rows.find(r => r[0] === id);
+  const cell = (row, sheet, name) => row[col(sheet, name)];
+  const logs = () => sheets.Log.rows.slice(1).map(r => r.join("|"));
+  const ts = "2026-11-12T09:00:00.000Z";
+  const M = (id, o) => Object.assign({ id, ts, type: "receive", sku: "PV", qty: 10, from: "SUPPLIER", to: "WH" }, o || {});
+  const REV = (id, orig, o) => Object.assign({ id, ts, type: "reverse", reverses: orig.type, ref: orig.id, sku: orig.sku, qty: orig.qty, from: orig.to, to: orig.from, reason: "typo" }, o || {});
+  const app = (token, rows) => post({ token, ops: [{ op: "append", sheet: "Moves", rows }] });
+  const ov = (ops, o) => post({ token: TS, ops, override: o || LEBO });
+  const line = (sku, system, counted) => ({ sku, system, counted, diff: counted - system, value: (counted - system) * 10 });
+  const ONE = /One manager approval covers one correction or one count decision/, SCOPE = /only for corrections and count decisions/;
+  assert.ok(post({ token: A, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", name: "PV red", uom: "m", track: "qty", cost: 10 }] }, { op: "append", sheet: "Moves", rows: [M("base", { qty: 100 })] },
+    { op: "upsert", sheet: "Jobs", rows: [{ no: "J-1", client: "Z", status: "out", van: "VAN-1", installer: "Thabo" }, { no: "J-2", client: "Y", status: "closed" }, { no: "J-3", client: "X", status: "kitted" }] }] }).ok);
+  assert.ok(app(TS, [M("r1"), M("r2"), M("r3"), M("r4"), M("r5"), M("r6")]).ok);
+
+  // F1: forged decidedBy / decidedAt / decisionNote on a NEW count are blanked, for a User and for a manager
+  const forged = id => ({ id, place: "WH", ts, status: "pending", lines: JSON.stringify([line("PV", 110, 100)]), value: -100, decidedBy: "lebo", decidedAt: ts, decisionNote: "ok", by: "lebo" });
+  assert.ok(post({ token: TS, ops: [{ op: "upsert", sheet: "Counts", rows: [forged("C1")] }] }).ok);
+  const bl = id => ["decidedBy", "decidedAt", "decisionNote"].map(n => cell(countRow(id), "Counts", n));
+  assert.deepStrictEqual(bl("C1"), ["", "", ""]); assert.strictEqual(cell(countRow("C1"), "Counts", "by"), "sipho");
+  assert.ok(post({ token: TL, ops: [{ op: "upsert", sheet: "Counts", rows: [forged("C2")] }] }).ok);
+  assert.deepStrictEqual(bl("C2"), ["", "", ""]); assert.strictEqual(cell(countRow("C2"), "Counts", "by"), "lebo");
+  // an update that is not a decision can't touch the decision fields (or who counted)
+  assert.ok(post({ token: TL, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "C1", note: "hello", decidedBy: "mona", decidedAt: "x", decisionNote: "y", by: "mona" }] }] }).ok);
+  assert.deepStrictEqual(bl("C1"), ["", "", ""]); assert.strictEqual(cell(countRow("C1"), "Counts", "note"), "hello"); assert.strictEqual(cell(countRow("C1"), "Counts", "by"), "sipho");
+  // a decision: decidedBy is the actor whatever the phone sent
+  assert.ok(post({ token: TL, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "C1", status: "rejected", decidedBy: "mona", decisionNote: "recount" }] }] }).ok);
+  assert.strictEqual(cell(countRow("C1"), "Counts", "decidedBy"), "lebo"); assert.strictEqual(cell(countRow("C1"), "Counts", "decisionNote"), "recount");
+  // a key called hasOwnProperty can't break the save
+  assert.ok(post({ token: TL, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "C1", hasOwnProperty: 1, note: "again" }] }] }).ok);
+  assert.strictEqual(cell(countRow("C1"), "Counts", "note"), "again");
+
+  // F2: one manager approval = one action. Padded batches, both shapes, are refused and nothing is written
+  const nMoves = () => sheets.Moves.rows.length, nCounts = () => sheets.Counts.rows.length;
+  const n0 = nMoves();
+  const decide = (id, st) => ({ op: "upsert", sheet: "Counts", rows: [{ id, status: st, decidedAt: ts }], expect: { field: "status", values: ["pending"] } });
+  const cm = (id, ref, o) => M(id, Object.assign({ type: "countshort", from: "WH", to: "LOSS", qty: 10, ref, reason: "count" }, o || {}));
+  assert.ok(post({ token: TS, ops: [{ op: "upsert", sheet: "Counts", rows: [{ id: "C3", place: "WH", status: "pending", lines: JSON.stringify([line("PV", 110, 100)]), value: -100 }, { id: "C4", place: "WH", status: "pending", lines: JSON.stringify([line("PV", 110, 105)]), value: -50 }] }] }).ok);
+  assert.ok(ONE.test(ov([{ op: "append", sheet: "Moves", rows: [REV("p1", M("r1")), REV("p2", M("r2"))] }]).error), "two reversals");
+  assert.ok(ONE.test(ov([{ op: "append", sheet: "Moves", rows: [REV("p1", M("r1"))] }, { op: "append", sheet: "Moves", rows: [REV("p2", M("r2"))] }]).error), "two reversal ops");
+  assert.ok(ONE.test(ov([decide("C3", "approved"), { op: "append", sheet: "Moves", rows: [cm("cm3", "C3"), REV("p3", cm("cm3", "C3"))] }]).error), "approve, book, and reverse the shortage in one go");
+  assert.ok(ONE.test(ov([decide("C3", "approved"), { op: "append", sheet: "Moves", rows: [cm("cm3", "C3"), REV("p3", M("r3"))] }]).error), "approve and reverse another move");
+  assert.ok(ONE.test(ov([decide("C3", "approved"), decide("C4", "approved"), { op: "append", sheet: "Moves", rows: [cm("cm3", "C3"), cm("cm4", "C4", { qty: 5 })] }]).error), "two count decisions");
+  assert.ok(ONE.test(ov([{ op: "upsert", sheet: "Counts", rows: [{ id: "C3", status: "approved" }, { id: "C4", status: "rejected" }] }]).error), "two counts in one op");
+  assert.ok(SCOPE.test(ov([decide("C3", "approved"), { op: "append", sheet: "Moves", rows: [cm("cm3", "C3"), cm("cm4", "C4", { qty: 5 })] }]).error), "a count move that belongs to another count");
+  assert.ok(SCOPE.test(ov([{ op: "append", sheet: "Moves", rows: [REV("p1", M("r1")), M("p9")] }]).error), "a reversal plus a plain movement");
+  assert.strictEqual(nMoves(), n0, "nothing written"); assert.strictEqual(cell(countRow("C3"), "Counts", "status"), "pending");
+  // the single actions still work
+  assert.ok(ov([{ op: "append", sheet: "Moves", rows: [cm("cm3", "C3")] }, decide("C3", "approved")]).ok);
+  assert.strictEqual(cell(countRow("C3"), "Counts", "decidedBy"), "lebo");
+  assert.ok(ov([decide("C4", "rejected")], MONA).ok);
+  assert.ok(ov([{ op: "append", sheet: "Moves", rows: [REV("ok1", M("r1"))] }]).ok);
+
+  // F3: a correction can't undo a movement saved in the same request (any role), needs a reason, and respects the job rule
+  const n1 = nMoves();
+  assert.ok(/saved earlier/.test(app(TL, [M("n1"), REV("nr1", M("n1"))]).error), "manager: same-save reversal");
+  assert.ok(/saved earlier/.test(app(TL, [REV("nr2", M("n2")), M("n2")]).error), "manager: reversal listed before its movement");
+  assert.ok(/saved earlier/.test(post({ token: TL, ops: [{ op: "append", sheet: "Moves", rows: [M("n3")] }, { op: "append", sheet: "Moves", rows: [REV("nr3", M("n3"))] }] }).error), "manager: across two ops");
+  assert.strictEqual(nMoves(), n1);
+  for (const reason of ["", "   ", undefined]) {
+    assert.ok(/reason/.test(app(TL, [REV("nr4", M("r2"), { reason })]).error), "manager: no reason");
+    assert.ok(/reason/.test(ov([{ op: "append", sheet: "Moves", rows: [REV("nr5", M("r2"), { reason })] }]).error), "override: no reason");
+  }
+  assert.ok(/can't be corrected/.test(app(TL, [REV("nr6", M("nope"))]).error), "manager: unknown movement");
+  assert.ok(/already been corrected/.test(app(TL, [REV("nr7", M("r1"))]).error), "manager: twice");
+  assert.ok(!moveRow("nr4") && !moveRow("nr5"));
+  // job rule: closed (or missing) job refuses; open job and kitted-out-to-job are fine
+  const jm = (id, job, type, to) => ({ id, ts, type: type || "extra", sku: "PV", qty: 2, from: "WH", to: to || "JOB:" + job, job, van: "VAN-1", installer: "Thabo", serial: "SN1", unitCost: 10, value: 20 });
+  assert.ok(app(A, [jm("j1", "J-1"), jm("j2", "J-2"), jm("j3", "J-3", "out"), jm("j4", "J-3", "extra"), jm("j5", "J-9")]).ok);
+  const JC = /This job is closed; its movements can't be corrected/;
+  assert.ok(JC.test(app(TL, [REV("jr2", jm("j2", "J-2"))]).error), "closed job, manager");
+  assert.ok(JC.test(ov([{ op: "append", sheet: "Moves", rows: [REV("jr2", jm("j2", "J-2"))] }]).error), "closed job, override");
+  assert.ok(JC.test(app(TL, [REV("jr4", jm("j4", "J-3", "extra"))]).error), "an extra to a kitted job is not correctable");
+  assert.ok(JC.test(app(TL, [REV("jr5", jm("j5", "J-9"))]).error), "job that doesn't exist");
+  assert.ok(app(TL, [REV("jr1", jm("j1", "J-1"))]).ok, "open job");
+  assert.ok(ov([{ op: "append", sheet: "Moves", rows: [REV("jr3", jm("j3", "J-3", "out"))] }]).ok, "a stock out to a kitted job is correctable");
+
+  // F4: a correction copies job / van / installer / serial / unitCost / value from the original; ts is the Sheet's time
+  const t0 = Date.now();
+  assert.ok(ov([{ op: "append", sheet: "Moves", rows: [REV("fv", M("r3"), { value: 999999, unitCost: 0.01, job: "J-1", van: "VAN-9", installer: "evil", serial: "XX", ts: "2020-01-01T00:00:00.000Z" })] }]).ok);
+  let fv = moveRow("fv");
+  assert.deepStrictEqual(["job", "van", "installer", "serial", "unitCost", "value"].map(n => cell(fv, "Moves", n)), ["", "", "", "", "", ""], "the original had none of these");
+  assert.ok(Date.parse(cell(fv, "Moves", "ts")) >= t0 - 1000, "server time");
+  assert.strictEqual(cell(fv, "Moves", "by"), "sipho"); assert.strictEqual(cell(fv, "Moves", "approvedBy"), "lebo");
+  assert.ok(app(TL, [REV("jr1x", jm("j1b", "J-1"))]).error, "unknown original");
+  assert.ok(app(A, [jm("j6", "J-1")]).ok);
+  assert.ok(app(TL, [REV("fv2", jm("j6", "J-1"), { value: 1, unitCost: 1, job: "J-3", van: "VAN-7", installer: "x", serial: "y", ts: "2001-01-01T00:00:00.000Z" })]).ok);
+  fv = moveRow("fv2");
+  assert.deepStrictEqual(["job", "van", "installer", "serial", "unitCost", "value"].map(n => cell(fv, "Moves", n)), ["J-1", "VAN-1", "Thabo", "SN1", "10", "20"], "copied from the original, even for a manager");
+  assert.ok(Date.parse(cell(fv, "Moves", "ts")) >= t0 - 1000);
+
+  // F5: built-in names as keys can't hit Object.prototype
+  assert.ok(app(TS, [M("constructor")]).ok && moveRow("constructor"), "a movement with the id 'constructor' is saved, not mistaken for a duplicate");
+  assert.ok(app(TS, [M("__proto__")]).ok && moveRow("__proto__"));
+  assert.ok(/can't be corrected/.test(app(TL, [REV("fp1", M("toString"), { ref: "toString" })]).error));
+  assert.ok(/only for corrections/.test(ov([{ op: "append", sheet: "Moves", rows: [REV("fp2", M("r4"), { ref: "valueOf" })] }]).error));
+  assert.ok(!moveRow("fp1") && !moveRow("fp2"));
+  assert.ok(/Unknown tab/.test(post({ token: TL, ops: [{ op: "upsert", sheet: "constructor", rows: [{ id: "x" }] }] }).error));
+  assert.ok(/Unknown tab/.test(post({ token: TL, ops: [{ op: "create", sheet: "__proto__", row: {} }] }).error));
+  assert.ok(SCOPE.test(ov([{ op: "upsert", sheet: "Counts", rows: [{ id: "C3", status: "approved", constructor: 1 }] }]).error));
+  assert.ok(/only for corrections/.test(ov([{ op: "append", sheet: "Moves", rows: [REV("fp3", M("r4"), { ref: "hasOwnProperty", reverses: "hasOwnProperty" })] }]).error));
+
+  // F6: a Moves header edited by hand stops the save, with nothing written (not even the other ops in the request)
+  const hdr = sheets.Moves.rows[0], good = hdr[3], n2 = nMoves(), cost0 = sheets.Items.rows.find(r => r[0] === "PV")[col("Items", "cost")];
+  hdr[3] = "SKU (item)";
+  let r = post({ token: TL, ops: [{ op: "upsert", sheet: "Items", rows: [{ sku: "PV", cost: 77 }] }, { op: "append", sheet: "Moves", rows: [M("h1")] }] });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.error, "The Moves tab header has been edited; column 4 should be 'sku'. Fix the header row, then try again.");
+  assert.strictEqual(nMoves(), n2); assert.strictEqual(sheets.Items.rows.find(r => r[0] === "PV")[col("Items", "cost")], cost0, "the Items change in the same request wasn't written either");
+  assert.ok(logs().some(l => /sipho|lebo/.test(l) && /sheet header problem\|The Moves tab header has been edited/.test(l)), "logged");
+  assert.ok(/header has been edited/.test(ov([{ op: "append", sheet: "Moves", rows: [REV("h2", M("r5"))] }]).error), "override too");
+  assert.throws(() => ctx.ensureColumns_("Moves"), /column 4 should be 'sku'/);
+  hdr[3] = good;
+  assert.ok(app(TL, [M("h1")]).ok, "works again once the header is fixed");
+  // a missing LAST header is still added automatically (older Sheet)
+  hdr[17] = ""; assert.ok(app(TL, [M("h3")]).ok); assert.strictEqual(hdr[17], "approvedBy");
+  console.log("backend fix round F1-F6: all tests passed");
 }

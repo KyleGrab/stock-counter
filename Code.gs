@@ -24,6 +24,10 @@
  *  - Manager override: when a User is signed in, a correction or a count decision is accepted only
  *    with a Warehouse Manager's or Senior Admin's OWN username and PIN, checked here (same wrong-PIN
  *    limits as sign-in). The record shows both people (by = the User, approvedBy = the manager).
+ *    One approval covers ONE correction or ONE count decision, never a bundle.
+ *  - Every correction is checked here: it must undo one real, earlier movement, with a reason, on a job that still
+ *    allows it, and it copies that movement's value, job, van, installer and serial (time = the Sheet's clock).
+ *  - Who decided a count is set here only; a phone can't write it.
  *  - The Sheet hands out job, sticker and van numbers, so two phones never clash.
  *  - Job steps are checked (a job can't be kitted or closed twice).
  *  - Stock in the store, vans and jobs can't go below zero.
@@ -440,8 +444,12 @@ var OVERRIDE_SCOPE_MSG = "Manager approval is only for corrections and count dec
 var OVERRIDE_WHO_MSG = "Manager approval must come from a Warehouse Manager or Senior Admin other than you.";
 // Same list as REVERSIBLE in the app: the movement types a correction may undo.
 var REVERSIBLE_ = { receive: 1, topup: 1, extra: 1, "return": 1, scrap: 1, countshort: 1, countover: 1, adjust: 1, out: 1 };
+var ONE_APPROVAL_MSG = "One manager approval covers one correction or one count decision.";
+var JOB_CLOSED_MSG = "This job is closed; its movements can't be corrected.";
 var COUNT_MOVE_ = { countshort: 1, countover: 1, kituse: 1 };
 var COUNT_DECISION_KEYS_ = { id: 1, status: 1, decidedAt: 1, decisionNote: 1 };
+/** Own-property lookup, so a key such as "constructor" or "__proto__" sent by a phone can never hit a built-in. */
+function has_(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
 
 /** Checks the manager's own username and PIN like a sign-in (same counters and lock). Returns the approver. */
 function verifyOverride_(o, user) {
@@ -457,31 +465,37 @@ function verifyOverride_(o, user) {
   return a;
 }
 
-/** What an override batch may contain, judged from the request alone: reversals and count decisions (with their adjustment moves). */
+/**
+ * What an override batch may contain, judged from the request alone. ONE manager approval = ONE action:
+ *  (A) exactly one correction (one reversal row) and nothing else, or
+ *  (B) exactly one count decision (approve or reject) plus, for an approval, only that count's own adjustment moves.
+ */
 function overrideScope_(ops) {
-  var decided = {}, any = false;
+  var bad = function () { return fail_(OVERRIDE_SCOPE_MSG); };
+  var counts = [], reversals = [], countMoves = [];
   ops.forEach(function (op) {
-    if (op && op.op === "upsert" && op.sheet === "Counts") {
-      if (!Array.isArray(op.rows) || !op.rows.length) throw fail_(OVERRIDE_SCOPE_MSG);
+    if (!op || typeof op !== "object" || !Array.isArray(op.rows) || !op.rows.length) throw bad();
+    if (op.op === "upsert" && op.sheet === "Counts") {
       op.rows.forEach(function (r) {
-        var id = r && String(r.id || "");
-        if (!id || decided[id] || (r.status !== "approved" && r.status !== "rejected")) throw fail_(OVERRIDE_SCOPE_MSG);
-        Object.keys(r).forEach(function (k) { if (!COUNT_DECISION_KEYS_[k]) throw fail_(OVERRIDE_SCOPE_MSG); });
-        decided[id] = r.status; any = true;
+        if (!r || typeof r !== "object" || !String(r.id || "") || (r.status !== "approved" && r.status !== "rejected")) throw bad();
+        Object.keys(r).forEach(function (k) { if (!has_(COUNT_DECISION_KEYS_, k)) throw bad(); });
+        counts.push(r);
       });
-    }
+    } else if (op.op === "append" && op.sheet === "Moves") {
+      op.rows.forEach(function (r) {
+        if (!r || typeof r !== "object") throw bad();
+        if (r.type === "reverse") reversals.push(r);
+        else if (typeof r.type === "string" && has_(COUNT_MOVE_, r.type)) countMoves.push(r);
+        else throw bad();
+      });
+    } else throw bad();
   });
-  ops.forEach(function (op) {
-    if (op && op.op === "upsert" && op.sheet === "Counts") return;
-    if (!op || op.op !== "append" || op.sheet !== "Moves" || !Array.isArray(op.rows) || !op.rows.length) throw fail_(OVERRIDE_SCOPE_MSG);
-    op.rows.forEach(function (r) {
-      if (!r || typeof r !== "object") throw fail_(OVERRIDE_SCOPE_MSG);
-      if (r.type === "reverse") { any = true; return; }
-      if (COUNT_MOVE_[r.type] && decided[String(r.ref || "")] === "approved") return;   // booked by an approval in this same batch
-      throw fail_(OVERRIDE_SCOPE_MSG);
-    });
-  });
-  if (!any) throw fail_(OVERRIDE_SCOPE_MSG);
+  if (!counts.length && !reversals.length) throw bad();
+  if (counts.length + reversals.length > 1) throw fail_(ONE_APPROVAL_MSG);
+  if (reversals.length) { if (countMoves.length) throw fail_(ONE_APPROVAL_MSG); return; }
+  var id = String(counts[0].id);
+  if (countMoves.length && counts[0].status !== "approved") throw bad();
+  countMoves.forEach(function (r) { if (String(r.ref || "") !== id) throw bad(); });
 }
 
 /** Text for the Log: how many corrections, which counts. */
@@ -494,14 +508,30 @@ function overrideSummary_(ops) {
   return (corr ? corr + " correction(s)" : "") + (corr && counts.length ? "; " : "") + counts.join("; ");
 }
 
-/** A correction must undo exactly one real, reversible movement that isn't already undone (the phone can't invent one). */
-function checkReversal_(r, moves) {
-  var orig = moves[String(r.ref || "")];
-  if (!orig || !REVERSIBLE_[orig.type] || r.reverses !== orig.type || String(r.sku) !== String(orig.sku) ||
-      Math.abs(Number(r.qty) - Number(orig.qty)) > 0.005 || r.from !== orig.to || r.to !== orig.from) throw fail_(OVERRIDE_SCOPE_MSG);
+/**
+ * A correction (any role) must undo exactly one real, reversible movement that was saved earlier and isn't already undone,
+ * with a reason, on a job that still allows corrections. Then the Sheet copies the original's facts onto the correction,
+ * so the phone can't choose the value, job, van, installer, serial or time.
+ */
+function checkReversal_(r, moves, batchIds, jobs, viaOverride) {
+  var refuse = function () { return fail_(viaOverride ? OVERRIDE_SCOPE_MSG : "That movement can't be corrected."); };
+  var ref = String(r.ref || "");
+  if (has_(batchIds, ref)) throw fail_("A correction can only undo a movement that was saved earlier, not one in the same save.");
+  var orig = has_(moves, ref) ? moves[ref] : null;
+  if (!orig || !has_(REVERSIBLE_, orig.type) || r.reverses !== orig.type || String(r.sku) !== String(orig.sku) ||
+      Math.abs(Number(r.qty) - Number(orig.qty)) > 0.005 || r.from !== orig.to || r.to !== orig.from) throw refuse();
   Object.keys(moves).forEach(function (k) {
     if (k !== String(r.id) && moves[k].type === "reverse" && String(moves[k].ref) === String(orig.id)) throw fail_("That movement has already been corrected. Refresh.");
   });
+  if (!String(r.reason || "").trim()) throw fail_("Give a reason for the correction.");
+  var job = String(orig.job || "");
+  if (job) {
+    var j = has_(jobs, job) ? jobs[job] : null;
+    if (!j || !(j.status === "out" || (orig.type === "out" && j.status === "kitted"))) throw fail_(JOB_CLOSED_MSG);
+  }
+  r.job = orig.job || ""; r.van = orig.van || ""; r.installer = orig.installer || ""; r.serial = orig.serial || "";
+  r.unitCost = orig.unitCost === undefined ? "" : orig.unitCost; r.value = orig.value === undefined ? "" : orig.value;
+  r.qty = orig.qty; r.ts = new Date().toISOString();
 }
 
 /** The adjustment moves an approval must book for a count, exactly as the app works them out from the count's lines. */
@@ -749,23 +779,24 @@ function applyBatch_(ops, user, approver) {
   var mem = {};          // sheet -> { keys: [...], rows: {key: row} } loaded on demand
   function load(name) {
     if (mem[name]) return mem[name];
-    var rows = rows_(name, 0), byKey = {}, k = SHEETS[name].key;
+    var rows = rows_(name, 0), byKey = Object.create(null), k = SHEETS[name].key;
     rows.forEach(function (r) { byKey[String(r[k])] = r; });
     mem[name] = { keys: rows.map(function (r) { return String(r[k]); }), rows: byKey };
     return mem[name];
   }
-  var assigned = {}, plan = [], newMoves = [], countSeen = {}, decidedCounts = {};
+  var assigned = {}, plan = [], newMoves = [], countSeen = Object.create(null), decidedCounts = Object.create(null), batchIds = null;
   // counts as they were BEFORE this batch (an override judges moves against the count's state when it was pending)
-  var counts0 = approver ? JSON.parse(JSON.stringify(load("Counts").rows)) : null;
+  var counts0 = null;
+  if (approver) { counts0 = Object.create(null); var c0 = load("Counts").rows; Object.keys(c0).forEach(function (k) { counts0[k] = Object.assign({}, c0[k]); }); }
 
   ops.forEach(function (raw) {
     var op = substitute_(raw, assigned);
-    var def = SHEETS[op.sheet];
+    var def = has_(SHEETS, op.sheet) ? SHEETS[op.sheet] : null;
     if (!def || def.private) throw new Error("Unknown tab: " + op.sheet);
     permitted_(op, actor);
 
     if (op.op === "create") {
-      var num = NUMBERING[op.sheet];
+      var num = has_(NUMBERING, op.sheet) ? NUMBERING[op.sheet] : null;
       if (!num) throw new Error("Numbers are only handed out for jobs, stickers and vans.");
       var m = load(op.sheet), max = num.first - 1;
       m.keys.forEach(function (k) {
@@ -787,6 +818,10 @@ function applyBatch_(ops, user, approver) {
     if (op.op === "append") {
       if (op.sheet !== "Moves") throw new Error("Append is only for Moves.");
       var seen = load("Moves").rows;
+      if (!batchIds) {   // ids this save is creating (before any is added), so a correction can't undo a movement from the same save
+        batchIds = Object.create(null);
+        ops.forEach(function (o2) { if (o2 && o2.op === "append" && o2.sheet === "Moves" && Array.isArray(o2.rows)) o2.rows.forEach(function (x) { if (x && x.id && !seen[String(x.id)]) batchIds[String(x.id)] = true; }); });
+      }
       var fresh = (op.rows || []).filter(function (r) {
         if (!r.id || !r.sku || !(Number(r.qty) > 0)) throw new Error("A movement is missing its id, item or quantity.");
         if (seen[String(r.id)]) return false;   // already saved by an earlier retry
@@ -795,12 +830,13 @@ function applyBatch_(ops, user, approver) {
         r.approvedBy = approver ? approver.username : "";   // likewise: only the Sheet says who approved
         return true;
       });
+      fresh.forEach(function (r) { if (r.type === "reverse") checkReversal_(r, seen, batchIds, load("Jobs").rows, !!approver); });
       if (approver) fresh.forEach(function (r) {
-        if (r.type === "reverse") return checkReversal_(r, seen);
+        if (r.type === "reverse") return;
         // a count adjustment: must be one the approved count calls for, once
-        var c = counts0[String(r.ref)], want = c && c.status === "pending" ? expectedCountMoves_(c)[String(r.sku)] : null;
+        var c = has_(counts0, String(r.ref)) ? counts0[String(r.ref)] : null, want = c && c.status === "pending" ? expectedCountMoves_(c)[String(r.sku)] : null;
         if (c && c.status !== "pending") throw fail_("This count has already been decided. Refresh.");
-        var cs = countSeen[c && c.id] = countSeen[c && c.id] || {};
+        var cid = String(c ? c.id : ""), cs = countSeen[cid] = countSeen[cid] || Object.create(null);
         if (!want || cs[r.sku] || want.type !== r.type || want.from !== r.from || want.to !== r.to || Math.abs(Number(r.qty) - want.qty) > 0.005) throw fail_(OVERRIDE_SCOPE_MSG);
         cs[r.sku] = true;
       });
@@ -823,11 +859,16 @@ function applyBatch_(ops, user, approver) {
             if (!cur) throw fail_(OVERRIDE_SCOPE_MSG);
             if (cur.status !== "pending") throw fail_("This count has already been decided. Refresh.");
           }
-          if (!cur) { r.by = user.username; r.status = r.status || "pending"; }
-          if (cur && r.status && r.status !== cur.status) {
-            if (cur.by === actor.username) throw fail_("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
-            r.decidedBy = actor.username;   // with an override this is the manager, not the phone's user
-            if (approver && r.status === "approved") decidedCounts[k] = true;
+          if (!cur) {   // a new count: who counted comes from the sign-in, and nobody has decided it yet
+            r.by = user.username; r.status = r.status || "pending";
+            r.decidedBy = ""; r.decidedAt = ""; r.decisionNote = "";
+          } else {
+            delete r.by;   // an existing count keeps the name of whoever counted it
+            if (r.status && r.status !== cur.status) {
+              if (cur.by === actor.username) throw fail_("You can't approve or reject your own count. Another manager or the Senior Admin must do it.");
+              r.decidedBy = actor.username;   // set here only, when the status changes; with an override this is the manager
+              if (approver && r.status === "approved") decidedCounts[k] = true;
+            } else { delete r.decidedBy; delete r.decidedAt; delete r.decisionNote; }   // not a decision: can't touch the decision fields
           }
         }
         if (op.expect) {
@@ -870,6 +911,8 @@ function applyBatch_(ops, user, approver) {
   });
 
   if (newMoves.length) {
+    var hp = headerProblem_("Moves");   // refuse BEFORE anything is written under a header that was edited by hand
+    if (hp) { log_(user.username, "sheet header problem", hp); throw fail_(hp); }
     var problem = checkBalances_(newMoves);
     if (problem) throw new Error(problem);
   }
@@ -941,17 +984,29 @@ function ensureRows_(sh, lastRowNeeded, cols) {
   sh.insertRowsAfter(max, add);
   sh.getRange(max + 1, 1, add, cols || sh.getMaxColumns()).setNumberFormat("@");
 }
+/** A message if a header cell has been edited by hand (so data would land under the wrong title), else null. Reads only. */
+function headerProblem_(name) {
+  var sh = sheet_(name), cols = SHEETS[name].cols, have = Math.min(cols.length, sh.getMaxColumns());
+  var head = have > 0 ? sh.getRange(1, 1, 1, have).getValues()[0] : [];
+  for (var i = 0; i < cols.length; i++) {
+    var h = i < head.length ? String(head[i]) : "";
+    if (h !== "" && h !== cols[i]) return "The " + name + " tab header has been edited; column " + (i + 1) + " should be '" + cols[i] + "'. Fix the header row, then try again.";
+  }
+  return null;
+}
 /**
  * Adds any column the code knows about that an older Sheet doesn't have yet, at the END of the header row
- * (so no existing data moves). Safe to run again. If an earlier header was changed by hand it does nothing.
+ * (so no existing data moves). Safe to run again. If a header cell holds something else it stops with a clear
+ * message rather than write data under the wrong title.
  */
 function ensureColumns_(name) {
+  var hp = headerProblem_(name);
+  if (hp) { log_("", "sheet header problem", hp); throw fail_(hp); }
   var sh = sheet_(name), cols = SHEETS[name].cols;
   if (sh.getMaxColumns() < cols.length) sh.insertColumnsAfter(sh.getMaxColumns(), cols.length - sh.getMaxColumns());
   var head = sh.getRange(1, 1, 1, cols.length).getValues()[0];
   for (var i = 0; i < cols.length; i++) {
     if (String(head[i]) === cols[i]) continue;
-    if (String(head[i]) !== "") return;
     sh.getRange(1, i + 1, sh.getMaxRows(), 1).setNumberFormat("@");
     sh.getRange(1, i + 1, 1, 1).setValues([[cols[i]]]).setFontWeight("bold");
   }
@@ -981,7 +1036,7 @@ function write_(step) {
       if (at >= 0) {
         // Merge: only overwrite the fields that were sent.
         var range = sh.getRange(at + 2, 1, 1, cols.length), cur = range.getValues()[0];
-        range.setValues([cols.map(function (c, i) { return r.hasOwnProperty(c) ? safe_(r[c]) : cur[i]; })]);
+        range.setValues([cols.map(function (c, i) { return has_(r, c) ? safe_(r[c]) : cur[i]; })]);
       } else {
         appendRows_(sh, [toRow_(cols, r)], cols.length);
         keys.push(k);
